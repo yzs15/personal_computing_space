@@ -38,5 +38,11 @@ The host Driver allows up to 90 seconds per Codex turn by default
 (`LOOM_CODING_AGENT_TIMEOUT_SECONDS` can override this) and reports a retryable
 `coding_agent_timeout` if the local upstream does not finish in that window.
 
+The Conversation-first UI persists user and assistant messages in Observer run
+events. `GET /api/v1/conversations` lists saved conversations and
+`GET /api/v1/conversations/{conversation_ref}` restores their message/run
+history after a browser refresh. Codex `agentMessage` events and Fake test
+messages use the same normalized `assistant_text` path.
+
 The next-stage Term/Capability Package work is intentionally roadmap-only in
 this version; an unknown required term fails with a structured capability error.
