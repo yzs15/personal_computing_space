@@ -9,7 +9,7 @@ if ! command -v "$DOCKER_BIN" >/dev/null 2>&1 || ! "$DOCKER_BIN" info >/dev/null
     if [[ -x "$candidate" ]] && "$candidate" info >/dev/null 2>&1; then DOCKER_BIN="$candidate"; break; fi
   done
 fi
-"$DOCKER_BIN" compose -f deploy/docker-compose.yml up -d --build --remove-orphans observer-db slave-a-db slave-b-db slave-a slave-b
+"$DOCKER_BIN" compose -f deploy/docker-compose.yml up -d --build --remove-orphans observer-db driver-db slave-a-db slave-b-db slave-a slave-b
 for _ in {1..30}; do
   if "$DOCKER_BIN" compose -f deploy/docker-compose.yml exec -T observer-db pg_isready -U loom -d loom_observer >/dev/null 2>&1; then break; fi
   sleep 1
