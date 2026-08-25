@@ -61,3 +61,28 @@ async def test_codex_turn_started_and_interrupted_are_normalized():
         ("turn_interrupted", {"turn_id": "turn-42"}),
     ]
     assert provider.current_turn_id == "turn-42"
+
+
+@pytest.mark.asyncio
+async def test_codex_interrupt_includes_thread_and_turn_ids():
+    provider = CodexAppServerProvider()
+    provider.process = object()
+    provider.thread_id = "thread-1"
+    provider.current_turn_id = "turn-42"
+    sent: list[dict] = []
+
+    async def fake_send(message):
+        sent.append(message)
+
+    provider._send = fake_send
+
+    await provider.interrupt()
+
+    assert sent == [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "turn/interrupt",
+            "params": {"threadId": "thread-1", "turnId": "turn-42"},
+        }
+    ]

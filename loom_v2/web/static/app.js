@@ -12,6 +12,7 @@ let conversationRef = null;
 let conversationSummaries = [];
 let statusPollTimer = null;
 let statusPollInFlight = false;
+let interruptPendingRef = null;
 
 const statusLabels = {
   idle: 'Idle',
@@ -28,6 +29,15 @@ function isActiveStatus(status) {
 
 function renderConversationStatus(status) {
   const normalized = Object.prototype.hasOwnProperty.call(statusLabels, status) ? status : 'idle';
+  if (interruptPendingRef === conversationRef && isActiveStatus(normalized)) {
+    conversationStatus.dataset.status = normalized;
+    conversationStatus.textContent = 'Interrupt requested';
+    interruptButton.disabled = true;
+    return;
+  }
+  if (interruptPendingRef === conversationRef && !isActiveStatus(normalized)) {
+    interruptPendingRef = null;
+  }
   conversationStatus.dataset.status = normalized;
   conversationStatus.textContent = statusLabels[normalized];
   interruptButton.disabled = !isActiveStatus(normalized);
@@ -164,6 +174,7 @@ async function loadConversations(selectLatest) {
 }
 
 async function selectConversation(ref) {
+  interruptPendingRef = null;
   conversationRef = ref;
   renderConversationList();
   try {
@@ -176,6 +187,7 @@ async function selectConversation(ref) {
 
 newConversationButton.addEventListener('click', () => {
   stopStatusPolling();
+  interruptPendingRef = null;
   conversationRef = newConversationRef();
   renderConversationList();
   showEmptyTimeline();
@@ -185,6 +197,7 @@ newConversationButton.addEventListener('click', () => {
 
 interruptButton.addEventListener('click', async () => {
   if (!conversationRef || interruptButton.disabled) return;
+  interruptPendingRef = conversationRef;
   interruptButton.disabled = true;
   conversationStatus.textContent = 'Interrupt requested';
   try {
@@ -196,6 +209,7 @@ interruptButton.addEventListener('click', async () => {
     if (!response.ok) throw new Error(payload.detail || payload.code || `interrupt failed: ${response.status}`);
     startStatusPolling();
   } catch (error) {
+    interruptPendingRef = null;
     appendMessage('error', `Assistant: interrupt failed (${error.message})`);
     try {
       await loadConversation(conversationRef);
@@ -210,6 +224,7 @@ form.addEventListener('submit', async (event) => {
   const prompt = promptInput.value.trim();
   if (!prompt) return;
   if (!conversationRef) conversationRef = newConversationRef();
+  interruptPendingRef = null;
   appendMessage('user', prompt);
   promptInput.value = '';
   sendButton.disabled = true;

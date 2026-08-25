@@ -119,7 +119,10 @@ class DriverService:
                 "assistant_text": "\n\n".join(assistant_parts),
             }
         except asyncio.CancelledError:
-            await self.repository.fail_run(run.run_id, "driver_cancelled")
+            if active.interrupt_requested:
+                await self.repository.cancel_run(run.run_id)
+            else:
+                await self.repository.fail_run(run.run_id, "driver_cancelled")
             raise
         except Exception as exc:
             await self.repository.fail_run(run.run_id, str(exc))

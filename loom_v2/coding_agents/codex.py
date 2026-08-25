@@ -86,7 +86,14 @@ class CodexAppServerProvider:
     async def interrupt(self, turn_ref: str | None = None) -> None:
         turn_ref = turn_ref or self.current_turn_id
         if self.process is not None and turn_ref:
-            await self._send({"jsonrpc": "2.0", "id": self._next_id(), "method": "turn/interrupt", "params": {"turnId": turn_ref}})
+            await self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": self._next_id(),
+                    "method": "turn/interrupt",
+                    "params": {"threadId": self.thread_id, "turnId": turn_ref},
+                }
+            )
 
     async def close(self) -> None:
         if self.process is not None:

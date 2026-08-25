@@ -27,5 +27,6 @@ def test_frontend_loads_runtime_agent_status():
     assert "assistant_text" in response.text
     assert "conversation_ref" in response.text
     assert "/interrupt" in response.text
+    assert "interruptPendingRef" in response.text
     assert "thinking" in response.text
     assert "executing" in response.text
