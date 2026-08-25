@@ -66,6 +66,23 @@ class ObserverRepository:
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
 
+    @staticmethod
+    def _record_from_row(row: RunRow) -> RunRecord:
+        return RunRecord(
+            run_id=row.run_id,
+            task_ref=row.task_ref,
+            goal=row.goal,
+            draft=ClosureVersion.model_validate(row.draft),
+            allow_reassignment=row.allow_reassignment,
+            committed=ClosureVersion.model_validate(row.committed) if row.committed else None,
+            execution_id=row.execution_id,
+            execution_epoch=row.execution_epoch,
+            state=row.state,
+            outcome=row.outcome,
+            attempts=row.attempts or [],
+            events=row.events or [],
+        )
+
     async def _persist(self, record: RunRecord) -> None:
         if self.sessions is None:
             return
@@ -102,22 +119,23 @@ class ObserverRepository:
             row = await session.get(RunRow, run_id)
             if row is None:
                 raise KeyError(run_id)
-            record = RunRecord(
-                run_id=row.run_id,
-                task_ref=row.task_ref,
-                goal=row.goal,
-                draft=ClosureVersion.model_validate(row.draft),
-                allow_reassignment=row.allow_reassignment,
-                committed=ClosureVersion.model_validate(row.committed) if row.committed else None,
-                execution_id=row.execution_id,
-                execution_epoch=row.execution_epoch,
-                state=row.state,
-                outcome=row.outcome,
-                attempts=row.attempts or [],
-                events=row.events or [],
-            )
+            record = self._record_from_row(row)
             self.runs[run_id] = record
             return record
+
+    async def _all_records(self) -> list[RunRecord]:
+        if self.sessions is None:
+            return list(self.runs.values())
+        async with self.sessions() as session:
+            rows = (await session.scalars(select(RunRow).order_by(RunRow.run_id))).all()
+        records: list[RunRecord] = []
+        for row in rows:
+            record = self.runs.get(row.run_id)
+            if record is None:
+                record = self._record_from_row(row)
+                self.runs[row.run_id] = record
+            records.append(record)
+        return records
 
     async def open_run(self, run_id: str | None, task_ref: str, goal: str, allow_reassignment: bool = False) -> RunRecord:
         run_id = run_id or f"run-{uuid4().hex[:12]}"
@@ -133,6 +151,71 @@ class ObserverRepository:
         self.runs[run_id] = record
         await self._persist(record)
         return record
+
+    async def append_message(self, run_id: str, role: str, content: str) -> dict[str, Any]:
+        if role not in {"user", "assistant"}:
+            raise ValueError("unsupported_message_role")
+        if not content:
+            raise ValueError("empty_message")
+        record = await self._load(run_id)
+        message = {
+            "phase": "message",
+            "message_id": f"message-{uuid4().hex[:12]}",
+            "role": role,
+            "content": content,
+            "run_id": run_id,
+        }
+        record.events.append(message)
+        await self._persist(record)
+        return message
+
+    async def list_conversations(self) -> list[dict[str, Any]]:
+        groups: dict[str, list[RunRecord]] = {}
+        for record in await self._all_records():
+            groups.setdefault(record.task_ref, []).append(record)
+        return [
+            {
+                "conversation_ref": conversation_ref,
+                "title": records[-1].goal or "New conversation",
+                "run_count": len(records),
+                "latest_run_id": records[-1].run_id,
+            }
+            for conversation_ref, records in groups.items()
+        ]
+
+    async def get_conversation(self, conversation_ref: str) -> dict[str, Any]:
+        records = [record for record in await self._all_records() if record.task_ref == conversation_ref]
+        if not records:
+            raise KeyError(conversation_ref)
+        messages: list[dict[str, Any]] = []
+        events: list[dict[str, Any]] = []
+        run_summaries: list[dict[str, Any]] = []
+        for record in records:
+            has_user_message = False
+            for event in record.events:
+                events.append(event)
+                if event.get("phase") != "message" or event.get("role") not in {"user", "assistant"}:
+                    continue
+                message = {
+                    "message_id": event.get("message_id", f"legacy-{record.run_id}"),
+                    "role": event["role"],
+                    "content": event.get("content", ""),
+                    "run_id": event.get("run_id", record.run_id),
+                }
+                messages.append(message)
+                has_user_message = has_user_message or message["role"] == "user"
+            if not has_user_message:
+                messages.append({"message_id": f"legacy-{record.run_id}", "role": "user", "content": record.goal, "run_id": record.run_id})
+            run_summaries.append(
+                {
+                    "run_id": record.run_id,
+                    "state": record.state,
+                    "committed_version": record.committed.version_id if record.committed else None,
+                    "execution_id": record.execution_id,
+                    "outcome": record.outcome,
+                }
+            )
+        return {"conversation_ref": conversation_ref, "messages": messages, "runs": run_summaries, "events": events}
 
     async def apply_patch(
         self,

@@ -92,13 +92,26 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         except (RuntimeError, FileNotFoundError) as exc:
             return JSONResponse(status_code=503, content={"code": str(exc), "retryable": True})
 
+    @app.get("/api/v1/conversations")
+    async def conversations() -> list[dict[str, Any]]:
+        return await app.state.repo.list_conversations()
+
+    @app.get("/api/v1/conversations/{conversation_ref}")
+    async def conversation(conversation_ref: str) -> dict[str, Any]:
+        try:
+            return await app.state.repo.get_conversation(conversation_ref)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="conversation_not_found") from exc
+
     @app.get("/api/v1/conversations/{conversation_ref}/stream")
     async def stream(conversation_ref: str) -> StreamingResponse:
         async def events() -> Any:
-            for record in app.state.repo.runs.values():
-                if record.task_ref == conversation_ref:
-                    for event in record.events:
-                        yield f"data: {json.dumps(event, sort_keys=True)}\n\n"
+            try:
+                conversation_view = await app.state.repo.get_conversation(conversation_ref)
+            except KeyError:
+                return
+            for event in conversation_view["events"]:
+                yield f"data: {json.dumps(event, sort_keys=True, ensure_ascii=False)}\n\n"
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
