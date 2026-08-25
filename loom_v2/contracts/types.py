@@ -27,6 +27,7 @@ class DataApplication(ContractModel):
     schema_digest: str = ""
     identity_criterion: str = "content_digest"
     expected_cardinality: str = "unknown"
+    terms: list[TypedTerm] = Field(default_factory=list)
 
 
 class DataSystems(ContractModel):
@@ -34,6 +35,7 @@ class DataSystems(ContractModel):
     classification: str = "internal"
     access_profile: dict[str, Any] = Field(default_factory=dict)
     retention_profile: dict[str, Any] = Field(default_factory=dict)
+    terms: list[TypedTerm] = Field(default_factory=list)
 
 
 class ProgramApplication(ContractModel):
@@ -42,6 +44,7 @@ class ProgramApplication(ContractModel):
     input_schema: str = ""
     output_schema: str = ""
     success_semantics: dict[str, Any] = Field(default_factory=dict)
+    terms: list[TypedTerm] = Field(default_factory=list)
 
 
 class ProgramSystems(ContractModel):
@@ -50,17 +53,20 @@ class ProgramSystems(ContractModel):
     permissions: list[str] = Field(default_factory=list)
     package_ref: ResourceRef | None = None
     replay_safety: str = "Idempotent"
+    terms: list[TypedTerm] = Field(default_factory=list)
 
 
 class ComputeApplication(ContractModel):
     capability_intent: str = "cpu"
     requirement_refs: list[str] = Field(default_factory=list)
     result_expectation: dict[str, Any] = Field(default_factory=dict)
+    terms: list[TypedTerm] = Field(default_factory=list)
 
 
 class ComputeSystems(ContractModel):
     requirement_refs: list[str] = Field(default_factory=list)
     admission_requirements: list[str] = Field(default_factory=list)
+    terms: list[TypedTerm] = Field(default_factory=list)
 
 
 class ComputeRequirement(ContractModel):
@@ -88,6 +94,7 @@ class ComputeSpec(ContractModel):
     operation_ref: str = ""
     requirements: list[ComputeRequirement] = Field(default_factory=list)
     typed_holes: list[TypedHole] = Field(default_factory=list)
+    terms: list[TypedTerm] = Field(default_factory=list)
 
 
 class ComputeBinding(ContractModel):
@@ -110,6 +117,7 @@ class TaskClosure(ContractModel):
     program: ProgramApplication = Field(default_factory=ProgramApplication)
     program_systems: ProgramSystems = Field(default_factory=ProgramSystems)
     compute: ComputeSpec = Field(default_factory=ComputeSpec)
+    compute_application: ComputeApplication = Field(default_factory=ComputeApplication)
     compute_systems: ComputeSystems = Field(default_factory=ComputeSystems)
     terms: list[TypedTerm] = Field(default_factory=list)
     constraints: list[Constraint] = Field(default_factory=list)
