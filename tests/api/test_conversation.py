@@ -11,6 +11,10 @@ def test_message_runs_fake_driver_and_sse_exposes_events(monkeypatch):
     payload = response.json()
     assert payload["state"] == "completed"
     assert payload["resource_ref"].startswith("result-")
+    assert payload["conversation_ref"] == "conversation-ui"
+    assert payload["assistant_text"] == "I will refine the closure in multiple patches."
+    history = client.get("/api/v1/conversations/conversation-ui")
+    assert [message["role"] for message in history.json()["messages"]] == ["user", "assistant"]
     stream = client.get("/api/v1/conversations/conversation-ui/stream")
     assert stream.status_code == 200
     assert "execution_started" in stream.text

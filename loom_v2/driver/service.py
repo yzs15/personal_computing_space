@@ -29,14 +29,21 @@ class DriverService:
 
     async def _run_prompt(self, conversation_ref: str, prompt: str) -> dict[str, Any]:
         run = await self.repository.open_run(None, conversation_ref, prompt)
+        await self.repository.append_message(run.run_id, "user", prompt)
         await self.provider.start(conversation_ref, os.getenv("LOOM_WORKSPACE_ROOT", "/workspace"))
         patches = 0
         committed: str | None = None
+        assistant_parts: list[str] = []
         try:
             async for event in self.provider.send_turn(prompt):
                 if event.kind == "apply_plan_patch":
                     await self.tools.apply_plan_patch(run.run_id, f"patch-{uuid4().hex[:12]}", event.payload.get("ops", []))
                     patches += 1
+                elif event.kind == "assistant_text":
+                    text = str(event.payload.get("text", "")).strip()
+                    if text:
+                        await self.repository.append_message(run.run_id, "assistant", text)
+                        assistant_parts.append(text)
                 elif event.kind == "commit_plan":
                     committed = (await self.tools.commit_plan(run.run_id))["closure_version"]
             if committed is None:
@@ -47,6 +54,16 @@ class DriverService:
                 run.run_id,
                 {"resource_ref": result.resource_ref.resource_id, "digest": result.digest, "value": result.value},
             )
-            return {"run_id": run.run_id, "closure_version": committed, "patches": patches, "state": completed.state, "resource_ref": result.resource_ref.resource_id, "execution_id": execution["execution_id"], "execution_epoch": execution["execution_epoch"]}
+            return {
+                "run_id": run.run_id,
+                "conversation_ref": conversation_ref,
+                "closure_version": committed,
+                "patches": patches,
+                "state": completed.state,
+                "resource_ref": result.resource_ref.resource_id,
+                "execution_id": execution["execution_id"],
+                "execution_epoch": execution["execution_epoch"],
+                "assistant_text": "\n\n".join(assistant_parts),
+            }
         finally:
             await self.provider.close()
