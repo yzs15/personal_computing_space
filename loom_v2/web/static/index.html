@@ -11,13 +11,13 @@
     <section class="conversation">
       <header>
         <h1>Loom v2</h1>
-        <div class="conversation-controls">
-          <span id="conversation-status" data-status="idle">Idle</span>
-          <button id="interrupt-conversation" type="button" disabled>Interrupt</button>
-          <span id="agent-status">Coding Agent: loading…</span>
-        </div>
+        <span id="agent-status">Coding Agent: loading…</span>
       </header>
       <div id="timeline" class="timeline" aria-live="polite">Start a conversation to refine a task closure.</div>
+      <div class="conversation-controls">
+        <span id="conversation-status" data-status="idle">Idle</span>
+        <button id="interrupt-conversation" type="button" disabled>Interrupt</button>
+      </div>
       <form id="prompt-form"><textarea id="prompt" placeholder="Describe the computation…"></textarea><button>Send</button></form>
     </section>
     <aside class="drawer">
