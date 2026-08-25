@@ -1,11 +1,116 @@
-from fastapi import FastAPI
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
+
+from loom_v2.db.session import make_engine
+from loom_v2.settings import Settings
+
+from .repository import ObserverRepository
 
 
-def create_app() -> FastAPI:
+def _run_view(record: Any) -> dict[str, Any]:
+    return {
+        "run_id": record.run_id,
+        "task_ref": record.task_ref,
+        "goal": record.goal,
+        "state": record.state,
+        "draft_version": record.draft.version_id,
+        "draft_digest": record.draft.snapshot_digest,
+        "committed_version": record.committed.version_id if record.committed else None,
+        "execution_id": record.execution_id,
+        "execution_epoch": record.execution_epoch,
+        "attempts": record.attempts,
+        "events": record.events,
+    }
+
+
+def create_app(repository: ObserverRepository | None = None) -> FastAPI:
     app = FastAPI(title="Loom v2 Observer")
+    settings = Settings()
+    app.state.engine = None
+    if repository is None and not settings.database_url.startswith("sqlite+aiosqlite:///:memory:"):
+        app.state.engine = make_engine(settings.database_url)
+    app.state.repo = repository or ObserverRepository(app.state.engine)
+
+    @app.on_event("startup")
+    async def initialize_database() -> None:
+        await app.state.repo.init_db()
+
+    @app.on_event("shutdown")
+    async def close_database() -> None:
+        if app.state.engine is not None:
+            await app.state.engine.dispose()
 
     @app.get("/healthz")
     async def health() -> dict[str, object]:
         return {"ok": True, "service": "observer"}
 
+    @app.post("/api/v1/runs")
+    async def open_run(payload: dict[str, Any]) -> dict[str, Any]:
+        record = await app.state.repo.open_run(payload.get("run_id"), payload["task_ref"], payload.get("goal", ""))
+        return _run_view(record)
+
+    @app.post("/api/v1/runs/{run_id}/patches")
+    async def apply_patch(run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            receipt = await app.state.repo.apply_patch(
+                run_id,
+                payload["base_draft_version"],
+                payload["base_snapshot_digest"],
+                payload["operation_id"],
+                payload.get("ops", []),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=f"missing_field:{exc.args[0]}") from exc
+        except ValueError as exc:
+            code = str(exc)
+            raise HTTPException(status_code=409 if code == "version_conflict" else 422, detail=code) from exc
+        return {
+            "receipt": receipt.receipt,
+            "run_id": receipt.run_id,
+            "kind": receipt.kind,
+            "draft_version": receipt.draft_version,
+            "draft_digest": receipt.draft_digest,
+            "patch_cursor": receipt.patch_cursor,
+        }
+
+    @app.post("/api/v1/runs/{run_id}/commit")
+    async def commit(run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            version = await app.state.repo.commit(run_id, payload["draft_version"], payload["draft_digest"])
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"closure_version": version.version_id, "snapshot_digest": version.snapshot_digest, "state": "committed"}
+
+    @app.post("/api/v1/runs/{run_id}/start")
+    async def start(run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await app.state.repo.start(run_id, payload["closure_version"])
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/runs/{run_id}")
+    async def get_run(run_id: str) -> dict[str, Any]:
+        try:
+            return _run_view(await app.state.repo.get_run(run_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="run_not_found") from exc
+
+    @app.post("/worker/v1/terminal")
+    async def terminal(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await app.state.repo.terminal(payload)
+        except ValueError as exc:
+            return JSONResponse(status_code=409, content={"code": str(exc), "retryable": False})
+
+    @app.get("/")
+    async def home() -> FileResponse:
+        return FileResponse("loom_v2/web/static/index.html")
+
     return app
+
+
+app = create_app()
