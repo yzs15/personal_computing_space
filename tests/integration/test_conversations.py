@@ -24,6 +24,25 @@ async def test_message_events_survive_repository_reload():
     assert [message["content"] for message in conversation["messages"]] == ["能力问题", "两者能力相同"]
 
 
+@pytest.mark.asyncio
+async def test_persisted_conversation_history_is_ordered_by_run_creation():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    repo = ObserverRepository(engine)
+    await repo.init_db()
+    first = await repo.open_run("run-z-first", "conversation-ordered", "第一问")
+    await repo.append_message(first.run_id, "user", "第一问")
+    second = await repo.open_run("run-a-second", "conversation-ordered", "第二问")
+    await repo.append_message(second.run_id, "user", "第二问")
+
+    restored = ObserverRepository(engine)
+    await restored.init_db()
+    summary = (await restored.list_conversations())[0]
+    history = await restored.get_conversation("conversation-ordered")
+
+    assert summary["latest_run_id"] == "run-a-second"
+    assert [message["content"] for message in history["messages"]] == ["第一问", "第二问"]
+
+
 def test_conversation_list_history_and_stream_use_persisted_messages():
     repository = ObserverRepository()
     client = TestClient(create_app(repository))

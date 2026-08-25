@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -137,6 +138,11 @@ class ObserverRepository:
             records.append(record)
         return records
 
+    @staticmethod
+    def _record_order_key(record: RunRecord) -> str:
+        timestamps = [event.get("created_at") for event in record.events if isinstance(event.get("created_at"), str)]
+        return max(timestamps, default="")
+
     async def open_run(self, run_id: str | None, task_ref: str, goal: str, allow_reassignment: bool = False) -> RunRecord:
         run_id = run_id or f"run-{uuid4().hex[:12]}"
         snapshot = TaskClosure.minimal(closure_id=task_ref, metadata={"goal": goal})
@@ -148,6 +154,7 @@ class ObserverRepository:
             patch_cursor=0,
         )
         record = RunRecord(run_id=run_id, task_ref=task_ref, goal=goal, allow_reassignment=allow_reassignment, draft=version)
+        record.events.append({"phase": "run_opened", "run_id": run_id, "created_at": datetime.now(timezone.utc).isoformat()})
         self.runs[run_id] = record
         await self._persist(record)
         return record
@@ -164,6 +171,7 @@ class ObserverRepository:
             "role": role,
             "content": content,
             "run_id": run_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
         record.events.append(message)
         await self._persist(record)
@@ -173,20 +181,27 @@ class ObserverRepository:
         groups: dict[str, list[RunRecord]] = {}
         for record in await self._all_records():
             groups.setdefault(record.task_ref, []).append(record)
-        return [
-            {
-                "conversation_ref": conversation_ref,
-                "title": records[-1].goal or "New conversation",
-                "run_count": len(records),
-                "latest_run_id": records[-1].run_id,
-            }
-            for conversation_ref, records in groups.items()
-        ]
+        summaries: list[tuple[str, dict[str, Any]]] = []
+        for conversation_ref, records in groups.items():
+            records.sort(key=self._record_order_key)
+            summaries.append(
+                (
+                    self._record_order_key(records[-1]),
+                    {
+                        "conversation_ref": conversation_ref,
+                        "title": records[-1].goal or "New conversation",
+                        "run_count": len(records),
+                        "latest_run_id": records[-1].run_id,
+                    },
+                )
+            )
+        return [summary for _, summary in sorted(summaries, key=lambda item: item[0])]
 
     async def get_conversation(self, conversation_ref: str) -> dict[str, Any]:
         records = [record for record in await self._all_records() if record.task_ref == conversation_ref]
         if not records:
             raise KeyError(conversation_ref)
+        records.sort(key=self._record_order_key)
         messages: list[dict[str, Any]] = []
         events: list[dict[str, Any]] = []
         run_summaries: list[dict[str, Any]] = []
