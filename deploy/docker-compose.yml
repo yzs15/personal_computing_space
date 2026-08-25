@@ -1,0 +1,89 @@
+services:
+  observer-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: loom
+      POSTGRES_PASSWORD: loom
+      POSTGRES_DB: loom_observer
+    volumes: [observer-db-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loom -d loom_observer"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  driver-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: loom
+      POSTGRES_PASSWORD: loom
+      POSTGRES_DB: loom_driver
+    volumes: [driver-db-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loom -d loom_driver"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  slave-a-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: loom
+      POSTGRES_PASSWORD: loom
+      POSTGRES_DB: loom_slave_a
+    volumes: [slave-a-db-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loom -d loom_slave_a"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  slave-b-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: loom
+      POSTGRES_PASSWORD: loom
+      POSTGRES_DB: loom_slave_b
+    volumes: [slave-b-db-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loom -d loom_slave_b"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  observer:
+    build: ..
+    environment:
+      LOOM_SERVICE_NAME: observer
+      LOOM_DATABASE_URL: postgresql+asyncpg://loom:loom@observer-db:5432/loom_observer
+      LOOM_CODING_AGENT_BACKEND: codex
+      LOOM_CODEX_MODEL: deepseek-v4-flash
+    depends_on:
+      observer-db: {condition: service_healthy}
+    ports: ["8080:8080"]
+
+  slave-a:
+    build: ..
+    command: ["uvicorn", "loom_v2.slave.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8081"]
+    environment:
+      LOOM_SERVICE_NAME: slave-a
+      LOOM_DATABASE_URL: postgresql+asyncpg://loom:loom@slave-a-db:5432/loom_slave_a
+    depends_on:
+      slave-a-db: {condition: service_healthy}
+    ports: ["8081:8081"]
+
+  slave-b:
+    build: ..
+    command: ["uvicorn", "loom_v2.slave.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8082"]
+    environment:
+      LOOM_SERVICE_NAME: slave-b
+      LOOM_DATABASE_URL: postgresql+asyncpg://loom:loom@slave-b-db:5432/loom_slave_b
+    depends_on:
+      slave-b-db: {condition: service_healthy}
+    ports: ["8082:8082"]
+
+volumes:
+  observer-db-data:
+  driver-db-data:
+  slave-a-db-data:
+  slave-b-db-data:

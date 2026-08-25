@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from loom_v2.db.session import make_engine
 from loom_v2.settings import Settings
+from loom_v2.coding_agents.codex import CodexAppServerProvider
+from loom_v2.coding_agents.fake import FakeCodingAgentProvider
+from loom_v2.driver.service import DriverService
 
 from .repository import ObserverRepository
 
@@ -37,6 +41,8 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
     if repository is None and not settings.database_url.startswith("sqlite+aiosqlite:///:memory:"):
         app.state.engine = make_engine(settings.database_url)
     app.state.repo = repository or ObserverRepository(app.state.engine)
+    provider = FakeCodingAgentProvider() if settings.coding_agent_backend == "fake" else CodexAppServerProvider(model=settings.codex_model)
+    app.state.driver = DriverService(app.state.repo, provider)
     static_dir = Path(__file__).resolve().parents[1] / "web" / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -57,6 +63,23 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
     async def open_run(payload: dict[str, Any]) -> dict[str, Any]:
         record = await app.state.repo.open_run(payload.get("run_id"), payload["task_ref"], payload.get("goal", ""), payload.get("allow_reassignment", False))
         return _run_view(record)
+
+    @app.post("/api/v1/messages")
+    async def message(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await app.state.driver.run_prompt(payload.get("conversation_ref", "conversation-default"), payload.get("text", ""))
+        except RuntimeError as exc:
+            return JSONResponse(status_code=503, content={"code": str(exc), "retryable": True})
+
+    @app.get("/api/v1/conversations/{conversation_ref}/stream")
+    async def stream(conversation_ref: str) -> StreamingResponse:
+        async def events() -> Any:
+            for record in app.state.repo.runs.values():
+                if record.task_ref == conversation_ref:
+                    for event in record.events:
+                        yield f"data: {json.dumps(event, sort_keys=True)}\n\n"
+
+        return StreamingResponse(events(), media_type="text/event-stream")
 
     @app.post("/api/v1/runs/{run_id}/patches")
     async def apply_patch(run_id: str, payload: dict[str, Any]) -> dict[str, Any]:

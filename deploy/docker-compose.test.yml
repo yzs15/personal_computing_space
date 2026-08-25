@@ -1,0 +1,10 @@
+services:
+  driver:
+    build: ..
+    command: ["python", "-m", "loom_v2.cli", "--self-test"]
+    environment:
+      LOOM_CODING_AGENT_BACKEND: fake
+      LOOM_OBSERVER_URL: http://observer:8080
+    depends_on:
+      observer: {condition: service_started}
+    profiles: [test]

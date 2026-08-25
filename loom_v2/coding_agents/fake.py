@@ -16,7 +16,7 @@ class FakeCodingAgentProvider:
     async def send_turn(self, user_message: str) -> AsyncIterator[AgentEvent]:
         yield AgentEvent("assistant_text", {"text": "I will refine the closure in multiple patches."})
         yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "set_program_ref", "value": "loom://echo"}]})
-        yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "set_compute_spec", "value": {"capability_intent": "cpu"}}]})
+        yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "set_compute_spec", "value": {"operation_ref": "loom://echo"}}]})
         yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "add_typed_hole", "value": {"hole_id": "h_compute"}}]})
         yield AgentEvent("inspect_plan_readiness", {})
         yield AgentEvent("commit_plan", {})
