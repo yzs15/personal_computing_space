@@ -58,6 +58,7 @@ def test_conversation_list_history_and_stream_use_persisted_messages():
             "title": "能力问题",
             "run_count": 1,
             "latest_run_id": run["run_id"],
+            "status": "idle",
         }
     ]
 

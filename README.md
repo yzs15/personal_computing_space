@@ -44,5 +44,14 @@ events. `GET /api/v1/conversations` lists saved conversations and
 history after a browser refresh. Codex `agentMessage` events and Fake test
 messages use the same normalized `assistant_text` path.
 
+Each conversation exposes a derived status (`idle`, `thinking`, `executing`,
+`completed`, `interrupted`, or `failed`) in both conversation projections. The
+workspace refreshes the selected conversation while a turn is active and shows
+an Interrupt button. `POST /api/v1/conversations/{conversation_ref}/interrupt`
+requests cancellation of the active Codex turn; it leaves persisted user,
+assistant, draft, and event history intact, marks the run `cancelled`, and
+reports the conversation as `interrupted`. If no turn is active, the endpoint
+returns HTTP 409 with `conversation_not_active`.
+
 The next-stage Term/Capability Package work is intentionally roadmap-only in
 this version; an unknown required term fails with a structured capability error.

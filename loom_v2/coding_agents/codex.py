@@ -16,6 +16,7 @@ class CodexAppServerProvider:
         self.process: asyncio.subprocess.Process | None = None
         self.request_id = 0
         self.thread_id: str | None = None
+        self.current_turn_id: str | None = None
 
     async def start(self, conversation_ref: str, workspace_root: str) -> str:
         try:
@@ -43,6 +44,7 @@ class CodexAppServerProvider:
     async def send_turn(self, user_message: str) -> AsyncIterator[AgentEvent]:
         if self.process is None:
             raise RuntimeError("coding_agent_unavailable")
+        self.current_turn_id = None
         turn_request_id = self._next_id()
         await self._send({"jsonrpc": "2.0", "id": turn_request_id, "method": "turn/start", "params": {"threadId": self.thread_id, "input": [{"type": "text", "text": user_message}]}})
         while True:
@@ -51,7 +53,28 @@ class CodexAppServerProvider:
                 continue
             method = message.get("method", "")
             if method == "turn/completed":
+                params = message.get("params", {})
+                turn = params.get("turn", params)
+                turn_id = turn.get("id") if isinstance(turn, dict) else None
+                if turn_id is None:
+                    turn_id = params.get("turnId") or params.get("turn_id")
+                if turn_id is not None:
+                    self.current_turn_id = str(turn_id)
+                status = turn.get("status") if isinstance(turn, dict) else None
+                status = status or params.get("status")
+                if str(status or "").lower() in {"interrupted", "cancelled", "canceled"}:
+                    yield AgentEvent("turn_interrupted", {"turn_id": self.current_turn_id} if self.current_turn_id else {})
                 break
+            if method == "turn/started":
+                params = message.get("params", {})
+                turn = params.get("turn", params)
+                turn_id = turn.get("id") if isinstance(turn, dict) else None
+                if turn_id is None:
+                    turn_id = params.get("turnId") or params.get("turn_id")
+                if turn_id is not None:
+                    self.current_turn_id = str(turn_id)
+                    yield AgentEvent("turn_started", {"turn_id": self.current_turn_id})
+                continue
             if method == "item/completed":
                 item = message.get("params", {}).get("item", {})
                 if item.get("type") == "agentMessage" and item.get("text"):
@@ -60,8 +83,9 @@ class CodexAppServerProvider:
             if method.startswith("item/") or method.startswith("turn/"):
                 yield AgentEvent(method, message.get("params", {}))
 
-    async def interrupt(self, turn_ref: str) -> None:
-        if self.process is not None:
+    async def interrupt(self, turn_ref: str | None = None) -> None:
+        turn_ref = turn_ref or self.current_turn_id
+        if self.process is not None and turn_ref:
             await self._send({"jsonrpc": "2.0", "id": self._next_id(), "method": "turn/interrupt", "params": {"turnId": turn_ref}})
 
     async def close(self) -> None:
@@ -70,6 +94,7 @@ class CodexAppServerProvider:
             await self.process.wait()
             self.process = None
             self.thread_id = None
+            self.current_turn_id = None
 
     def _next_id(self) -> int:
         self.request_id += 1

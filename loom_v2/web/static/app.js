@@ -3,11 +3,63 @@ const form = document.querySelector('#prompt-form');
 const promptInput = document.querySelector('#prompt');
 const sendButton = form.querySelector('button');
 const agentStatus = document.querySelector('#agent-status');
+const conversationStatus = document.querySelector('#conversation-status');
+const interruptButton = document.querySelector('#interrupt-conversation');
 const conversationList = document.querySelector('#conversation-list');
 const newConversationButton = document.querySelector('#new-conversation');
 
 let conversationRef = null;
 let conversationSummaries = [];
+let statusPollTimer = null;
+let statusPollInFlight = false;
+
+const statusLabels = {
+  idle: 'Idle',
+  thinking: 'Thinking',
+  executing: 'Executing',
+  completed: 'Completed',
+  interrupted: 'Interrupted',
+  failed: 'Failed',
+};
+
+function isActiveStatus(status) {
+  return status === 'thinking' || status === 'executing';
+}
+
+function renderConversationStatus(status) {
+  const normalized = Object.prototype.hasOwnProperty.call(statusLabels, status) ? status : 'idle';
+  conversationStatus.dataset.status = normalized;
+  conversationStatus.textContent = statusLabels[normalized];
+  interruptButton.disabled = !isActiveStatus(normalized);
+}
+
+function stopStatusPolling() {
+  if (statusPollTimer !== null) {
+    globalThis.clearInterval(statusPollTimer);
+    statusPollTimer = null;
+  }
+}
+
+function startStatusPolling() {
+  if (statusPollTimer !== null) return;
+  statusPollTimer = globalThis.setInterval(async () => {
+    if (!conversationRef || statusPollInFlight) return;
+    statusPollInFlight = true;
+    const ref = conversationRef;
+    try {
+      await loadConversation(ref);
+    } catch (_error) {
+      // The first turn may not have been committed yet; the next poll retries.
+    } finally {
+      statusPollInFlight = false;
+    }
+  }, 1500);
+}
+
+function syncStatusPolling(status) {
+  if (isActiveStatus(status)) startStatusPolling();
+  else stopStatusPolling();
+}
 
 async function loadRuntimeStatus() {
   try {
@@ -72,7 +124,8 @@ function renderConversationList() {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = summary.conversation_ref === conversationRef ? 'active' : '';
-    button.textContent = summary.title || summary.conversation_ref;
+    const status = statusLabels[summary.status] || statusLabels.idle;
+    button.textContent = `${summary.title || summary.conversation_ref} · ${status}`;
     button.title = summary.conversation_ref;
     button.addEventListener('click', () => selectConversation(summary.conversation_ref));
     conversationList.appendChild(button);
@@ -83,7 +136,15 @@ async function loadConversation(ref) {
   const response = await fetch(`/api/v1/conversations/${encodeURIComponent(ref)}`);
   if (!response.ok) throw new Error(`conversation history failed: ${response.status}`);
   const conversation = await response.json();
+  if (ref !== conversationRef) return;
   renderMessages(conversation.messages || []);
+  renderConversationStatus(conversation.status || 'idle');
+  const summary = conversationSummaries.find((item) => item.conversation_ref === ref);
+  if (summary && summary.status !== (conversation.status || 'idle')) {
+    summary.status = conversation.status || 'idle';
+    renderConversationList();
+  }
+  syncStatusPolling(conversation.status || 'idle');
 }
 
 async function loadConversations(selectLatest) {
@@ -114,10 +175,34 @@ async function selectConversation(ref) {
 }
 
 newConversationButton.addEventListener('click', () => {
+  stopStatusPolling();
   conversationRef = newConversationRef();
   renderConversationList();
   showEmptyTimeline();
+  renderConversationStatus('idle');
   promptInput.focus();
+});
+
+interruptButton.addEventListener('click', async () => {
+  if (!conversationRef || interruptButton.disabled) return;
+  interruptButton.disabled = true;
+  conversationStatus.textContent = 'Interrupt requested';
+  try {
+    const response = await fetch(`/api/v1/conversations/${encodeURIComponent(conversationRef)}/interrupt`, {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || payload.code || `interrupt failed: ${response.status}`);
+    startStatusPolling();
+  } catch (error) {
+    appendMessage('error', `Assistant: interrupt failed (${error.message})`);
+    try {
+      await loadConversation(conversationRef);
+    } catch (_reloadError) {
+      renderConversationStatus('failed');
+    }
+  }
 });
 
 form.addEventListener('submit', async (event) => {
@@ -129,6 +214,8 @@ form.addEventListener('submit', async (event) => {
   promptInput.value = '';
   sendButton.disabled = true;
   appendMessage('status', 'Assistant: working…');
+  renderConversationStatus('thinking');
+  startStatusPolling();
   try {
     const response = await fetch('/api/v1/messages', {
       method: 'POST',
@@ -153,5 +240,6 @@ void loadConversations(true).catch((error) => {
   conversationSummaries = [];
   renderConversationList();
   showEmptyTimeline();
+  renderConversationStatus('idle');
   appendMessage('error', `Conversation history unavailable (${error.message})`);
 });

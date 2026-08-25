@@ -143,6 +143,26 @@ class ObserverRepository:
         timestamps = [event.get("created_at") for event in record.events if isinstance(event.get("created_at"), str)]
         return max(timestamps, default="")
 
+    @staticmethod
+    def _conversation_status_for_state(state: str) -> str:
+        return {
+            "opened": "idle",
+            "closed": "idle",
+            "thinking": "thinking",
+            "committed": "executing",
+            "running": "executing",
+            "completed": "completed",
+            "cancelled": "interrupted",
+            "failed": "failed",
+        }.get(state, "idle")
+
+    @classmethod
+    def _conversation_status(cls, records: list[RunRecord]) -> str:
+        if not records:
+            return "idle"
+        latest = max(records, key=cls._record_order_key)
+        return cls._conversation_status_for_state(latest.state)
+
     async def open_run(self, run_id: str | None, task_ref: str, goal: str, allow_reassignment: bool = False) -> RunRecord:
         run_id = run_id or f"run-{uuid4().hex[:12]}"
         snapshot = TaskClosure.minimal(closure_id=task_ref, metadata={"goal": goal})
@@ -177,6 +197,50 @@ class ObserverRepository:
         await self._persist(record)
         return message
 
+    async def begin_refinement(self, run_id: str) -> RunRecord:
+        record = await self._load(run_id)
+        if record.state == "opened":
+            record.state = "thinking"
+            record.events.append(
+                {"phase": "refinement_started", "run_id": run_id, "created_at": datetime.now(timezone.utc).isoformat()}
+            )
+            await self._persist(record)
+        return record
+
+    async def cancel_run(self, run_id: str, reason: str = "user_interrupt") -> RunRecord:
+        record = await self._load(run_id)
+        if record.state in {"completed", "closed", "failed"}:
+            return record
+        record.state = "cancelled"
+        record.outcome = {"reason": reason}
+        record.events.append(
+            {
+                "phase": "run_cancelled",
+                "run_id": run_id,
+                "reason": reason,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        await self._persist(record)
+        return record
+
+    async def fail_run(self, run_id: str, reason: str) -> RunRecord:
+        record = await self._load(run_id)
+        if record.state in {"completed", "closed", "cancelled"}:
+            return record
+        record.state = "failed"
+        record.outcome = {"reason": reason}
+        record.events.append(
+            {
+                "phase": "run_failed",
+                "run_id": run_id,
+                "reason": reason,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        await self._persist(record)
+        return record
+
     async def list_conversations(self) -> list[dict[str, Any]]:
         groups: dict[str, list[RunRecord]] = {}
         for record in await self._all_records():
@@ -192,6 +256,7 @@ class ObserverRepository:
                         "title": records[-1].goal or "New conversation",
                         "run_count": len(records),
                         "latest_run_id": records[-1].run_id,
+                        "status": self._conversation_status(records),
                     },
                 )
             )
@@ -225,12 +290,19 @@ class ObserverRepository:
                 {
                     "run_id": record.run_id,
                     "state": record.state,
+                    "status": self._conversation_status_for_state(record.state),
                     "committed_version": record.committed.version_id if record.committed else None,
                     "execution_id": record.execution_id,
                     "outcome": record.outcome,
                 }
             )
-        return {"conversation_ref": conversation_ref, "messages": messages, "runs": run_summaries, "events": events}
+        return {
+            "conversation_ref": conversation_ref,
+            "status": self._conversation_status(records),
+            "messages": messages,
+            "runs": run_summaries,
+            "events": events,
+        }
 
     async def apply_patch(
         self,

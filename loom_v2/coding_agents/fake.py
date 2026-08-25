@@ -21,7 +21,7 @@ class FakeCodingAgentProvider:
         yield AgentEvent("inspect_plan_readiness", {})
         yield AgentEvent("commit_plan", {})
 
-    async def interrupt(self, turn_ref: str) -> None:
+    async def interrupt(self, turn_ref: str | None = None) -> None:
         return None
 
     async def close(self) -> None:

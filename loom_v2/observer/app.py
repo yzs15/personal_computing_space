@@ -25,6 +25,7 @@ def _run_view(record: Any) -> dict[str, Any]:
         "goal": record.goal,
         "allow_reassignment": record.allow_reassignment,
         "state": record.state,
+        "status": ObserverRepository._conversation_status_for_state(record.state),
         "draft_version": record.draft.version_id,
         "draft_digest": record.draft.snapshot_digest,
         "committed_version": record.committed.version_id if record.committed else None,
@@ -102,6 +103,13 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
             return await app.state.repo.get_conversation(conversation_ref)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="conversation_not_found") from exc
+
+    @app.post("/api/v1/conversations/{conversation_ref}/interrupt")
+    async def interrupt_conversation(conversation_ref: str) -> dict[str, Any]:
+        try:
+            return await app.state.driver.interrupt(conversation_ref)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/v1/conversations/{conversation_ref}/stream")
     async def stream(conversation_ref: str) -> StreamingResponse:
