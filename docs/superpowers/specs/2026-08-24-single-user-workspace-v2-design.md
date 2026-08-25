@@ -1,6 +1,6 @@
 # Loom v2 单用户单 Workspace 垂直切片设计
 
-> 状态：已完成设计讨论，待用户审阅。  
+> 状态：已确认 TypedTerm/VocabularyRegistry/TermSupport 方向，待实施计划与代码验收。  
 > 日期：2026-08-24  
 > 权威输入：`../computility/单用户单Workspace核心架构设计v2.md`
 
@@ -170,12 +170,13 @@ Body = {
 SpecPart<A, S> = {
   application: A,       // 用户工作语义：目标、输入/输出语义、成功标准
   systems: S,            // 平台义务：权限、审计、隔离、保留、可观测性
+  terms: [TypedTerm],    // 可扩展、类型化的语义项；不把词汇表硬编码进闭包结构
   refs: [ResourceRef],   // 已绑定的资源/程序/数据指称，不允许裸路径或裸 URL
   constraints: [Constraint]
 }
 ```
 
-三类主体的最小语义字段如下；具体 wire encoding 留给实现，但不能删掉这些语义面：
+`application`/`systems` 仍然是 3×2 的稳定语义边界，但它们不是一个封闭的字段枚举。每个视图由一组**语义锚点**和可扩展的 `TypedTerm` 组成。锚点确保闭包可被解释、细化和追溯；新领域语义通过注册 term 加入，不需要修改 `TaskClosure` 的顶层结构。下列锚点是本版本的最小投影；具体 wire encoding 留给实现，但不能删掉这些语义面：
 
 ```text
 DataApplication  = { logical_inputs, schema_digest, identity_criterion, expected_cardinality }
@@ -187,12 +188,63 @@ ComputeSystems     = { requirement_refs, admission_requirements }
 
 ComputeRequirement = {
   requirement_id: OpaqueId,
-  key: capability | precision | parallelism | budget | locality | network | deadline,
+  key: VocabularyTerm,
   value: StructuredValue,
   view: "application" | "systems",
   constraint_ref: ConstraintRef?   // 约束语义的唯一归属；匹配-only 要求可为空
 }
 ```
+
+`capability`、`precision`、`parallelism`、`budget`、`locality`、`network`、`deadline` 不再是不可扩展的枚举，而是首批命名空间 term，例如 `loom.compute.precision.v1`、`loom.compute.parallelism.v1` 和 `loom.data.locality.v1`。它们的结构化值、比较/细化关系、传播规则和证据要求由词汇注册表定义。若某项需要传播、强制或审计，唯一语义真相是它引用的 `Constraint`；`TypedTerm`/`ComputeRequirement` 只保存该约束在特定视图中的投影，避免同一条件在 ComputeSpec 和 Constraint 中分叉。
+
+#### TypedTerm 与词汇注册
+
+```text
+TypedTerm = {
+  term_id: OpaqueId,
+  kind: VocabularyTerm,              // 稳定命名空间，例如 loom.compute.precision
+  schema_ref: SchemaRef,             // 版本化 schema + digest
+  value: StructuredValue,
+  criticality: "required" | "advisory",
+  constraint_ref: ConstraintRef?,    // 该 term 若承载约束，指向唯一约束对象
+  refinement_relation_ref: RelationRef?,
+  provenance: [ProvenanceLink]
+}
+
+VocabularyRegistryEntry = {
+  kind: VocabularyTerm,
+  schema_ref: SchemaRef,
+  value_schema: SchemaRef,
+  refinement_relation: RelationRef,
+  propagation_rules: PropagationProfile,
+  evidence_kinds: [EvidenceKind],
+  compatibility: CompatibilityProfile,
+  registry_version: VersionRef
+}
+
+VocabularyRegistry = {
+  registry_id: OpaqueId,
+  version: VersionRef,
+  entries: [VocabularyRegistryEntry],
+  digest: Digest,
+  provenance: [ProvenanceLink]
+}
+```
+
+注册表是 term 的语义权威，不是某个 Slave 的私有配置。它定义 schema、版本兼容、`A(C') ⊨ A(C)` 的细化关系、传播/命运标签以及可接受的 evidence 类型。实现可以把注册表内置在 `contracts` 包或由 Observer 以版本化资源发布，但每个 ClosureVersion 必须记录所使用的 registry digest。
+
+视图的最小锚点与扩展 term 的关系如下：
+
+| 视图 | 稳定锚点（本版本必须可投影） | 可扩展部分 |
+|---|---|---|
+| Data/Application | logical inputs、schema digest、identity criterion、expected cardinality | 数据质量、分区、脱敏、采样等 `loom.data.*` terms |
+| Data/Systems | locality、classification、access/retention profile | 加密、审计、驻留、传输等 `loom.data.systems.*` terms |
+| Program/Application | operation ref、semantics/input/output schema、success semantics | 算法参数、确定性声明、质量目标等 `loom.program.*` terms |
+| Program/Systems | executor/effect/permission、package ref、replay safety | 沙箱、设备、依赖和供应链证明等 `loom.program.systems.*` terms |
+| Compute/Application | capability intent、requirement refs、result expectation | 精度、并行度、成本目标等 `loom.compute.*` terms |
+| Compute/Systems | requirement refs、admission requirements、typed holes/bindings | 网络、调度、隔离、运行时证据等 `loom.compute.systems.*` terms |
+
+因此“最小字段”不是把所有未来概念一次性塞进结构，而是保证三类主体在应用/系统两侧都有可解释锚点；新语义优先作为注册 term 增量演进。删除锚点会破坏闭包的闭合性、细化关系或 provenance；新增 term 则只需注册 schema/关系并更新支持声明。
 
 `Envelope` 至少包含 `closure_id`（稳定任务型资源标识）、`schema_version`、`lineage`、`origin_conversation_ref`、`declared_by`、`authorization_ref`、`result_expectations` 和 `provenance`。稳定标识指向任务闭包家族；每个可执行快照另有 `closure_version`，一次 Execution 只引用一个确定版本。
 
@@ -385,7 +437,24 @@ CapabilityDescriptor = {
   external_effect_class: Known | Idempotent | NonReplayable,
   required_target_profile: TargetProfile,
   secret_slots: [SecretSlot],
-  capability_package_closure_ref: TaskRef?
+  capability_package_closure_ref: TaskRef?,
+  term_support: [TermSupport]
+}
+
+TermSupport = {
+  kind: VocabularyTerm,
+  schema_ref: SchemaRef,
+  support: [
+    "parse",       // 能读取并按注册 schema 做结构校验
+    "preserve",    // 细化/转交时原样保留或按关系收紧
+    "match",       // 能用于能力发现和路由匹配
+    "validate",    // 能确定性判断闭包/绑定是否满足该 term
+    "enforce",     // 执行中或准入时能阻止违反
+    "discharge"    // 能以声明的 evidence 兑现该约束
+  ],
+  execution_stages: ["commit" | "admission" | "execute" | "terminal"],
+  evidence_kinds: [EvidenceKind],
+  support_version: VersionRef
 }
 
 ResourceLifecycleProfile = {
@@ -409,6 +478,21 @@ ResourceInstance = {
 ```
 
 `Index` 只做能力/资源发现，`Resolver` 只把稳定 `ResourceRef` 解析到权威 Descriptor，`DESCRIBE` 只返回调用者有权看到的自描述；发现不授予访问权，解析不创建执行。M0 可以只实现 Observer 内置 registry，但必须保留这三个职责的边界。
+
+#### Required term 的识别与支持边界
+
+`required` 是闭包契约的一部分，不能因为某个组件“不认识”就丢弃或降级为 `advisory`。识别与执行按职责分层：
+
+1. **VocabularyRegistry/Observer** 是共同契约权威：确认 `kind + schema_ref` 已注册、schema/value 可解析、term 的 constraint/refinement relation 合法，并在事件/provenance 中保留 registry digest。Observer 不需要理解每个领域值的业务含义，但必须能做通用结构校验、版本兼容检查和未知 required 的拒绝。
+2. **Driver/coding-agent** 负责把用户意图细化成 canonical `TypedTerm`/`Constraint`，并根据 registry 做 `parse`、`validate`、`preserve` 和 `match`。coding-agent 可以提出 term，却不拥有接受、放宽或伪造 evidence 的权力。
+3. **Slave** 不必理解全量词汇，只需在 `CapabilityDescriptor.term_support` 中声明自身支持的子集。目标节点若要求 `match`、`validate`、`enforce` 或 `discharge`，路由/准入必须找到具有对应 stage support 的 Slave；自报告不能被 Observer 直接伪造成已验证事实，仍需 health/package evidence。
+
+规则固定为：
+
+- `required + preserve` 必须在每次细化、改派和重试中保留或收紧；最终执行目标还必须具备该 term 所要求的 `enforce` 或 `discharge` 能力。
+- `required` 但注册表未知、schema 不兼容、或目标能力缺少所需 stage support，返回结构化 `capability_unavailable`/`validation_failed`，不得静默执行。
+- `advisory` 可以由不理解的组件按 schema/digest 原样 round-trip 保存，但该组件不得声称已匹配、验证、强制或兑现它。
+- `parse/preserve` 与 `match/validate/enforce/discharge` 是可独立声明的能力；因此一个 Slave 可以安全转交未知 advisory term，却不能接收必须在执行点强制的 required term。
 
 能力包不是裸脚本：它是带 operation 契约的可复用 Task Closure，可停在任意细化层；Slave 部署并通过 package test/health check 后，生成一个 `capability_package` ResourceInstance，随后该资源可被 `ComputeBinding` 引用。
 
@@ -593,7 +677,7 @@ Python project 的 `loom_v2/contracts/` 只承载本节 Layer 0 的版本化语�
 
 ### 9.1 单元
 
-覆盖状态转移、3×2 TaskClosure schema、Python 装饰器到 canonical metadata 的编译、任意 predicate/lambda 拒绝、ComputeSpec/typed hole/opaque ComputeBinding、ComputeRequirement 与 ConstraintRef 的单一真相、ClosureContract 收紧关系、policy 合并、持续 `apply_plan_patch` 的 patch algebra、CAS、PlanLimits、引用类型/作用域、criterion evidence、digest/provenance 和 error envelope。
+覆盖状态转移、3×2 TaskClosure schema、Python 装饰器到 canonical metadata 的编译、任意 predicate/lambda 拒绝、`TypedTerm`/`VocabularyRegistry` schema 与版本兼容、未知 required/advisory term 行为、`TermSupport` 分层能力匹配、ComputeSpec/typed hole/opaque ComputeBinding、ComputeRequirement 与 ConstraintRef 的单一真相、ClosureContract 收紧关系、policy 合并、持续 `apply_plan_patch` 的 patch algebra、CAS、PlanLimits、引用类型/作用域、criterion evidence、digest/provenance 和 error envelope。
 
 ### 9.2 集成
 
@@ -621,7 +705,20 @@ Docker Compose 测试 profile 启动四个 PostgreSQL 实例；各服务只使�
 - Driver 本地数据库丢失时进入永久 `driver_state_lost` fence，不从 Slave 残留重建 Run；迟到 Worker/Codex 事件按 session generation/execution epoch 拒绝。
 - 旧 `../loom` 与 `../computility` 内容只作参考；新 Python project 不 import 旧 `multi-agent/internal/*` 或旧运行时包。
 
-## 11. 迁移与扩展路径
+## 11. 下一阶段 Roadmap
+
+首版只实现固定内置 `VocabularyRegistry`、通用 `TypedTerm` round-trip/校验，以及 Slave 对当前 demo terms 的静态 `TermSupport` 声明；不在本版动态安装或执行第三方能力包。未知 `required` term 必须诚实失败，不通过 fallback 到 Fake 或忽略字段来“完成”任务。
+
+下一阶段加入 **Term/Capability Package**：
+
+1. 定义可签名的 package manifest（term kind/schema、细化关系、传播与 evidence 规则、运行时 adapter、兼容范围和 package tests）。
+2. 安装器将 package 注册到版本化 `VocabularyRegistry`，并在 Slave 上完成隔离安装、health/package test、回滚和 capability snapshot 更新。
+3. Driver/Observer 在 commit/admission 时按 registry digest 解析新 term；Slave 只有在对应 `TermSupport` 通过验证后才可接收需要该 term 的节点。
+4. 增加 package 生命周期、撤销/过期、跨版本迁移和 provenance/evidence 审计；旧 closure 继续锁定原 registry/package digest，不被新安装静默改写。
+
+该 roadmap 是能力扩展方向，不改变当前单域边界：能力包仍由 Provider/Slave 负责填充其内部 typed hole，公共 `ComputeBinding` 仍由 Driver/Observer 早绑定并锁定。
+
+## 12. 迁移与扩展路径
 
 首版不迁移旧数据库和旧任务。后续可在不改变 `loom_v2/contracts` 的前提下：
 
