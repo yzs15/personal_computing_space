@@ -62,6 +62,24 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
     async def health() -> dict[str, object]:
         return {"ok": True, "service": "observer"}
 
+    @app.get("/api/v1/runtime")
+    async def runtime() -> dict[str, str | None]:
+        backend = settings.coding_agent_backend.strip().lower()
+        if backend == "codex":
+            label = "Codex app-server"
+            model = settings.codex_model
+        elif backend == "fake":
+            label = "Fake coding agent"
+            model = None
+        else:
+            label = backend or "Unknown coding agent"
+            model = settings.codex_model or None
+        return {
+            "coding_agent_backend": backend,
+            "coding_agent_label": label,
+            "model": model,
+        }
+
     @app.post("/api/v1/runs")
     async def open_run(payload: dict[str, Any]) -> dict[str, Any]:
         record = await app.state.repo.open_run(payload.get("run_id"), payload["task_ref"], payload.get("goal", ""), payload.get("allow_reassignment", False))

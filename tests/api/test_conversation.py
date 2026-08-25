@@ -3,7 +3,8 @@ from fastapi.testclient import TestClient
 from loom_v2.observer.app import create_app
 
 
-def test_message_runs_fake_driver_and_sse_exposes_events():
+def test_message_runs_fake_driver_and_sse_exposes_events(monkeypatch):
+    monkeypatch.setenv("LOOM_CODING_AGENT_BACKEND", "fake")
     client = TestClient(create_app())
     response = client.post("/api/v1/messages", json={"conversation_ref": "conversation-ui", "text": "echo hello"})
     assert response.status_code == 200
