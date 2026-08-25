@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.12, FastAPI/Starlette, Pydantic v2, SQLAlchemy 2 + asyncpg, Alembic-compatible SQL migrations, pytest/pytest-asyncio/httpx, vanilla HTML/CSS/JS with SSE, Docker Compose, local Codex app-server over stdio JSONL.
 
+**Execution status (2026-08-25):** Tasks 1–7 are implemented and verified; Task 8 Compose files/configuration are implemented and validated, but image build/deployment is blocked in this environment because Docker cannot resolve `registry-1.docker.io`. The local venv experience and Fake vertical slice are runnable; the next deployment attempt should rerun the unchanged Compose commands after registry DNS/network is restored.
+
 ---
 
 ### Task 1: Bootstrap the Python project and deterministic test harness
