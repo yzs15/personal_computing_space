@@ -16,6 +16,7 @@ def _run_view(record: Any) -> dict[str, Any]:
         "run_id": record.run_id,
         "task_ref": record.task_ref,
         "goal": record.goal,
+        "allow_reassignment": record.allow_reassignment,
         "state": record.state,
         "draft_version": record.draft.version_id,
         "draft_digest": record.draft.snapshot_digest,
@@ -50,7 +51,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
 
     @app.post("/api/v1/runs")
     async def open_run(payload: dict[str, Any]) -> dict[str, Any]:
-        record = await app.state.repo.open_run(payload.get("run_id"), payload["task_ref"], payload.get("goal", ""))
+        record = await app.state.repo.open_run(payload.get("run_id"), payload["task_ref"], payload.get("goal", ""), payload.get("allow_reassignment", False))
         return _run_view(record)
 
     @app.post("/api/v1/runs/{run_id}/patches")
@@ -98,6 +99,15 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
             return _run_view(await app.state.repo.get_run(run_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="run_not_found") from exc
+
+    @app.post("/api/v1/slaves/{slave_id}/availability")
+    async def set_slave_availability(slave_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        await app.state.repo.set_slave_availability(slave_id, bool(payload.get("available", True)))
+        return {"slave_id": slave_id, "available": bool(payload.get("available", True))}
+
+    @app.post("/api/v1/runs/{run_id}/reconcile")
+    async def reconcile(run_id: str) -> dict[str, Any]:
+        return _run_view(await app.state.repo.reconcile(run_id))
 
     @app.post("/worker/v1/terminal")
     async def terminal(payload: dict[str, Any]) -> dict[str, Any]:

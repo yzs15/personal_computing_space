@@ -30,6 +30,7 @@ class RunRecord:
     task_ref: str
     goal: str
     draft: ClosureVersion
+    allow_reassignment: bool = False
     committed: ClosureVersion | None = None
     execution_id: str | None = None
     execution_epoch: int = 1
@@ -52,6 +53,7 @@ class ObserverRepository:
     def __init__(self, engine: AsyncEngine | None = None) -> None:
         self.runs: dict[str, RunRecord] = {}
         self.idempotency: dict[str, PatchReceipt] = {}
+        self.slave_availability: dict[str, bool] = {"slave-a": True, "slave-b": True}
         self.engine = engine
         self.sessions = make_session_factory(engine) if engine is not None else None
 
@@ -110,7 +112,7 @@ class ObserverRepository:
             self.runs[run_id] = record
             return record
 
-    async def open_run(self, run_id: str | None, task_ref: str, goal: str) -> RunRecord:
+    async def open_run(self, run_id: str | None, task_ref: str, goal: str, allow_reassignment: bool = False) -> RunRecord:
         run_id = run_id or f"run-{uuid4().hex[:12]}"
         snapshot = TaskClosure.minimal(closure_id=task_ref, metadata={"goal": goal})
         version = ClosureVersion(
@@ -120,7 +122,7 @@ class ObserverRepository:
             snapshot_digest=snapshot.canonical_digest(),
             patch_cursor=0,
         )
-        record = RunRecord(run_id=run_id, task_ref=task_ref, goal=goal, draft=version)
+        record = RunRecord(run_id=run_id, task_ref=task_ref, goal=goal, allow_reassignment=allow_reassignment, draft=version)
         self.runs[run_id] = record
         await self._persist(record)
         return record
@@ -206,6 +208,18 @@ class ObserverRepository:
 
     async def get_run(self, run_id: str) -> RunRecord:
         return await self._load(run_id)
+
+    async def set_slave_availability(self, slave_id: str, available: bool) -> None:
+        self.slave_availability[slave_id] = available
+
+    async def reconcile(self, run_id: str) -> RunRecord:
+        record = await self._load(run_id)
+        if record.allow_reassignment and record.execution_id and record.attempts and not self.slave_availability.get("slave-a", True):
+            if not any(attempt["target"] == "slave-b" for attempt in record.attempts):
+                record.attempts.append({"attempt_id": f"attempt-{uuid4().hex[:12]}", "target": "slave-b", "state": "created", "reason": "slave_a_unavailable", "provenance": {"from": "slave-a", "to": "slave-b"}})
+                record.events.append({"phase": "reassigned", "execution_id": record.execution_id, "from": "slave-a", "to": "slave-b"})
+                await self._persist(record)
+        return record
 
     async def terminal(self, payload: dict[str, Any]) -> dict[str, Any]:
         attempt = next((item for record in self.runs.values() for item in record.attempts if item["attempt_id"] == payload.get("attempt_id")), None)
