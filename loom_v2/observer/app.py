@@ -13,6 +13,7 @@ from loom_v2.settings import Settings
 from loom_v2.coding_agents.codex import CodexAppServerProvider
 from loom_v2.coding_agents.fake import FakeCodingAgentProvider
 from loom_v2.driver.service import DriverService
+from loom_v2.slave.service import SlaveService
 
 from .repository import ObserverRepository
 
@@ -29,6 +30,7 @@ def _run_view(record: Any) -> dict[str, Any]:
         "committed_version": record.committed.version_id if record.committed else None,
         "execution_id": record.execution_id,
         "execution_epoch": record.execution_epoch,
+        "outcome": record.outcome,
         "attempts": record.attempts,
         "events": record.events,
     }
@@ -43,6 +45,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
     app.state.repo = repository or ObserverRepository(app.state.engine)
     provider = FakeCodingAgentProvider() if settings.coding_agent_backend == "fake" else CodexAppServerProvider(model=settings.codex_model)
     app.state.driver = DriverService(app.state.repo, provider)
+    app.state.slaves = {"slave-a": SlaveService("slave-a"), "slave-b": SlaveService("slave-b")}
     static_dir = Path(__file__).resolve().parents[1] / "web" / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -120,6 +123,13 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/api/v1/runs/{run_id}/close")
+    async def close_run(run_id: str) -> dict[str, Any]:
+        try:
+            return _run_view(await app.state.repo.close_run(run_id))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.get("/api/v1/runs/{run_id}")
     async def get_run(run_id: str) -> dict[str, Any]:
         try:
@@ -127,10 +137,20 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="run_not_found") from exc
 
+    @app.get("/api/v1/capabilities")
+    async def capabilities() -> list[dict[str, Any]]:
+        return [
+            {"slave_id": slave_id, "available": slave.available, "replica": slave.replica.state, "term_support": [support.model_dump(mode="json") for support in slave.term_support()]}
+            for slave_id, slave in app.state.slaves.items()
+        ]
+
     @app.post("/api/v1/slaves/{slave_id}/availability")
     async def set_slave_availability(slave_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        await app.state.repo.set_slave_availability(slave_id, bool(payload.get("available", True)))
-        return {"slave_id": slave_id, "available": bool(payload.get("available", True))}
+        available = bool(payload.get("available", True))
+        await app.state.repo.set_slave_availability(slave_id, available)
+        if slave_id in app.state.slaves:
+            app.state.slaves[slave_id].available = available
+        return {"slave_id": slave_id, "available": available}
 
     @app.post("/api/v1/runs/{run_id}/reconcile")
     async def reconcile(run_id: str) -> dict[str, Any]:

@@ -37,6 +37,7 @@ class RunRecord:
     execution_id: str | None = None
     execution_epoch: int = 1
     state: str = "opened"
+    outcome: dict[str, Any] | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     attempts: list[dict[str, Any]] = field(default_factory=list)
 
@@ -80,6 +81,7 @@ class ObserverRepository:
                 "execution_id": record.execution_id,
                 "execution_epoch": record.execution_epoch,
                 "state": record.state,
+                "outcome": record.outcome,
                 "attempts": record.attempts,
                 "events": record.events,
             }
@@ -110,6 +112,7 @@ class ObserverRepository:
                 execution_id=row.execution_id,
                 execution_epoch=row.execution_epoch,
                 state=row.state,
+                outcome=row.outcome,
                 attempts=row.attempts or [],
                 events=row.events or [],
             )
@@ -219,6 +222,25 @@ class ObserverRepository:
 
     async def get_run(self, run_id: str) -> RunRecord:
         return await self._load(run_id)
+
+    async def record_result(self, run_id: str, result: dict[str, Any]) -> RunRecord:
+        record = await self._load(run_id)
+        if record.state != "running":
+            raise ValueError("execution_not_running")
+        record.outcome = result
+        record.state = "completed"
+        record.events.append({"phase": "execution_completed", "execution_id": record.execution_id, "resource_ref": result.get("resource_ref")})
+        await self._persist(record)
+        return record
+
+    async def close_run(self, run_id: str) -> RunRecord:
+        record = await self._load(run_id)
+        if record.state not in {"completed", "failed", "cancelled"}:
+            raise ValueError("run_not_terminal")
+        record.state = "closed"
+        record.events.append({"phase": "run_closed", "execution_id": record.execution_id})
+        await self._persist(record)
+        return record
 
     async def set_slave_availability(self, slave_id: str, available: bool) -> None:
         self.slave_availability[slave_id] = available

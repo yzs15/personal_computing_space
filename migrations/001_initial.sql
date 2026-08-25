@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS runs (
     execution_id VARCHAR(128),
     execution_epoch INTEGER NOT NULL DEFAULT 1,
     state VARCHAR(64) NOT NULL,
+    outcome JSONB,
     attempts JSONB NOT NULL DEFAULT '[]'::jsonb,
     events JSONB NOT NULL DEFAULT '[]'::jsonb
 );

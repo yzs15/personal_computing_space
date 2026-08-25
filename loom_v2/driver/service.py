@@ -5,15 +5,17 @@ from uuid import uuid4
 
 from loom_v2.coding_agents.base import CodingAgentProvider
 from loom_v2.observer.repository import ObserverRepository
+from loom_v2.slave.executor import ExecutionResult, execute_operation
 
 from .tools import DriverTools
 
 
 class DriverService:
-    def __init__(self, repository: ObserverRepository, provider: CodingAgentProvider) -> None:
+    def __init__(self, repository: ObserverRepository, provider: CodingAgentProvider, executor=execute_operation) -> None:
         self.repository = repository
         self.provider = provider
         self.tools = DriverTools(repository)
+        self.executor = executor
 
     async def run_prompt(self, conversation_ref: str, prompt: str) -> dict[str, Any]:
         run = await self.repository.open_run(None, conversation_ref, prompt)
@@ -30,6 +32,11 @@ class DriverService:
             if committed is None:
                 committed = (await self.tools.commit_plan(run.run_id))["closure_version"]
             execution = await self.tools.start_run(run.run_id, committed)
-            return {"run_id": run.run_id, "closure_version": committed, "patches": patches, **execution}
+            result: ExecutionResult = await self.executor("echo", {"text": prompt})
+            completed = await self.repository.record_result(
+                run.run_id,
+                {"resource_ref": result.resource_ref.resource_id, "digest": result.digest, "value": result.value},
+            )
+            return {"run_id": run.run_id, "closure_version": committed, "patches": patches, "state": completed.state, "resource_ref": result.resource_ref.resource_id, "execution_id": execution["execution_id"], "execution_epoch": execution["execution_epoch"]}
         finally:
             await self.provider.close()

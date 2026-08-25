@@ -8,7 +8,11 @@ def test_message_runs_fake_driver_and_sse_exposes_events():
     response = client.post("/api/v1/messages", json={"conversation_ref": "conversation-ui", "text": "echo hello"})
     assert response.status_code == 200
     payload = response.json()
-    assert payload["state"] == "running"
+    assert payload["state"] == "completed"
+    assert payload["resource_ref"].startswith("result-")
     stream = client.get("/api/v1/conversations/conversation-ui/stream")
     assert stream.status_code == 200
     assert "execution_started" in stream.text
+    closed = client.post(f"/api/v1/runs/{payload['run_id']}/close")
+    assert closed.status_code == 200
+    assert closed.json()["state"] == "closed"
