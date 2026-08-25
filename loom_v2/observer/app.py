@@ -68,7 +68,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
     async def message(payload: dict[str, Any]) -> dict[str, Any]:
         try:
             return await app.state.driver.run_prompt(payload.get("conversation_ref", "conversation-default"), payload.get("text", ""))
-        except RuntimeError as exc:
+        except (RuntimeError, FileNotFoundError) as exc:
             return JSONResponse(status_code=503, content={"code": str(exc), "retryable": True})
 
     @app.get("/api/v1/conversations/{conversation_ref}/stream")

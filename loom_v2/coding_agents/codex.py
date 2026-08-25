@@ -17,15 +17,18 @@ class CodexAppServerProvider:
         self.request_id = 0
 
     async def start(self, conversation_ref: str, workspace_root: str) -> str:
-        self.process = await asyncio.create_subprocess_exec(
-            self.executable,
-            "app-server",
-            "--listen",
-            "stdio://",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                self.executable,
+                "app-server",
+                "--listen",
+                "stdio://",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            raise RuntimeError("coding_agent_unavailable") from exc
         await self._send({"jsonrpc": "2.0", "id": self._next_id(), "method": "initialize", "params": {"clientInfo": {"name": "loom-v2", "version": "0.1.0"}}})
         await self._read_message()
         await self._send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
