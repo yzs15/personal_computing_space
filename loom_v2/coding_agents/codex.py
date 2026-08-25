@@ -52,6 +52,11 @@ class CodexAppServerProvider:
             method = message.get("method", "")
             if method == "turn/completed":
                 break
+            if method == "item/completed":
+                item = message.get("params", {}).get("item", {})
+                if item.get("type") == "agentMessage" and item.get("text"):
+                    yield AgentEvent("assistant_text", {"text": item["text"]})
+                continue
             if method.startswith("item/") or method.startswith("turn/"):
                 yield AgentEvent(method, message.get("params", {}))
 
