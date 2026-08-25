@@ -7,7 +7,7 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from loom_v2.contracts.types import ClosureVersion, TaskClosure
+from loom_v2.contracts.types import ClosureVersion, ComputeSpec, TaskClosure, TypedHole
 from loom_v2.db.base import Base
 from loom_v2.db.models import IdempotencyRow, RunRow
 from loom_v2.db.session import make_session_factory
@@ -146,12 +146,14 @@ class ObserverRepository:
             if kind == "set_result_expectation":
                 snapshot.metadata["result_expectation"] = operation.get("value", {})
             elif kind == "set_compute_spec":
-                snapshot.compute = operation["value"]
+                snapshot.compute = ComputeSpec.model_validate(operation["value"])
             elif kind == "add_constraint":
                 snapshot.constraints.append(operation["value"])
             elif kind == "set_program_ref":
                 snapshot.program.operation_ref = operation["value"]
-            elif kind in {"add_typed_hole", "bind_compute_hole"}:
+            elif kind == "add_typed_hole":
+                snapshot.compute.typed_holes.append(TypedHole.model_validate(operation["value"]))
+            elif kind == "bind_compute_hole":
                 snapshot.metadata.setdefault("patch_ops", []).append(operation)
             else:
                 raise ValueError(f"unsupported_patch:{kind}")

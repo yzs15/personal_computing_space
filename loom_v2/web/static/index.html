@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loom v2 Workspace</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="conversation">
+      <header><h1>Loom v2</h1><span id="agent-status">Fake coding-agent · deepseek-v4-flash</span></header>
+      <div id="timeline" class="timeline" aria-live="polite">Start a conversation to refine a task closure.</div>
+      <form id="prompt-form"><textarea id="prompt" placeholder="Describe the computation…"></textarea><button>Send</button></form>
+    </section>
+    <aside class="drawer">
+      <h2>Run drawer</h2>
+      <dl><dt>ClosureVersion</dt><dd id="closure-version">—</dd><dt>Readiness blockers</dt><dd id="blockers">—</dd><dt>Event cursor</dt><dd id="event-cursor">0</dd></dl>
+      <h3>Nodes / Attempts</h3><pre id="attempts">—</pre>
+      <h3>Provenance</h3><pre id="provenance">—</pre>
+      <h3>Resources</h3><pre id="resources">—</pre>
+      <section class="slaves"><h3>WorkspaceReplica</h3><div>Slave A <b id="slave-a">ready</b></div><div>Slave B <b id="slave-b">ready</b></div></section>
+    </aside>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

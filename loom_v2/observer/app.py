@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from loom_v2.db.session import make_engine
 from loom_v2.settings import Settings
@@ -35,6 +37,8 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
     if repository is None and not settings.database_url.startswith("sqlite+aiosqlite:///:memory:"):
         app.state.engine = make_engine(settings.database_url)
     app.state.repo = repository or ObserverRepository(app.state.engine)
+    static_dir = Path(__file__).resolve().parents[1] / "web" / "static"
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     @app.on_event("startup")
     async def initialize_database() -> None:
@@ -118,7 +122,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
 
     @app.get("/")
     async def home() -> FileResponse:
-        return FileResponse("loom_v2/web/static/index.html")
+        return FileResponse(static_dir / "index.html")
 
     return app
 
