@@ -14,6 +14,10 @@
       <form id="prompt-form"><textarea id="prompt" placeholder="Describe the computation…"></textarea><button>Send</button></form>
     </section>
     <aside class="drawer">
+      <section class="conversation-picker">
+        <div class="drawer-heading"><h2>Conversations</h2><button id="new-conversation" type="button">New</button></div>
+        <nav id="conversation-list" aria-label="Conversations"></nav>
+      </section>
       <h2>Run drawer</h2>
       <dl><dt>ClosureVersion</dt><dd id="closure-version">—</dd><dt>Readiness blockers</dt><dd id="blockers">—</dd><dt>Event cursor</dt><dd id="event-cursor">0</dd></dl>
       <h3>Nodes / Attempts</h3><pre id="attempts">—</pre>
