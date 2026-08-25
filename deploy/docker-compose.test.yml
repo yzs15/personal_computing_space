@@ -1,4 +1,8 @@
 services:
+  observer:
+    environment:
+      LOOM_CODING_AGENT_BACKEND: fake
+
   driver:
     build: ..
     command: ["python", "-m", "loom_v2.cli", "--self-test"]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import asyncio
 from typing import Any
 from uuid import uuid4
 
@@ -18,8 +20,16 @@ class DriverService:
         self.executor = executor
 
     async def run_prompt(self, conversation_ref: str, prompt: str) -> dict[str, Any]:
+        timeout_seconds = float(os.getenv("LOOM_CODING_AGENT_TIMEOUT_SECONDS", "30"))
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                return await self._run_prompt(conversation_ref, prompt)
+        except TimeoutError as exc:
+            raise RuntimeError("coding_agent_timeout") from exc
+
+    async def _run_prompt(self, conversation_ref: str, prompt: str) -> dict[str, Any]:
         run = await self.repository.open_run(None, conversation_ref, prompt)
-        await self.provider.start(conversation_ref, "/workspace")
+        await self.provider.start(conversation_ref, os.getenv("LOOM_WORKSPACE_ROOT", "/workspace"))
         patches = 0
         committed: str | None = None
         try:

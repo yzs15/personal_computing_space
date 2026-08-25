@@ -15,6 +15,7 @@ class CodexAppServerProvider:
         self.executable = executable
         self.process: asyncio.subprocess.Process | None = None
         self.request_id = 0
+        self.thread_id: str | None = None
 
     async def start(self, conversation_ref: str, workspace_root: str) -> str:
         try:
@@ -29,19 +30,25 @@ class CodexAppServerProvider:
             )
         except (FileNotFoundError, OSError) as exc:
             raise RuntimeError("coding_agent_unavailable") from exc
-        await self._send({"jsonrpc": "2.0", "id": self._next_id(), "method": "initialize", "params": {"clientInfo": {"name": "loom-v2", "version": "0.1.0"}}})
-        await self._read_message()
+        initialize_id = self._next_id()
+        await self._send({"jsonrpc": "2.0", "id": initialize_id, "method": "initialize", "params": {"clientInfo": {"name": "loom-v2", "version": "0.1.0"}}})
+        await self._read_response(initialize_id)
         await self._send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
-        await self._send({"jsonrpc": "2.0", "id": self._next_id(), "method": "thread/start", "params": {"model": self.model, "cwd": workspace_root, "metadata": {"conversation_ref": conversation_ref}}})
-        response = await self._read_message()
-        return str(response.get("result", {}).get("thread", {}).get("id", conversation_ref))
+        thread_request_id = self._next_id()
+        await self._send({"jsonrpc": "2.0", "id": thread_request_id, "method": "thread/start", "params": {"model": self.model, "cwd": workspace_root, "metadata": {"conversation_ref": conversation_ref}}})
+        response = await self._read_response(thread_request_id)
+        self.thread_id = str(response.get("result", {}).get("thread", {}).get("id", conversation_ref))
+        return self.thread_id
 
     async def send_turn(self, user_message: str) -> AsyncIterator[AgentEvent]:
         if self.process is None:
             raise RuntimeError("coding_agent_unavailable")
-        await self._send({"jsonrpc": "2.0", "id": self._next_id(), "method": "turn/start", "params": {"input": [{"type": "text", "text": user_message}]}})
+        turn_request_id = self._next_id()
+        await self._send({"jsonrpc": "2.0", "id": turn_request_id, "method": "turn/start", "params": {"threadId": self.thread_id, "input": [{"type": "text", "text": user_message}]}})
         while True:
             message = await self._read_message()
+            if message.get("id") == turn_request_id:
+                continue
             method = message.get("method", "")
             if method == "turn/completed":
                 break
@@ -57,6 +64,7 @@ class CodexAppServerProvider:
             self.process.terminate()
             await self.process.wait()
             self.process = None
+            self.thread_id = None
 
     def _next_id(self) -> int:
         self.request_id += 1
@@ -78,3 +86,12 @@ class CodexAppServerProvider:
             return json.loads(line)
         except json.JSONDecodeError as exc:
             raise RuntimeError("coding_agent_protocol_error") from exc
+
+    async def _read_response(self, request_id: int) -> dict[str, Any]:
+        while True:
+            message = await self._read_message()
+            if message.get("id") != request_id:
+                continue
+            if "error" in message:
+                raise RuntimeError("coding_agent_protocol_error")
+            return message
