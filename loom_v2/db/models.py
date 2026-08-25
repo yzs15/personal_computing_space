@@ -1,4 +1,4 @@
-from sqlalchemy import JSON, Integer, String
+from sqlalchemy import JSON, Boolean, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -10,6 +10,7 @@ class RunRow(Base):
     run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     task_ref: Mapped[str] = mapped_column(String(256), nullable=False)
     goal: Mapped[str] = mapped_column(String(2048), nullable=False)
+    allow_reassignment: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     draft: Mapped[dict] = mapped_column(JSON, nullable=False)
     committed: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     execution_id: Mapped[str | None] = mapped_column(String(128), nullable=True)

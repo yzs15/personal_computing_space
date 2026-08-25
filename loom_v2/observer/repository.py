@@ -7,6 +7,8 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from loom_v2.contracts.constraints import Constraint
+from loom_v2.contracts.refinement import is_monotonic_tightening
 from loom_v2.contracts.types import ClosureVersion, ComputeSpec, TaskClosure, TypedHole
 from loom_v2.db.base import Base
 from loom_v2.db.models import IdempotencyRow, RunRow
@@ -72,6 +74,7 @@ class ObserverRepository:
                 "run_id": record.run_id,
                 "task_ref": record.task_ref,
                 "goal": record.goal,
+                "allow_reassignment": record.allow_reassignment,
                 "draft": record.draft.model_dump(mode="json"),
                 "committed": record.committed.model_dump(mode="json") if record.committed else None,
                 "execution_id": record.execution_id,
@@ -102,6 +105,7 @@ class ObserverRepository:
                 task_ref=row.task_ref,
                 goal=row.goal,
                 draft=ClosureVersion.model_validate(row.draft),
+                allow_reassignment=row.allow_reassignment,
                 committed=ClosureVersion.model_validate(row.committed) if row.committed else None,
                 execution_id=row.execution_id,
                 execution_epoch=row.execution_epoch,
@@ -148,7 +152,12 @@ class ObserverRepository:
             elif kind == "set_compute_spec":
                 snapshot.compute = ComputeSpec.model_validate(operation["value"])
             elif kind == "add_constraint":
-                snapshot.constraints.append(operation["value"])
+                snapshot.constraints.append(Constraint.model_validate(operation["value"]))
+            elif kind == "tighten_constraint":
+                value = operation["value"]
+                if not is_monotonic_tightening(value["parent"], value["child"]):
+                    raise ValueError("constraint_not_monotonic")
+                snapshot.metadata.setdefault("refined_constraints", []).append(value["child"])
             elif kind == "set_program_ref":
                 snapshot.program.operation_ref = operation["value"]
             elif kind == "add_typed_hole":
