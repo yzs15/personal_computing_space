@@ -34,5 +34,9 @@ configuration and never copies credentials into Loom. If the local app-server or
 model is unavailable, the UI reports `coding_agent_unavailable` rather than
 silently switching to Fake.
 
+The host Driver allows up to 90 seconds per Codex turn by default
+(`LOOM_CODING_AGENT_TIMEOUT_SECONDS` can override this) and reports a retryable
+`coding_agent_timeout` if the local upstream does not finish in that window.
+
 The next-stage Term/Capability Package work is intentionally roadmap-only in
 this version; an unknown required term fails with a structured capability error.

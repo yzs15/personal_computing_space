@@ -20,7 +20,7 @@ class DriverService:
         self.executor = executor
 
     async def run_prompt(self, conversation_ref: str, prompt: str) -> dict[str, Any]:
-        timeout_seconds = float(os.getenv("LOOM_CODING_AGENT_TIMEOUT_SECONDS", "30"))
+        timeout_seconds = float(os.getenv("LOOM_CODING_AGENT_TIMEOUT_SECONDS", "90"))
         try:
             async with asyncio.timeout(timeout_seconds):
                 return await self._run_prompt(conversation_ref, prompt)
