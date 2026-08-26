@@ -45,8 +45,8 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         app.state.engine = make_engine(settings.database_url)
     app.state.repo = repository or ObserverRepository(app.state.engine)
     provider = FakeCodingAgentProvider() if settings.coding_agent_backend == "fake" else CodexAppServerProvider(model=settings.codex_model)
-    app.state.driver = DriverService(app.state.repo, provider)
     app.state.slaves = {"slave-a": SlaveService("slave-a"), "slave-b": SlaveService("slave-b")}
+    app.state.driver = DriverService(app.state.repo, provider, slaves=app.state.slaves)
     static_dir = Path(__file__).resolve().parents[1] / "web" / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -145,7 +145,17 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
             "draft_version": receipt.draft_version,
             "draft_digest": receipt.draft_digest,
             "patch_cursor": receipt.patch_cursor,
+            "readiness": receipt.readiness,
         }
+
+    @app.get("/api/v1/runs/{run_id}/readiness")
+    async def readiness(run_id: str) -> dict[str, Any]:
+        try:
+            return await app.state.repo.inspect_readiness(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="run_not_found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/v1/runs/{run_id}/commit")
     async def commit(run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -179,7 +189,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
     @app.get("/api/v1/capabilities")
     async def capabilities() -> list[dict[str, Any]]:
         return [
-            {"slave_id": slave_id, "available": slave.available, "replica": slave.replica.state, "term_support": [support.model_dump(mode="json") for support in slave.term_support()]}
+            {"slave_id": slave_id, "available": slave.available, "replica": slave.replica.state, "operations": sorted(slave.supported_operations), "term_support": [support.model_dump(mode="json") for support in slave.term_support()]}
             for slave_id, slave in app.state.slaves.items()
         ]
 

@@ -18,6 +18,24 @@ class FakeCodingAgentProvider:
         yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "set_program_ref", "value": "loom://echo"}]})
         yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "set_compute_spec", "value": {"operation_ref": "loom://echo"}}]})
         yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "add_typed_hole", "value": {"hole_id": "h_compute"}}]})
+        yield AgentEvent(
+            "apply_plan_patch",
+            {
+                "ops": [
+                    {
+                        "kind": "bind_compute_hole",
+                        "value": {
+                            "binding_id": "binding-h_compute",
+                            "hole_id": "h_compute",
+                            "capability_descriptor_ref": {"resource_id": "capability://slave-a/echo"},
+                            "target_resource_ref": {"resource_id": "slave-a"},
+                            "realization_digest": "fake-realization-echo",
+                            "bound_by": "fake-driver",
+                        },
+                    }
+                ]
+            },
+        )
         yield AgentEvent("inspect_plan_readiness", {})
         yield AgentEvent("commit_plan", {})
 

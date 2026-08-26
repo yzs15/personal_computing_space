@@ -117,6 +117,7 @@ class TaskClosure(ContractModel):
     program: ProgramApplication = Field(default_factory=ProgramApplication)
     program_systems: ProgramSystems = Field(default_factory=ProgramSystems)
     compute: ComputeSpec = Field(default_factory=ComputeSpec)
+    compute_bindings: list[ComputeBinding] = Field(default_factory=list)
     compute_application: ComputeApplication = Field(default_factory=ComputeApplication)
     compute_systems: ComputeSystems = Field(default_factory=ComputeSystems)
     terms: list[TypedTerm] = Field(default_factory=list)

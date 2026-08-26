@@ -12,7 +12,7 @@ class DriverTools:
     async def apply_plan_patch(self, run_id: str, operation_id: str, ops: list[dict[str, Any]]) -> dict[str, Any]:
         run = await self.repository.get_run(run_id)
         receipt = await self.repository.apply_patch(run_id, run.draft_version, run.draft_digest, operation_id, ops)
-        return {"receipt": receipt.receipt, "draft_version": receipt.draft_version, "draft_digest": receipt.draft_digest, "patch_cursor": receipt.patch_cursor}
+        return {"receipt": receipt.receipt, "draft_version": receipt.draft_version, "draft_digest": receipt.draft_digest, "patch_cursor": receipt.patch_cursor, "readiness": receipt.readiness}
 
     async def commit_plan(self, run_id: str) -> dict[str, Any]:
         run = await self.repository.get_run(run_id)
@@ -21,3 +21,6 @@ class DriverTools:
 
     async def start_run(self, run_id: str, closure_version: str) -> dict[str, Any]:
         return await self.repository.start(run_id, closure_version)
+
+    async def inspect_plan_readiness(self, run_id: str) -> dict[str, Any]:
+        return await self.repository.inspect_readiness(run_id)

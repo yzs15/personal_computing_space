@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import json
 from typing import Any
 from uuid import uuid4
 
@@ -10,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from loom_v2.contracts.constraints import Constraint
 from loom_v2.contracts.refinement import is_monotonic_tightening
-from loom_v2.contracts.types import ClosureVersion, ComputeSpec, TaskClosure, TypedHole
+from loom_v2.contracts.types import ClosureVersion, ComputeBinding, ComputeSpec, TaskClosure, TypedHole
 from loom_v2.db.base import Base
 from loom_v2.db.models import IdempotencyRow, RunRow
 from loom_v2.db.session import make_session_factory
@@ -25,6 +26,7 @@ class PatchReceipt:
     draft_digest: str
     snapshot: TaskClosure
     patch_cursor: int
+    readiness: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -58,6 +60,10 @@ class ObserverRepository:
         self.runs: dict[str, RunRecord] = {}
         self.idempotency: dict[str, PatchReceipt] = {}
         self.slave_availability: dict[str, bool] = {"slave-a": True, "slave-b": True}
+        self.slave_capabilities: dict[str, dict[str, Any]] = {
+            "slave-a": {"operations": {"echo", "hash", "sort"}},
+            "slave-b": {"operations": {"echo", "hash", "sort"}},
+        }
         self.engine = engine
         self.sessions = make_session_factory(engine) if engine is not None else None
 
@@ -163,6 +169,56 @@ class ObserverRepository:
         latest = max(records, key=cls._record_order_key)
         return cls._conversation_status_for_state(latest.state)
 
+    @staticmethod
+    def _operation_name(operation_ref: str) -> str:
+        if not operation_ref:
+            return ""
+        return operation_ref.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+
+    def _evaluate_readiness(self, snapshot: TaskClosure) -> dict[str, Any]:
+        operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
+        operation = self._operation_name(operation_ref)
+        blockers: list[dict[str, Any]] = []
+        bindings_by_hole = {binding.hole_id: binding for binding in snapshot.compute_bindings}
+
+        for hole in snapshot.compute.typed_holes:
+            binding = bindings_by_hole.get(hole.hole_id)
+            if hole.status != "bound" or not hole.binding_ref:
+                blockers.append({"code": "typed_hole_unbound", "hole_id": hole.hole_id})
+                continue
+            if binding is None or binding.binding_id != hole.binding_ref:
+                blockers.append({"code": "compute_binding_missing", "hole_id": hole.hole_id, "binding_ref": hole.binding_ref})
+                continue
+            target = binding.target_resource_ref.resource_id
+            capability = self.slave_capabilities.get(target)
+            if capability is None:
+                blockers.append({"code": "capability_unavailable", "hole_id": hole.hole_id, "target_resource_ref": target})
+                continue
+            if not self.slave_availability.get(target, False):
+                blockers.append({"code": "slave_unavailable", "hole_id": hole.hole_id, "target_resource_ref": target})
+            if operation and operation not in capability.get("operations", set()):
+                blockers.append({"code": "capability_unavailable", "operation": operation, "target_resource_ref": target})
+
+        if operation and not snapshot.compute.typed_holes:
+            default_target = "slave-a"
+            capability = self.slave_capabilities.get(default_target, {})
+            if not self.slave_availability.get(default_target, False):
+                blockers.append({"code": "slave_unavailable", "target_resource_ref": default_target})
+            if operation not in capability.get("operations", set()):
+                blockers.append({"code": "capability_unavailable", "operation": operation, "target_resource_ref": default_target})
+
+        return {
+            "ready": not blockers,
+            "operation_ref": operation_ref,
+            "operation": operation,
+            "blockers": blockers,
+            "bindings": [binding.model_dump(mode="json") for binding in snapshot.compute_bindings],
+        }
+
+    @staticmethod
+    def _readiness_error(readiness: dict[str, Any]) -> ValueError:
+        return ValueError("readiness_blocked:" + json.dumps(readiness["blockers"], sort_keys=True, ensure_ascii=False))
+
     async def open_run(self, run_id: str | None, task_ref: str, goal: str, allow_reassignment: bool = False) -> RunRecord:
         run_id = run_id or f"run-{uuid4().hex[:12]}"
         snapshot = TaskClosure.minimal(closure_id=task_ref, metadata={"goal": goal})
@@ -206,6 +262,30 @@ class ObserverRepository:
             )
             await self._persist(record)
         return record
+
+    async def inspect_readiness(self, run_id: str, version_id: str | None = None) -> dict[str, Any]:
+        record = await self._load(run_id)
+        if version_id is None or version_id == record.draft.version_id:
+            snapshot = record.draft.snapshot
+            inspected_version = record.draft.version_id
+        elif record.committed is not None and version_id == record.committed.version_id:
+            snapshot = record.committed.snapshot
+            inspected_version = record.committed.version_id
+        else:
+            raise ValueError("version_conflict")
+        readiness = self._evaluate_readiness(snapshot)
+        record.events.append(
+            {
+                "phase": "readiness_inspected",
+                "run_id": run_id,
+                "version": inspected_version,
+                "ready": readiness["ready"],
+                "blockers": readiness["blockers"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        await self._persist(record)
+        return {"run_id": run_id, "version": inspected_version, **readiness}
 
     async def cancel_run(self, run_id: str, reason: str = "user_interrupt") -> RunRecord:
         record = await self._load(run_id)
@@ -334,9 +414,27 @@ class ObserverRepository:
             elif kind == "set_program_ref":
                 snapshot.program.operation_ref = operation["value"]
             elif kind == "add_typed_hole":
-                snapshot.compute.typed_holes.append(TypedHole.model_validate(operation["value"]))
+                hole = TypedHole.model_validate(operation["value"])
+                if any(existing.hole_id == hole.hole_id for existing in snapshot.compute.typed_holes):
+                    raise ValueError(f"duplicate_typed_hole:{hole.hole_id}")
+                snapshot.compute.typed_holes.append(hole)
             elif kind == "bind_compute_hole":
-                snapshot.metadata.setdefault("patch_ops", []).append(operation)
+                value = operation.get("value", {})
+                if isinstance(value, dict) and "binding" in value:
+                    value = value["binding"]
+                binding = ComputeBinding.model_validate(value)
+                hole = next((item for item in snapshot.compute.typed_holes if item.hole_id == binding.hole_id), None)
+                if hole is None:
+                    raise ValueError(f"typed_hole_not_found:{binding.hole_id}")
+                snapshot.compute_bindings = [item for item in snapshot.compute_bindings if item.hole_id != binding.hole_id]
+                snapshot.compute_bindings.append(binding)
+                hole.status = "bound"
+                hole.binding_ref = binding.binding_id
+            elif kind == "set_execution_payload":
+                payload = operation.get("value", {})
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid_execution_payload")
+                snapshot.metadata["execution_payload"] = payload
             else:
                 raise ValueError(f"unsupported_patch:{kind}")
         new_version = ClosureVersion(
@@ -357,11 +455,12 @@ class ObserverRepository:
             snapshot=snapshot,
             patch_cursor=new_version.patch_cursor,
         )
+        receipt.readiness = self._evaluate_readiness(snapshot)
         self.idempotency[operation_id] = receipt
         record.events.append({"phase": "draft_patched", "operation_id": operation_id, "version": new_version.version_id})
         if self.sessions is not None:
             async with self.sessions() as session:
-                session.add(IdempotencyRow(operation_id=operation_id, receipt={"receipt": receipt.receipt, "run_id": receipt.run_id, "kind": receipt.kind, "draft_version": receipt.draft_version, "draft_digest": receipt.draft_digest, "patch_cursor": receipt.patch_cursor}))
+                session.add(IdempotencyRow(operation_id=operation_id, receipt={"receipt": receipt.receipt, "run_id": receipt.run_id, "kind": receipt.kind, "draft_version": receipt.draft_version, "draft_digest": receipt.draft_digest, "patch_cursor": receipt.patch_cursor, "readiness": receipt.readiness}))
                 await session.commit()
         await self._persist(record)
         return receipt
@@ -370,6 +469,20 @@ class ObserverRepository:
         record = await self._load(run_id)
         if record.draft.version_id != version_id or record.draft.snapshot_digest != digest:
             raise ValueError("version_conflict")
+        readiness = self._evaluate_readiness(record.draft.snapshot)
+        record.events.append(
+            {
+                "phase": "readiness_inspected",
+                "run_id": run_id,
+                "version": record.draft.version_id,
+                "ready": readiness["ready"],
+                "blockers": readiness["blockers"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        if not readiness["ready"]:
+            await self._persist(record)
+            raise self._readiness_error(readiness)
         committed = record.draft.model_copy(update={"kind": "committed", "version_id": f"committed-{uuid4().hex[:12]}"})
         record.committed = committed
         record.state = "committed"
@@ -381,11 +494,28 @@ class ObserverRepository:
         record = await self._load(run_id)
         if record.committed is None or record.committed.version_id != version_id:
             raise ValueError("closure_not_committed")
+        readiness = self._evaluate_readiness(record.committed.snapshot)
+        record.events.append(
+            {
+                "phase": "readiness_inspected",
+                "run_id": run_id,
+                "version": record.committed.version_id,
+                "ready": readiness["ready"],
+                "blockers": readiness["blockers"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        if not readiness["ready"]:
+            await self._persist(record)
+            raise self._readiness_error(readiness)
         if record.execution_id:
             return {"execution_id": record.execution_id, "state": record.state, "execution_epoch": record.execution_epoch}
         record.execution_id = f"execution-{uuid4().hex[:12]}"
         record.state = "running"
-        record.attempts.append({"attempt_id": f"attempt-{uuid4().hex[:12]}", "target": "slave-a", "state": "created"})
+        target = "slave-a"
+        if record.committed.snapshot.compute_bindings:
+            target = record.committed.snapshot.compute_bindings[0].target_resource_ref.resource_id
+        record.attempts.append({"attempt_id": f"attempt-{uuid4().hex[:12]}", "target": target, "state": "created"})
         record.events.append({"phase": "execution_started", "execution_id": record.execution_id})
         await self._persist(record)
         return {"execution_id": record.execution_id, "state": record.state, "execution_epoch": record.execution_epoch}
@@ -414,6 +544,9 @@ class ObserverRepository:
 
     async def set_slave_availability(self, slave_id: str, available: bool) -> None:
         self.slave_availability[slave_id] = available
+
+    async def set_slave_capabilities(self, slave_id: str, operations: set[str]) -> None:
+        self.slave_capabilities.setdefault(slave_id, {})["operations"] = set(operations)
 
     async def reconcile(self, run_id: str) -> RunRecord:
         record = await self._load(run_id)
