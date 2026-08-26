@@ -38,6 +38,25 @@ The host Driver allows up to 90 seconds per Codex turn by default
 (`LOOM_CODING_AGENT_TIMEOUT_SECONDS` can override this) and reports a retryable
 `coding_agent_timeout` if the local upstream does not finish in that window.
 
+`open_run` is a coding-agent decision: after clarifying the user's goal, the
+agent calls it through the conversation-scoped Driver MCP surface. The Driver
+injects and verifies the conversation/user/Workspace identity, while Observer
+persists the immutable high-level `ClosureContract`. Driver does not infer or
+silently open a Run from a prompt, and it does not auto-commit or auto-start a
+Run that the agent has only opened/refined.
+
+Codex app-server receives the Driver tools through its native per-thread
+`dynamicTools` registration and handles `item/tool/call` requests. A standard
+MCP JSON-RPC HTTP transport is also available at `POST /mcp`; send the
+conversation scope in `X-Loom-Conversation-Ref` and use `tools/list` or
+`tools/call`.
+
+After `start_run`, Driver dispatches the locked closure over `WorkerSession` to
+`POST /worker/v1/dispatch` on the selected Slave. The development deployment
+uses loopback HTTP; the envelope carries attempt/execution IDs and epoch, and
+returns a dispatch acknowledgement plus terminal report. Each Slave has its
+own PostgreSQL ledger and exposes `/worker/v1/capabilities`.
+
 The Conversation-first UI persists user and assistant messages in Observer run
 events. `GET /api/v1/conversations` lists saved conversations and
 `GET /api/v1/conversations/{conversation_ref}` restores their message/run

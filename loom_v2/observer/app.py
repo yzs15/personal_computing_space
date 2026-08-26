@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -16,6 +16,7 @@ from loom_v2.driver.service import DriverService
 from loom_v2.slave.service import SlaveService
 from loom_v2.contracts.types import ClosureContract
 from loom_v2.observer.worker import WorkerSession
+from loom_v2.driver.mcp_server import DriverMCPServer
 
 from .repository import ObserverRepository
 
@@ -55,6 +56,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
     if settings.slave_b_url:
         app.state.workers["slave-b"] = WorkerSession("slave-b", settings.slave_b_url)
     app.state.driver = DriverService(app.state.repo, provider, slaves=app.state.slaves, workers=app.state.workers)
+    app.state.mcp_server = DriverMCPServer(app.state.repo)
     static_dir = Path(__file__).resolve().parents[1] / "web" / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -88,6 +90,11 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
             "coding_agent_label": label,
             "model": model,
         }
+
+    @app.post("/mcp")
+    async def mcp(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+        conversation_ref = request.headers.get("x-loom-conversation-ref", "")
+        return await app.state.mcp_server.handle(payload, conversation_ref)
 
     @app.post("/api/v1/runs")
     async def open_run(payload: dict[str, Any]) -> dict[str, Any]:
