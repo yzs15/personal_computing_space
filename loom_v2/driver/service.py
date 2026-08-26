@@ -91,26 +91,15 @@ class DriverService:
                     # Discard late planning events after the user requested a stop.
                     continue
                 if event.kind == "open_run":
-                    opened = await mcp.call("loom_open_run", event.payload)
-                    active.run_id = opened["run_id"]
-                    run = await self.repository.begin_refinement(active.run_id)
-                    await self.repository.append_message(active.run_id, "user", prompt)
-                    for pending in pending_assistant_parts:
-                        await self.repository.append_message(active.run_id, "assistant", pending)
-                    pending_assistant_parts.clear()
+                    await mcp.call("loom_open_run", event.payload)
+                    await self._attach_open_run(mcp, active, prompt, pending_assistant_parts)
                 elif event.kind == "tool_call":
                     tool_name = str(event.payload.get("tool", ""))
                     # Codex dynamic tools execute inside the provider before the
                     # normalized event reaches this loop. Adopt the scoped MCP
                     # state here so the Driver's execution lane sees the same
                     # Run that the agent opened.
-                    if active.run_id is None and mcp.run_id is not None:
-                        active.run_id = mcp.run_id
-                        await self.repository.begin_refinement(active.run_id)
-                        await self.repository.append_message(active.run_id, "user", prompt)
-                        for pending in pending_assistant_parts:
-                            await self.repository.append_message(active.run_id, "assistant", pending)
-                        pending_assistant_parts.clear()
+                    await self._attach_open_run(mcp, active, prompt, pending_assistant_parts)
                     if tool_name == "loom_apply_plan_patch":
                         patches += 1
                     elif tool_name == "loom_commit_plan" and active.run_id is not None:
@@ -209,15 +198,12 @@ class DriverService:
                     "execution_epoch": record.execution_epoch,
                     "assistant_text": "\n\n".join(assistant_parts),
                 }
-            execution = {
-                "execution_id": record.execution_id,
-                "state": record.state,
-                "execution_epoch": record.execution_epoch,
-            }
+            execution_id = record.execution_id
+            execution_epoch = record.execution_epoch
             snapshot = record.committed.snapshot if record.committed is not None else TaskClosure.minimal()
             operation = self._operation_name(snapshot.program.operation_ref or snapshot.compute.operation_ref) or "echo"
             payload = self._execution_payload(snapshot, operation, prompt)
-            binding = self._binding_for_operation(snapshot, operation)
+            binding = self._binding_for_operation(snapshot)
             if self.workers or self.slaves:
                 target = binding.target_resource_ref.resource_id if binding is not None else "slave-a"
                 record = await self.repository.get_run(active.run_id)
@@ -229,8 +215,8 @@ class DriverService:
                     workspace_id = record.closure_contract.workspace_id if record.closure_contract else "workspace-default"
                     result = await worker.dispatch(
                         attempt_id=attempt_id,
-                        execution_id=execution["execution_id"],
-                        execution_epoch=execution["execution_epoch"],
+                        execution_id=execution_id,
+                        execution_epoch=execution_epoch,
                         workspace_id=workspace_id,
                         operation=operation,
                         payload=payload,
@@ -262,8 +248,8 @@ class DriverService:
                 "state": completed.state,
                 "status": "completed",
                 "resource_ref": result.resource_ref.resource_id,
-                "execution_id": execution["execution_id"],
-                "execution_epoch": execution["execution_epoch"],
+                "execution_id": execution_id,
+                "execution_epoch": execution_epoch,
                 "assistant_text": "\n\n".join(assistant_parts),
             }
         except asyncio.CancelledError:
@@ -281,6 +267,22 @@ class DriverService:
             if self.active_turns.get(conversation_ref) is active:
                 self.active_turns.pop(conversation_ref, None)
             await self.provider.close()
+
+    async def _attach_open_run(
+        self,
+        mcp: DriverMCP,
+        active: ActiveTurn,
+        prompt: str,
+        pending_assistant_parts: list[str],
+    ) -> None:
+        if active.run_id is not None or mcp.run_id is None:
+            return
+        active.run_id = mcp.run_id
+        await self.repository.begin_refinement(active.run_id)
+        await self.repository.append_message(active.run_id, "user", prompt)
+        for pending in pending_assistant_parts:
+            await self.repository.append_message(active.run_id, "assistant", pending)
+        pending_assistant_parts.clear()
 
     @staticmethod
     def _operation_name(operation_ref: str) -> str:
@@ -306,7 +308,7 @@ class DriverService:
         return payload
 
     @staticmethod
-    def _binding_for_operation(snapshot: TaskClosure, operation: str) -> ComputeBinding | None:
+    def _binding_for_operation(snapshot: TaskClosure) -> ComputeBinding | None:
         if not snapshot.compute_bindings:
             return None
         return snapshot.compute_bindings[0]

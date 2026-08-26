@@ -6,6 +6,8 @@ from uuid import uuid4
 from loom_v2.contracts.types import ClosureContract, TaskClosure
 from loom_v2.observer.repository import ObserverRepository
 
+from .tools import DriverTools
+
 
 class DriverMCP:
     """Scoped Driver tool surface exposed to exactly one coding-agent turn.
@@ -28,6 +30,7 @@ class DriverMCP:
         self.user_id = user_id
         self.workspace_id = workspace_id
         self.active_run_id: str | None = None
+        self.tools = DriverTools(repository)
 
     @property
     def run_id(self) -> str | None:
@@ -37,38 +40,41 @@ class DriverMCP:
         arguments = arguments or {}
         if tool_name == "loom_open_run":
             return await self.open_run(arguments)
+        if tool_name == "loom_query_capabilities":
+            return self._query_capabilities()
         if self.active_run_id is None:
             raise ValueError("run_not_open")
         if tool_name == "loom_apply_plan_patch":
             operation_id = str(arguments.get("operation_id") or f"mcp-patch-{uuid4().hex[:12]}")
-            return await self.repository_driver_tools().apply_plan_patch(self.active_run_id, operation_id, arguments.get("ops", []))
+            return await self.tools.apply_plan_patch(self.active_run_id, operation_id, arguments.get("ops", []))
         if tool_name == "loom_inspect_plan_readiness":
-            return await self.repository_driver_tools().inspect_plan_readiness(self.active_run_id)
+            return await self.tools.inspect_plan_readiness(self.active_run_id)
         if tool_name == "loom_commit_plan":
-            return await self.repository_driver_tools().commit_plan(self.active_run_id)
+            return await self.tools.commit_plan(self.active_run_id)
         if tool_name == "loom_start_run":
             run = await self.repository.get_run(self.active_run_id)
             version_id = arguments.get("closure_version") or (run.committed.version_id if run.committed else None)
             if not version_id:
                 raise ValueError("closure_not_committed")
-            return await self.repository_driver_tools().start_run(self.active_run_id, version_id)
+            return await self.tools.start_run(self.active_run_id, version_id)
         if tool_name == "loom_get_run_status":
             return self.run_view(await self.repository.get_run(self.active_run_id))
         if tool_name == "loom_close_run":
             return self.run_view(await self.repository.close_run(self.active_run_id))
-        if tool_name == "loom_query_capabilities":
-            return {
-                "workspace_id": self.workspace_id,
-                "capabilities": [
-                    {
-                        "resource_id": resource_id,
-                        "available": self.repository.slave_availability.get(resource_id, False),
-                        "operations": sorted(details.get("operations", set())),
-                    }
-                    for resource_id, details in sorted(self.repository.slave_capabilities.items())
-                ],
-            }
         raise ValueError(f"unknown_driver_tool:{tool_name}")
+
+    def _query_capabilities(self) -> dict[str, Any]:
+        return {
+            "workspace_id": self.workspace_id,
+            "capabilities": [
+                {
+                    "resource_id": resource_id,
+                    "available": self.repository.slave_availability.get(resource_id, False),
+                    "operations": sorted(details.get("operations", set())),
+                }
+                for resource_id, details in sorted(self.repository.slave_capabilities.items())
+            ],
+        }
 
     async def open_run(self, arguments: dict[str, Any]) -> dict[str, Any]:
         contract_payload = arguments.get("closure_contract")
@@ -120,11 +126,6 @@ class DriverMCP:
             "draft_digest": record.draft.snapshot_digest,
             "closure_contract": record.closure_contract.model_dump(mode="json") if record.closure_contract else None,
         }
-
-    def repository_driver_tools(self):
-        from .tools import DriverTools
-
-        return DriverTools(self.repository)
 
     @staticmethod
     def run_view(record: Any) -> dict[str, Any]:

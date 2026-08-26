@@ -36,6 +36,16 @@ async def test_open_run_is_agent_decision_and_contract_is_scoped_by_driver():
     assert run.draft.snapshot.closure_id == "closure-mcp"
 
 
+@pytest.mark.asyncio
+async def test_query_capabilities_is_available_before_open_run():
+    mcp = DriverMCP(ObserverRepository(), "conversation-capabilities-first")
+
+    result = await mcp.call("loom_query_capabilities")
+
+    assert result["workspace_id"] == "workspace-default"
+    assert {item["resource_id"] for item in result["capabilities"]} == {"slave-a", "slave-b"}
+
+
 def test_driver_mcp_exposes_dynamic_tool_specs():
     specs = DriverMCP.tool_specs()
     names = {item["name"] for item in specs}
