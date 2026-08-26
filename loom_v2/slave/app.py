@@ -1,11 +1,12 @@
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from loom_v2.db.session import make_engine
 from loom_v2.settings import Settings
 
 from .service import SlaveService
+from loom_v2.contracts.types import ComputeBinding, TaskClosure
 
 
 def create_app(slave_id: str | None = None) -> FastAPI:
@@ -28,5 +29,60 @@ def create_app(slave_id: str | None = None) -> FastAPI:
     async def health() -> dict[str, object]:
         service: SlaveService = app.state.service
         return {"ok": service.available, "service": service.slave_id, "replica": service.replica.state}
+
+    @app.post("/worker/v1/dispatch")
+    async def dispatch(payload: dict[str, object]) -> dict[str, object]:
+        service: SlaveService = app.state.service
+        try:
+            attempt_id = str(payload["attempt_id"])
+            operation = str(payload["operation"])
+            body = payload.get("payload", {})
+            if not isinstance(body, dict):
+                raise ValueError("invalid_dispatch_payload")
+            closure_payload = payload.get("closure")
+            closure = TaskClosure.model_validate(closure_payload) if closure_payload is not None else None
+            binding_payload = payload.get("binding")
+            binding = ComputeBinding.model_validate(binding_payload) if binding_payload is not None else None
+            workspace_id = str(payload.get("workspace_id", service.workspace_id))
+            if workspace_id != service.workspace_id:
+                raise ValueError("workspace_binding_mismatch")
+            execution_epoch = int(payload.get("execution_epoch", 1))
+            result = await service.run(attempt_id, operation, body, closure=closure, binding=binding)
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=f"missing_field:{exc.args[0]}") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "type": "dispatch_ack",
+            "accepted": True,
+            "attempt_id": attempt_id,
+            "execution_epoch": execution_epoch,
+            "terminal_report": {
+                "type": "terminal_report",
+                "attempt_id": attempt_id,
+                "execution_epoch": execution_epoch,
+                "state": "completed",
+                "result": {
+                    "resource_ref": result.resource_ref.model_dump(mode="json"),
+                    "value": result.value,
+                    "replay_safety": result.replay_safety,
+                    "digest": result.digest,
+                },
+            },
+        }
+
+    @app.get("/worker/v1/capabilities")
+    async def capabilities() -> dict[str, object]:
+        service: SlaveService = app.state.service
+        return {
+            "slave_id": service.slave_id,
+            "workspace_id": service.workspace_id,
+            "available": service.available,
+            "replica": service.replica.state,
+            "operations": sorted(service.supported_operations),
+            "term_support": [support.model_dump(mode="json") for support in service.term_support()],
+        }
 
     return app

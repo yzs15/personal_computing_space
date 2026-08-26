@@ -14,6 +14,8 @@ from loom_v2.coding_agents.codex import CodexAppServerProvider
 from loom_v2.coding_agents.fake import FakeCodingAgentProvider
 from loom_v2.driver.service import DriverService
 from loom_v2.slave.service import SlaveService
+from loom_v2.contracts.types import ClosureContract
+from loom_v2.observer.worker import WorkerSession
 
 from .repository import ObserverRepository
 
@@ -23,6 +25,7 @@ def _run_view(record: Any) -> dict[str, Any]:
         "run_id": record.run_id,
         "task_ref": record.task_ref,
         "goal": record.goal,
+        "closure_contract": record.closure_contract.model_dump(mode="json") if record.closure_contract else None,
         "allow_reassignment": record.allow_reassignment,
         "state": record.state,
         "status": ObserverRepository._conversation_status_for_state(record.state),
@@ -46,7 +49,12 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
     app.state.repo = repository or ObserverRepository(app.state.engine)
     provider = FakeCodingAgentProvider() if settings.coding_agent_backend == "fake" else CodexAppServerProvider(model=settings.codex_model)
     app.state.slaves = {"slave-a": SlaveService("slave-a"), "slave-b": SlaveService("slave-b")}
-    app.state.driver = DriverService(app.state.repo, provider, slaves=app.state.slaves)
+    app.state.workers = {}
+    if settings.slave_a_url:
+        app.state.workers["slave-a"] = WorkerSession("slave-a", settings.slave_a_url)
+    if settings.slave_b_url:
+        app.state.workers["slave-b"] = WorkerSession("slave-b", settings.slave_b_url)
+    app.state.driver = DriverService(app.state.repo, provider, slaves=app.state.slaves, workers=app.state.workers)
     static_dir = Path(__file__).resolve().parents[1] / "web" / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
@@ -83,7 +91,18 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
 
     @app.post("/api/v1/runs")
     async def open_run(payload: dict[str, Any]) -> dict[str, Any]:
-        record = await app.state.repo.open_run(payload.get("run_id"), payload["task_ref"], payload.get("goal", ""), payload.get("allow_reassignment", False))
+        contract_payload = payload.get("closure_contract")
+        contract = ClosureContract.model_validate(contract_payload) if contract_payload is not None else None
+        goal = contract.goal if contract is not None else payload.get("goal", "")
+        record = await app.state.repo.open_run(
+            payload.get("run_id"),
+            payload["task_ref"],
+            goal,
+            payload.get("allow_reassignment", False),
+            contract,
+            user_id=payload.get("user_id", "user-default"),
+            workspace_id=payload.get("workspace_id", settings.workspace_id),
+        )
         return _run_view(record)
 
     @app.post("/api/v1/messages")

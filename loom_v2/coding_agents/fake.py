@@ -14,6 +14,22 @@ class FakeCodingAgentProvider:
         return self.session_ref
 
     async def send_turn(self, user_message: str) -> AsyncIterator[AgentEvent]:
+        yield AgentEvent(
+            "open_run",
+            {
+                "closure_contract": {
+                    "closure_id": f"closure-{self.session_ref or 'fake'}",
+                    "goal": user_message,
+                    "required_success_criteria": [],
+                    "allowed_effects": ["read_workspace"],
+                    "resource_budget": {"max_node_concurrency": 1, "max_attempts": 1},
+                    "recovery_policy": {"allow_reassignment": False},
+                    "result_expectations": [{"kind": "content", "identity_criterion": "content_digest"}],
+                    "declared_constraints": [],
+                    "body": {"closure_id": f"closure-{self.session_ref or 'fake'}", "metadata": {"goal": user_message}},
+                }
+            },
+        )
         yield AgentEvent("assistant_text", {"text": "I will refine the closure in multiple patches."})
         yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "set_program_ref", "value": "loom://echo"}]})
         yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "set_compute_spec", "value": {"operation_ref": "loom://echo"}}]})
@@ -38,6 +54,7 @@ class FakeCodingAgentProvider:
         )
         yield AgentEvent("inspect_plan_readiness", {})
         yield AgentEvent("commit_plan", {})
+        yield AgentEvent("start_run", {})
 
     async def interrupt(self, turn_ref: str | None = None) -> None:
         return None

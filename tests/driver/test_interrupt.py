@@ -17,6 +17,16 @@ class BlockingProvider:
         return f"thread:{conversation_ref}"
 
     async def send_turn(self, user_message: str):
+        yield AgentEvent(
+            "open_run",
+            {
+                "closure_contract": {
+                    "closure_id": "closure-interrupt",
+                    "goal": user_message,
+                    "body": {"closure_id": "closure-interrupt"},
+                }
+            },
+        )
         yield AgentEvent("turn_started", {"turn_id": "turn-blocking"})
         self.started.set()
         await self.released.wait()

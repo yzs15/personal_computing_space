@@ -2,6 +2,7 @@ CREATE TABLE IF NOT EXISTS runs (
     run_id VARCHAR(128) PRIMARY KEY,
     task_ref VARCHAR(256) NOT NULL,
     goal VARCHAR(2048) NOT NULL,
+    closure_contract JSONB,
     allow_reassignment BOOLEAN NOT NULL DEFAULT FALSE,
     draft JSONB NOT NULL,
     committed JSONB,

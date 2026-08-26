@@ -86,3 +86,43 @@ async def test_codex_interrupt_includes_thread_and_turn_ids():
             "params": {"threadId": "thread-1", "turnId": "turn-42"},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_codex_provider_registers_and_answers_dynamic_tools():
+    provider = CodexAppServerProvider()
+    provider.process = object()
+    provider.thread_id = "thread-1"
+    provider.set_tool_handler(
+        [{"type": "function", "name": "loom_open_run", "description": "open", "inputSchema": {"type": "object"}}],
+        lambda name, args: _tool_result(name, args),
+    )
+    sent: list[dict] = []
+    messages = iter(
+        [
+            {"id": 7, "method": "item/tool/call", "params": {"tool": "loom_open_run", "arguments": {"goal": "sort"}}},
+            {"method": "turn/completed", "params": {}},
+        ]
+    )
+
+    async def fake_send(message):
+        sent.append(message)
+
+    async def fake_read_message():
+        return next(messages)
+
+    provider._send = fake_send
+    provider._read_message = fake_read_message
+
+    events = [event async for event in provider.send_turn("sort")]
+
+    assert events[0].kind == "tool_call"
+    assert sent[-1] == {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "result": {"contentItems": [{"type": "inputText", "text": '{"tool": "loom_open_run", "goal": "sort"}'}], "success": True},
+    }
+
+
+async def _tool_result(name: str, args: dict) -> dict:
+    return {"tool": name, **args}

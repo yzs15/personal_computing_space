@@ -136,6 +136,14 @@ class TaskClosure(ContractModel):
 class ClosureContract(ContractModel):
     closure_id: str
     goal: str
+    origin_conversation_ref: str = ""
+    user_id: str = "user-default"
+    workspace_id: str = "workspace-default"
+    required_success_criteria: list[dict[str, Any]] = Field(default_factory=list)
+    allowed_effects: list[str] = Field(default_factory=list)
+    resource_budget: dict[str, Any] = Field(default_factory=dict)
+    recovery_policy: dict[str, Any] = Field(default_factory=dict)
+    result_expectations: list[dict[str, Any]] = Field(default_factory=list)
     declared_constraints: list[Constraint] = Field(default_factory=list)
     body: TaskClosure
 

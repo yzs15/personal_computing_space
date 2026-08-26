@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from .base import AgentEvent
 
@@ -17,6 +17,16 @@ class CodexAppServerProvider:
         self.request_id = 0
         self.thread_id: str | None = None
         self.current_turn_id: str | None = None
+        self.dynamic_tools: list[dict[str, Any]] = []
+        self.tool_handler: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+
+    def set_tool_handler(
+        self,
+        tools: list[dict[str, Any]],
+        handler: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]],
+    ) -> None:
+        self.dynamic_tools = list(tools)
+        self.tool_handler = handler
 
     async def start(self, conversation_ref: str, workspace_root: str) -> str:
         try:
@@ -32,11 +42,28 @@ class CodexAppServerProvider:
         except (FileNotFoundError, OSError) as exc:
             raise RuntimeError("coding_agent_unavailable") from exc
         initialize_id = self._next_id()
-        await self._send({"jsonrpc": "2.0", "id": initialize_id, "method": "initialize", "params": {"clientInfo": {"name": "loom-v2", "version": "0.1.0"}}})
+        await self._send(
+            {
+                "jsonrpc": "2.0",
+                "id": initialize_id,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "loom-v2", "version": "0.1.0"},
+                    "capabilities": {"experimentalApi": True},
+                },
+            }
+        )
         await self._read_response(initialize_id)
-        await self._send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
         thread_request_id = self._next_id()
-        await self._send({"jsonrpc": "2.0", "id": thread_request_id, "method": "thread/start", "params": {"model": self.model, "cwd": workspace_root, "metadata": {"conversation_ref": conversation_ref}}})
+        thread_params: dict[str, Any] = {
+            "model": self.model,
+            "cwd": workspace_root,
+            "runtimeWorkspaceRoots": [workspace_root],
+            "metadata": {"conversation_ref": conversation_ref},
+        }
+        if self.dynamic_tools:
+            thread_params["dynamicTools"] = self.dynamic_tools
+        await self._send({"jsonrpc": "2.0", "id": thread_request_id, "method": "thread/start", "params": thread_params})
         response = await self._read_response(thread_request_id)
         self.thread_id = str(response.get("result", {}).get("thread", {}).get("id", conversation_ref))
         return self.thread_id
@@ -52,6 +79,10 @@ class CodexAppServerProvider:
             if message.get("id") == turn_request_id:
                 continue
             method = message.get("method", "")
+            if method == "item/tool/call":
+                await self._handle_dynamic_tool_call(message)
+                yield AgentEvent("tool_call", message.get("params", {}))
+                continue
             if method == "turn/completed":
                 params = message.get("params", {})
                 turn = params.get("turn", params)
@@ -102,6 +133,25 @@ class CodexAppServerProvider:
             self.process = None
             self.thread_id = None
             self.current_turn_id = None
+
+    async def _handle_dynamic_tool_call(self, message: dict[str, Any]) -> None:
+        request_id = message.get("id")
+        params = message.get("params", {})
+        tool_name = str(params.get("tool", ""))
+        arguments = params.get("arguments", {})
+        if not isinstance(arguments, dict):
+            arguments = {}
+        try:
+            if self.tool_handler is None:
+                raise RuntimeError("driver_mcp_unavailable")
+            result = await self.tool_handler(tool_name, arguments)
+            content = {"contentItems": [{"type": "inputText", "text": json.dumps(result, ensure_ascii=False)}], "success": True}
+        except Exception as exc:
+            content = {
+                "contentItems": [{"type": "inputText", "text": json.dumps({"code": str(exc)}, ensure_ascii=False)}],
+                "success": False,
+            }
+        await self._send({"jsonrpc": "2.0", "id": request_id, "result": content})
 
     def _next_id(self) -> int:
         self.request_id += 1

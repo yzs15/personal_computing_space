@@ -23,6 +23,34 @@ def test_draft_patch_commit_and_start_are_explicit():
     ).status_code == 200
 
 
+def test_open_run_persists_complete_closure_contract():
+    client = TestClient(create_app())
+    contract = {
+        "closure_id": "closure-sort",
+        "goal": "sort numbers",
+        "required_success_criteria": [{"criterion_id": "sorted", "kind": "deterministic"}],
+        "allowed_effects": ["read_workspace"],
+        "resource_budget": {"max_node_concurrency": 1, "max_attempts": 2},
+        "recovery_policy": {"allow_reassignment": True, "retry_on": ["timeout"]},
+        "result_expectations": [{"kind": "content", "identity_criterion": "content_digest"}],
+        "declared_constraints": [],
+        "body": {
+            "closure_id": "closure-sort",
+            "program": {"operation_ref": "loom://sort"},
+            "compute": {"operation_ref": "loom://sort"},
+        },
+    }
+    response = client.post(
+        "/api/v1/runs",
+        json={"task_ref": "conversation-contract", "closure_contract": contract},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["goal"] == "sort numbers"
+    assert payload["closure_contract"]["required_success_criteria"][0]["criterion_id"] == "sorted"
+    assert payload["closure_contract"]["resource_budget"]["max_attempts"] == 2
+
+
 def test_duplicate_patch_returns_same_receipt():
     client = TestClient(create_app())
     run = client.post("/api/v1/runs", json={"task_ref": "task-2", "goal": "echo"}).json()

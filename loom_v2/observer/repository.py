@@ -2,16 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from copy import deepcopy
 import json
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from loom_v2.contracts.constraints import Constraint
 from loom_v2.contracts.refinement import is_monotonic_tightening
-from loom_v2.contracts.types import ClosureVersion, ComputeBinding, ComputeSpec, TaskClosure, TypedHole
+from loom_v2.contracts.types import ClosureContract, ClosureVersion, ComputeBinding, ComputeSpec, TaskClosure, TypedHole
 from loom_v2.db.base import Base
 from loom_v2.db.models import IdempotencyRow, RunRow
 from loom_v2.db.session import make_session_factory
@@ -35,6 +36,7 @@ class RunRecord:
     task_ref: str
     goal: str
     draft: ClosureVersion
+    closure_contract: ClosureContract | None = None
     allow_reassignment: bool = False
     committed: ClosureVersion | None = None
     execution_id: str | None = None
@@ -72,16 +74,22 @@ class ObserverRepository:
             return
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+            if connection.dialect.name == "postgresql":
+                await connection.execute(text("ALTER TABLE runs ADD COLUMN IF NOT EXISTS closure_contract JSONB"))
 
     @staticmethod
     def _record_from_row(row: RunRow) -> RunRecord:
+        draft_payload = ObserverRepository._normalize_version_payload(row.draft)
+        committed_payload = ObserverRepository._normalize_version_payload(row.committed) if row.committed else None
+        contract_payload = ObserverRepository._normalize_contract_payload(row.closure_contract) if row.closure_contract else None
         return RunRecord(
             run_id=row.run_id,
             task_ref=row.task_ref,
             goal=row.goal,
-            draft=ClosureVersion.model_validate(row.draft),
+            draft=ClosureVersion.model_validate(draft_payload),
+            closure_contract=ClosureContract.model_validate(contract_payload) if contract_payload else None,
             allow_reassignment=row.allow_reassignment,
-            committed=ClosureVersion.model_validate(row.committed) if row.committed else None,
+            committed=ClosureVersion.model_validate(committed_payload) if committed_payload else None,
             execution_id=row.execution_id,
             execution_epoch=row.execution_epoch,
             state=row.state,
@@ -89,6 +97,41 @@ class ObserverRepository:
             attempts=row.attempts or [],
             events=row.events or [],
         )
+
+    @staticmethod
+    def _normalize_task_closure_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        normalized = deepcopy(payload)
+        for section in ("program", "compute"):
+            values = normalized.get(section)
+            if not isinstance(values, dict):
+                continue
+            operation_ref = values.get("operation_ref")
+            if isinstance(operation_ref, dict):
+                values["operation_ref"] = (
+                    operation_ref.get("program_ref")
+                    or operation_ref.get("operation_ref")
+                    or operation_ref.get("ref")
+                    or ""
+                )
+        return normalized
+
+    @classmethod
+    def _normalize_version_payload(cls, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+        if payload is None:
+            return None
+        normalized = deepcopy(payload)
+        snapshot = normalized.get("snapshot")
+        if isinstance(snapshot, dict):
+            normalized["snapshot"] = cls._normalize_task_closure_payload(snapshot)
+        return normalized
+
+    @classmethod
+    def _normalize_contract_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        normalized = deepcopy(payload)
+        body = normalized.get("body")
+        if isinstance(body, dict):
+            normalized["body"] = cls._normalize_task_closure_payload(body)
+        return normalized
 
     async def _persist(self, record: RunRecord) -> None:
         if self.sessions is None:
@@ -99,6 +142,7 @@ class ObserverRepository:
                 "run_id": record.run_id,
                 "task_ref": record.task_ref,
                 "goal": record.goal,
+                "closure_contract": record.closure_contract.model_dump(mode="json") if record.closure_contract else None,
                 "allow_reassignment": record.allow_reassignment,
                 "draft": record.draft.model_dump(mode="json"),
                 "committed": record.committed.model_dump(mode="json") if record.committed else None,
@@ -175,6 +219,16 @@ class ObserverRepository:
             return ""
         return operation_ref.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
 
+    def _canonical_target_resource_id(self, resource_id: str) -> str:
+        """Resolve common capability-URI spellings to a registered Slave id."""
+        if resource_id in self.slave_capabilities:
+            return resource_id
+        normalized = resource_id.rstrip("/")
+        for slave_id in self.slave_capabilities:
+            if normalized.endswith(f"/{slave_id}") or normalized.endswith(f":{slave_id}"):
+                return slave_id
+        return resource_id
+
     def _evaluate_readiness(self, snapshot: TaskClosure) -> dict[str, Any]:
         operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
         operation = self._operation_name(operation_ref)
@@ -189,7 +243,7 @@ class ObserverRepository:
             if binding is None or binding.binding_id != hole.binding_ref:
                 blockers.append({"code": "compute_binding_missing", "hole_id": hole.hole_id, "binding_ref": hole.binding_ref})
                 continue
-            target = binding.target_resource_ref.resource_id
+            target = self._canonical_target_resource_id(binding.target_resource_ref.resource_id)
             capability = self.slave_capabilities.get(target)
             if capability is None:
                 blockers.append({"code": "capability_unavailable", "hole_id": hole.hole_id, "target_resource_ref": target})
@@ -219,17 +273,60 @@ class ObserverRepository:
     def _readiness_error(readiness: dict[str, Any]) -> ValueError:
         return ValueError("readiness_blocked:" + json.dumps(readiness["blockers"], sort_keys=True, ensure_ascii=False))
 
-    async def open_run(self, run_id: str | None, task_ref: str, goal: str, allow_reassignment: bool = False) -> RunRecord:
+    async def open_run(
+        self,
+        run_id: str | None,
+        task_ref: str,
+        goal: str,
+        allow_reassignment: bool = False,
+        closure_contract: ClosureContract | None = None,
+        *,
+        user_id: str = "user-default",
+        workspace_id: str = "workspace-default",
+    ) -> RunRecord:
         run_id = run_id or f"run-{uuid4().hex[:12]}"
-        snapshot = TaskClosure.minimal(closure_id=task_ref, metadata={"goal": goal})
+        if closure_contract is None:
+            snapshot = TaskClosure.minimal(closure_id=task_ref, metadata={"goal": goal})
+            closure_contract = ClosureContract(
+                closure_id=task_ref,
+                goal=goal,
+                origin_conversation_ref=task_ref,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                resource_budget={"max_node_concurrency": 1, "max_attempts": 1},
+                recovery_policy={"allow_reassignment": allow_reassignment},
+                body=snapshot,
+            )
+        else:
+            if closure_contract.goal != goal:
+                raise ValueError("closure_goal_mismatch")
+            snapshot = closure_contract.body.model_copy(deep=True)
+            snapshot.closure_id = closure_contract.closure_id
+            snapshot.metadata.setdefault("goal", goal)
+            closure_contract = closure_contract.model_copy(
+                update={
+                    "origin_conversation_ref": task_ref,
+                    "user_id": user_id,
+                    "workspace_id": workspace_id,
+                    "body": snapshot,
+                },
+                deep=True,
+            )
         version = ClosureVersion(
             version_id=f"draft-{uuid4().hex[:12]}",
-            closure_id=task_ref,
+            closure_id=closure_contract.closure_id,
             snapshot=snapshot,
             snapshot_digest=snapshot.canonical_digest(),
             patch_cursor=0,
         )
-        record = RunRecord(run_id=run_id, task_ref=task_ref, goal=goal, allow_reassignment=allow_reassignment, draft=version)
+        record = RunRecord(
+            run_id=run_id,
+            task_ref=task_ref,
+            goal=goal,
+            draft=version,
+            closure_contract=closure_contract,
+            allow_reassignment=allow_reassignment,
+        )
         record.events.append({"phase": "run_opened", "run_id": run_id, "created_at": datetime.now(timezone.utc).isoformat()})
         self.runs[run_id] = record
         await self._persist(record)
@@ -399,7 +496,10 @@ class ObserverRepository:
             raise ValueError("version_conflict")
         snapshot = record.draft.snapshot.model_copy(deep=True)
         for operation in ops:
-            kind = operation.get("kind")
+            # ``kind`` is the canonical wire field.  ``op``/``operation``
+            # are accepted as equivalent spellings because JSON tool callers
+            # commonly emit one of those names when translating a plan.
+            kind = operation.get("kind") or operation.get("op") or operation.get("operation")
             if kind == "set_result_expectation":
                 snapshot.metadata["result_expectation"] = operation.get("value", {})
             elif kind == "set_compute_spec":
@@ -412,7 +512,12 @@ class ObserverRepository:
                     raise ValueError("constraint_not_monotonic")
                 snapshot.metadata.setdefault("refined_constraints", []).append(value["child"])
             elif kind == "set_program_ref":
-                snapshot.program.operation_ref = operation["value"]
+                value = operation.get("value")
+                if isinstance(value, dict):
+                    value = value.get("program_ref") or value.get("operation_ref") or value.get("ref")
+                if not isinstance(value, str) or not value:
+                    raise ValueError("invalid_program_ref")
+                snapshot.program.operation_ref = value
             elif kind == "add_typed_hole":
                 hole = TypedHole.model_validate(operation["value"])
                 if any(existing.hole_id == hole.hole_id for existing in snapshot.compute.typed_holes):
@@ -423,6 +528,9 @@ class ObserverRepository:
                 if isinstance(value, dict) and "binding" in value:
                     value = value["binding"]
                 binding = ComputeBinding.model_validate(value)
+                target_resource_id = self._canonical_target_resource_id(binding.target_resource_ref.resource_id)
+                if target_resource_id != binding.target_resource_ref.resource_id:
+                    binding.target_resource_ref = binding.target_resource_ref.model_copy(update={"resource_id": target_resource_id})
                 hole = next((item for item in snapshot.compute.typed_holes if item.hole_id == binding.hole_id), None)
                 if hole is None:
                     raise ValueError(f"typed_hole_not_found:{binding.hole_id}")
@@ -439,7 +547,7 @@ class ObserverRepository:
                 raise ValueError(f"unsupported_patch:{kind}")
         new_version = ClosureVersion(
             version_id=f"draft-{uuid4().hex[:12]}",
-            closure_id=record.task_ref,
+            closure_id=record.draft.closure_id,
             parent_version=record.draft.version_id,
             snapshot=snapshot,
             snapshot_digest=snapshot.canonical_digest(),

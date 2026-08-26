@@ -59,8 +59,12 @@ services:
       LOOM_DATABASE_URL: postgresql+asyncpg://loom:loom@observer-db:5432/loom_observer
       LOOM_CODING_AGENT_BACKEND: codex
       LOOM_CODEX_MODEL: deepseek-v4-flash
+      LOOM_SLAVE_A_URL: http://slave-a:8081
+      LOOM_SLAVE_B_URL: http://slave-b:8082
     depends_on:
       observer-db: {condition: service_healthy}
+      slave-a: {condition: service_started}
+      slave-b: {condition: service_started}
     ports: ["8080:8080"]
 
   slave-a:

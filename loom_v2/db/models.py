@@ -10,6 +10,7 @@ class RunRow(Base):
     run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     task_ref: Mapped[str] = mapped_column(String(256), nullable=False)
     goal: Mapped[str] = mapped_column(String(2048), nullable=False)
+    closure_contract: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     allow_reassignment: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     draft: Mapped[dict] = mapped_column(JSON, nullable=False)
     committed: Mapped[dict | None] = mapped_column(JSON, nullable=True)

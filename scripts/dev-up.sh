@@ -19,5 +19,7 @@ export LOOM_DATABASE_URL="${LOOM_DATABASE_URL:-postgresql+asyncpg://loom:loom@12
 export LOOM_CODING_AGENT_BACKEND="${LOOM_CODING_AGENT_BACKEND:-codex}"
 export LOOM_CODEX_MODEL="${LOOM_CODEX_MODEL:-deepseek-v4-flash}"
 export LOOM_WORKSPACE_ROOT="${LOOM_WORKSPACE_ROOT:-$ROOT_DIR}"
+export LOOM_SLAVE_A_URL="${LOOM_SLAVE_A_URL:-http://127.0.0.1:8081}"
+export LOOM_SLAVE_B_URL="${LOOM_SLAVE_B_URL:-http://127.0.0.1:8082}"
 echo "Loom v2 is available at http://localhost:8080 (backend=$LOOM_CODING_AGENT_BACKEND, model=$LOOM_CODEX_MODEL)"
 exec .venv/bin/uvicorn loom_v2.observer.app:app --host 0.0.0.0 --port 8080
