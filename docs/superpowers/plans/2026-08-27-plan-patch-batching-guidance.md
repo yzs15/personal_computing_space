@@ -16,7 +16,7 @@
 - Modify: `loom_v2/driver/mcp.py:197-207` — update the `loom_apply_plan_patch` description only.
 - Test: `tests/driver/test_mcp.py:40-52` — extend the dynamic tool schema test with guidance assertions.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Extend `test_driver_mcp_exposes_dynamic_tool_specs` after the existing schema assertions:
 
@@ -31,7 +31,7 @@ These assertions verify that the model receives all three pieces of guidance:
 batch independent operations, atomic application, and splitting only when
 readiness feedback is needed.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run:
 
@@ -44,7 +44,7 @@ Expected: FAIL because the current description only says “Apply one
 deterministic closure refinement patch” and does not mention batching or
 atomicity.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [x] **Step 3: Write the minimal implementation**
 
 Replace the current description in `loom_v2/driver/mcp.py`:
 
@@ -61,7 +61,7 @@ Replace the current description in `loom_v2/driver/mcp.py`:
 Do not change the input schema, operation handling, repository calls, or
 versioning behavior.
 
-- [ ] **Step 4: Run the focused tests to verify the change**
+- [x] **Step 4: Run the focused tests to verify the change**
 
 Run:
 
@@ -72,7 +72,7 @@ cd .
 
 Expected: all tests in `tests/driver/test_mcp.py` pass.
 
-- [ ] **Step 5: Run the complete test suite**
+- [x] **Step 5: Run the complete test suite**
 
 Run:
 
@@ -84,11 +84,10 @@ cd .
 Expected: the complete suite passes with zero failures; existing deprecation
 warnings may remain.
 
-- [ ] **Step 6: Commit the implementation**
+- [x] **Step 6: Commit the implementation**
 
 ```bash
 cd .
 git add loom_v2/driver/mcp.py tests/driver/test_mcp.py
 git commit -m "feat: guide coding agent to batch plan patches"
 ```
-
