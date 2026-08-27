@@ -185,7 +185,13 @@ class DriverMCP:
             {
                 "type": "function",
                 "name": "loom_apply_plan_patch",
-                "description": "Apply one deterministic closure refinement patch after open_run. Every patch is versioned and readiness is returned.",
+                "description": (
+                    "Apply deterministic closure refinement operations after open_run. "
+                    "Batch independent operations in one ordered `ops` array whenever possible: "
+                    "the complete array is applied atomically and creates one draft version, "
+                    "receipt, and draft_patched event. Split into multiple calls only when an "
+                    "intermediate readiness result or a prior operation's result is required."
+                ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {

@@ -54,6 +54,10 @@ def test_driver_mcp_exposes_dynamic_tool_specs():
     op_schema = patch_spec["inputSchema"]["properties"]["ops"]["items"]
     assert "kind" in op_schema["properties"]
     assert "set_program_ref" in op_schema["properties"]["kind"]["enum"]
+    description = patch_spec["description"].lower()
+    assert "batch" in description
+    assert "atomic" in description
+    assert "readiness" in description
 
 
 @pytest.mark.asyncio
