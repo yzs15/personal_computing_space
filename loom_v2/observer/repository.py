@@ -1,21 +1,37 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from copy import deepcopy
 import json
+import hashlib
 from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from loom_v2.contracts.constraints import Constraint
+from loom_v2.contracts.constraints import Constraint, ConstraintRef
 from loom_v2.contracts.refinement import is_monotonic_tightening
-from loom_v2.contracts.types import ClosureContract, ClosureVersion, ComputeBinding, ComputeSpec, TaskClosure, TypedHole
+from loom_v2.contracts.types import (
+    CapabilityPackage,
+    CapabilityPackageActivation,
+    CapabilityPackageVersion,
+    ClosureContract,
+    ClosureVersion,
+    ComputeBinding,
+    ComputeSpec,
+    ResourceRef,
+    TaskClosure,
+    TypedHole,
+)
 from loom_v2.db.base import Base
 from loom_v2.db.models import IdempotencyRow, RunRow
 from loom_v2.db.session import make_session_factory
+from loom_v2.content_store import ContentStore
+from loom_v2.settings import Settings
+from loom_v2.slave.executor import default_registry
 
 
 @dataclass
@@ -45,6 +61,8 @@ class RunRecord:
     outcome: dict[str, Any] | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     attempts: list[dict[str, Any]] = field(default_factory=list)
+    capability_packages: list[CapabilityPackageVersion] = field(default_factory=list)
+    capability_activations: list[CapabilityPackageActivation] = field(default_factory=list)
 
     @property
     def draft_version(self) -> str:
@@ -58,16 +76,24 @@ class RunRecord:
 class ObserverRepository:
     """Deterministic state authority; SQL persistence is added behind this boundary."""
 
-    def __init__(self, engine: AsyncEngine | None = None) -> None:
+    def __init__(self, engine: AsyncEngine | None = None, content_store: ContentStore | None = None) -> None:
         self.runs: dict[str, RunRecord] = {}
         self.idempotency: dict[str, PatchReceipt] = {}
         self.slave_availability: dict[str, bool] = {"slave-a": True, "slave-b": True}
         self.slave_capabilities: dict[str, dict[str, Any]] = {
-            "slave-a": {"operations": {"echo", "hash", "sort"}},
-            "slave-b": {"operations": {"echo", "hash", "sort"}},
+            "slave-a": {"operations": {"echo", "hash", "sort", "run_code"}},
+            "slave-b": {"operations": {"echo", "hash", "sort", "run_code"}},
         }
         self.engine = engine
         self.sessions = make_session_factory(engine) if engine is not None else None
+        if content_store is None:
+            settings = Settings()
+            content_store = ContentStore.from_settings(settings)
+        self.content_store = content_store
+        # Promotion mutates a RunRecord's package list.  The single Observer
+        # process serializes concurrent retries so two requests cannot both
+        # pass the existence check before either persists its derivative.
+        self._promotion_lock = asyncio.Lock()
 
     async def init_db(self) -> None:
         if self.engine is None:
@@ -76,6 +102,8 @@ class ObserverRepository:
             await connection.run_sync(Base.metadata.create_all)
             if connection.dialect.name == "postgresql":
                 await connection.execute(text("ALTER TABLE runs ADD COLUMN IF NOT EXISTS closure_contract JSONB"))
+                await connection.execute(text("ALTER TABLE runs ADD COLUMN IF NOT EXISTS capability_packages JSONB NOT NULL DEFAULT '[]'::jsonb"))
+                await connection.execute(text("ALTER TABLE runs ADD COLUMN IF NOT EXISTS capability_activations JSONB NOT NULL DEFAULT '[]'::jsonb"))
 
     @staticmethod
     def _record_from_row(row: RunRow) -> RunRecord:
@@ -96,6 +124,8 @@ class ObserverRepository:
             outcome=row.outcome,
             attempts=row.attempts or [],
             events=row.events or [],
+            capability_packages=[CapabilityPackageVersion.model_validate(item) for item in (getattr(row, "capability_packages", None) or [])],
+            capability_activations=[CapabilityPackageActivation.model_validate(item) for item in (getattr(row, "capability_activations", None) or [])],
         )
 
     @staticmethod
@@ -152,6 +182,8 @@ class ObserverRepository:
                 "outcome": record.outcome,
                 "attempts": record.attempts,
                 "events": record.events,
+                "capability_packages": [item.model_dump(mode="json") for item in record.capability_packages],
+                "capability_activations": [item.model_dump(mode="json") for item in record.capability_activations],
             }
             if row is None:
                 row = RunRow(**values)
@@ -229,7 +261,158 @@ class ObserverRepository:
                 return slave_id
         return resource_id
 
-    def _evaluate_readiness(self, snapshot: TaskClosure) -> dict[str, Any]:
+    @staticmethod
+    def _package_ref(package: CapabilityPackageVersion) -> str:
+        return f"capability-package://{package.package_id}/{package.package_version}"
+
+    @classmethod
+    def _reusable_matches_candidate(
+        cls,
+        reusable: CapabilityPackageVersion,
+        candidate: CapabilityPackageVersion,
+    ) -> bool:
+        if reusable.scope != "workspace_reusable" or reusable.publication_state != "published":
+            return False
+        if reusable.package_id != candidate.package_id:
+            return False
+        # New versions carry an explicit lineage entry.  The deterministic
+        # version/source fallback also recognizes versions produced before
+        # lineage matching was fixed.
+        candidate_ref = cls._package_ref(candidate)
+        if any(entry.get("derived_from") == candidate_ref for entry in reusable.provenance):
+            return True
+        return (
+            reusable.package_version == f"{candidate.package_version}-reusable"
+            and reusable.program_digest == candidate.program_digest
+            and reusable.source_run_ref == candidate.source_run_ref
+            and reusable.source_closure_version_ref == candidate.source_closure_version_ref
+        )
+
+    def _find_package(self, package_ref: str | ResourceRef) -> CapabilityPackageVersion | None:
+        resource_id = package_ref.resource_id if isinstance(package_ref, ResourceRef) else package_ref
+        digest = package_ref.version_or_digest if isinstance(package_ref, ResourceRef) else None
+        for record in self.runs.values():
+            for package in record.capability_packages:
+                if resource_id in {package.package_id, self._package_ref(package), f"{package.package_id}:{package.package_version}", package.package_version} or digest in {package.package_digest, package.program_digest}:
+                    return package
+        return None
+
+    async def list_capability_packages(self, *, run_id: str | None = None, include_abandoned: bool = False) -> list[CapabilityPackageVersion]:
+        records = [await self._load(run_id)] if run_id else await self._all_records()
+        packages = [package for record in records for package in record.capability_packages]
+        if not include_abandoned:
+            packages = [package for package in packages if package.publication_state != "abandoned"]
+        return packages
+
+    async def get_capability_package(self, package_ref: str) -> CapabilityPackageVersion:
+        package = self._find_package(package_ref)
+        if package is None and self.sessions is not None:
+            for record in await self._all_records():
+                for candidate in record.capability_packages:
+                    if package_ref in {candidate.package_id, self._package_ref(candidate), f"{candidate.package_id}:{candidate.package_version}", candidate.package_version}:
+                        package = candidate
+                        break
+        if package is None:
+            raise KeyError(package_ref)
+        return package
+
+    async def get_capability_package_aggregate(self, package_ref: str) -> CapabilityPackage:
+        version = await self.get_capability_package(package_ref)
+        records = await self._all_records()
+        activations = [activation for record in records for activation in record.capability_activations if activation.package_version_ref in {f"{version.package_id}:{version.package_version}", self._package_ref(version), version.version_ref}]
+        versions = [item for record in records for item in record.capability_packages if item.package_id == version.package_id]
+        return CapabilityPackage(package_id=version.package_id, versions=versions, activations=activations)
+
+    async def abandon_capability_package(self, package_ref: str, *, idempotency_key: str | None = None) -> CapabilityPackageVersion:
+        package = await self.get_capability_package(package_ref)
+        if package.publication_state == "abandoned":
+            return package
+        package.publication_state = "abandoned"
+        for record in self.runs.values():
+            if any(item.package_id == package.package_id and item.package_version == package.package_version for item in record.capability_packages):
+                record.events.append({"phase": "capability_package_abandoned", "package_ref": self._package_ref(package), "idempotency_key": idempotency_key, "created_at": datetime.now(timezone.utc).isoformat()})
+                await self._persist(record)
+                break
+        return package
+
+    async def promote_capability_package(self, package_ref: str, *, idempotency_key: str | None = None, approved_digest: str | None = None) -> CapabilityPackageVersion:
+        async with self._promotion_lock:
+            # Resolve the input first.  A request normally carries the
+            # candidate ref (for example ``.../v1``), while the derived
+            # published version has a different identity (``.../v1-reusable``).
+            # Idempotency therefore has to follow the candidate -> reusable
+            # lineage, not compare the request string with the reusable ref.
+            candidate = await self.get_capability_package(package_ref)
+            if candidate.publication_state == "published" and candidate.scope == "workspace_reusable":
+                return candidate
+
+            candidate_ref = self._package_ref(candidate)
+            reusable_version = f"{candidate.package_version}-reusable"
+            for record in await self._all_records():
+                reusable = next(
+                    (
+                        item
+                        for item in record.capability_packages
+                        if self._reusable_matches_candidate(item, candidate)
+                    ),
+                    None,
+                )
+                if reusable is not None:
+                    return reusable
+
+            if candidate.publication_state == "abandoned":
+                raise ValueError("capability_package_abandoned")
+            if approved_digest and approved_digest not in {candidate.package_digest, candidate.program_digest}:
+                raise ValueError("promotion_digest_mismatch")
+            if not candidate.semantic_closed:
+                raise ValueError("package_promotion_denied:semantic_not_closed")
+            if candidate.captures_run_state or candidate.captured_secret_refs or candidate.captured_path_refs:
+                raise ValueError("package_captures_run_state")
+            source_record = next((record for record in self.runs.values() if any(item.package_id == candidate.package_id and item.package_version == candidate.package_version for item in record.capability_packages)), None)
+            if source_record is None:
+                raise KeyError(package_ref)
+            if source_record.state not in {"completed", "closed", "failed", "cancelled"}:
+                raise ValueError("run_not_terminal")
+            reusable_payload = candidate.model_dump(mode="json")
+            reusable_payload.update({"package_version": reusable_version, "scope": "workspace_reusable", "publication_state": "published", "provenance": [*candidate.provenance, {"derived_from": candidate_ref, "idempotency_key": idempotency_key}], "package_digest": ""})
+            reusable = CapabilityPackageVersion.model_validate(reusable_payload)
+            source_record.capability_packages.append(reusable)
+            source_record.events.append({"phase": "capability_package_promoted", "package_ref": self._package_ref(reusable), "derived_from": candidate_ref, "idempotency_key": idempotency_key, "created_at": datetime.now(timezone.utc).isoformat()})
+            await self._persist(source_record)
+            return reusable
+
+    async def record_capability_health(self, report: Any) -> CapabilityPackageActivation:
+        """Accept a verified Slave health report into the activation projection."""
+        package = await self.get_capability_package(report.package_version_ref)
+        if package.package_digest != report.package_digest:
+            raise ValueError("capability_package_digest_mismatch")
+        record = next((item for item in self.runs.values() if any(p.package_id == package.package_id and p.package_version == package.package_version for p in item.capability_packages)), None)
+        if record is None:
+            raise KeyError(report.package_version_ref)
+        activation_ref = package.version_ref
+        current = next((item for item in record.capability_activations if item.package_version_ref == activation_ref and item.target_slave == report.target_slave), None)
+        if current is not None and report.session_generation < current.runtime_profile.get("session_generation", report.session_generation):
+            raise ValueError("stale_session_generation")
+        activation = CapabilityPackageActivation(
+            package_version_ref=activation_ref,
+            target_slave=report.target_slave,
+            activation_closure_version_ref=package.package_closure_version_ref,
+            compute_binding_ref="",
+            evidence_refs=list(report.evidence_refs),
+            activation_state=report.activation_state,
+            runtime_profile={**(dict(report.details.get("runtime_profile", {})) if isinstance(report.details, dict) else {}), "session_generation": report.session_generation},
+        )
+        record.capability_activations = [item for item in record.capability_activations if not (item.package_version_ref == activation_ref and item.target_slave == report.target_slave)]
+        record.capability_activations.append(activation)
+        if report.activation_state == "ready" and package.scope == "workspace_reusable" and package.publication_state == "published":
+            operation_ref = package.operation_descriptor_ref
+            operation_name = operation_ref.resource_id if isinstance(operation_ref, ResourceRef) else str(operation_ref)
+            self.slave_capabilities.setdefault(report.target_slave, {}).setdefault("operations", set()).add(self._operation_name(operation_name))
+        record.events.append({"phase": "capability_health_report", "package_ref": activation_ref, "target_slave": report.target_slave, "activation_state": report.activation_state, "evidence_refs": report.evidence_refs, "created_at": datetime.now(timezone.utc).isoformat()})
+        await self._persist(record)
+        return activation
+
+    async def _evaluate_readiness(self, snapshot: TaskClosure, *, run_id: str | None = None) -> dict[str, Any]:
         operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
         operation = self._operation_name(operation_ref)
         blockers: list[dict[str, Any]] = []
@@ -250,7 +433,34 @@ class ObserverRepository:
                 continue
             if not self.slave_availability.get(target, False):
                 blockers.append({"code": "slave_unavailable", "hole_id": hole.hole_id, "target_resource_ref": target})
-            if operation and operation not in capability.get("operations", set()):
+            package = self._find_package(binding.capability_package_ref) if binding.capability_package_ref else None
+            if binding.capability_package_ref and package is None:
+                blockers.append({"code": "capability_package_not_found", "hole_id": hole.hole_id})
+            elif package is not None:
+                if package.scope == "run_bound" and run_id is not None and package.source_run_ref != run_id:
+                    blockers.append({"code": "capability_package_scope_mismatch", "hole_id": hole.hole_id, "source_run_ref": package.source_run_ref})
+                if package.publication_state == "abandoned":
+                    blockers.append({"code": "capability_package_abandoned", "package_ref": self._package_ref(package)})
+                stat = await self.content_store.stat(package.program_content_ref)
+                if stat is None or not stat.integrity_verified or stat.declared_digest != package.program_digest:
+                    blockers.append({"code": "package_content_unavailable", "hole_id": hole.hole_id})
+                if binding.realization_digest and binding.realization_digest not in {package.program_digest, package.package_digest}:
+                    blockers.append({"code": "capability_package_digest_mismatch", "hole_id": hole.hole_id})
+                if package.provider_fillable_hole_refs and not binding.runtime_profile:
+                    blockers.append({"code": "provider_fillable_hole_unbound", "hole_id": hole.hole_id, "hole_refs": package.provider_fillable_hole_refs})
+                if "run_code" not in capability.get("operations", set()):
+                    blockers.append({"code": "capability_unavailable", "operation": "run_code", "target_resource_ref": target})
+                try:
+                    expected_executor_digest = default_registry.get(package.executor_kind).descriptor.digest
+                    if binding.executor_descriptor_digest and binding.executor_descriptor_digest != expected_executor_digest:
+                        blockers.append({"code": "executor_descriptor_mismatch", "hole_id": hole.hole_id})
+                except ValueError:
+                    blockers.append({"code": "executor_unavailable", "executor_kind": package.executor_kind})
+                descriptor_ref = package.operation_descriptor_ref
+                descriptor_name = descriptor_ref.resource_id if isinstance(descriptor_ref, ResourceRef) else str(descriptor_ref)
+                if operation and self._operation_name(descriptor_name) != operation:
+                    blockers.append({"code": "operation_descriptor_mismatch", "operation": operation})
+            elif operation and operation not in capability.get("operations", set()):
                 blockers.append({"code": "capability_unavailable", "operation": operation, "target_resource_ref": target})
 
         if operation and not snapshot.compute.typed_holes:
@@ -370,7 +580,7 @@ class ObserverRepository:
             inspected_version = record.committed.version_id
         else:
             raise ValueError("version_conflict")
-        readiness = self._evaluate_readiness(snapshot)
+        readiness = await self._evaluate_readiness(snapshot, run_id=run_id)
         record.events.append(
             {
                 "phase": "readiness_inspected",
@@ -401,7 +611,7 @@ class ObserverRepository:
         await self._persist(record)
         return record
 
-    async def fail_run(self, run_id: str, reason: str) -> RunRecord:
+    async def fail_run(self, run_id: str, reason: str | dict[str, Any]) -> RunRecord:
         record = await self._load(run_id)
         if record.state in {"completed", "closed", "cancelled"}:
             return record
@@ -417,6 +627,20 @@ class ObserverRepository:
         )
         await self._persist(record)
         return record
+
+    async def record_agent_signal(self, run_id: str, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist non-terminal app-server status/warning signals on a Run."""
+        record = await self._load(run_id)
+        event = {
+            "phase": "coding_agent_signal",
+            "run_id": run_id,
+            "kind": kind,
+            "payload": deepcopy(payload),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        record.events.append(event)
+        await self._persist(record)
+        return event
 
     async def list_conversations(self) -> list[dict[str, Any]]:
         groups: dict[str, list[RunRecord]] = {}
@@ -471,6 +695,8 @@ class ObserverRepository:
                     "committed_version": record.committed.version_id if record.committed else None,
                     "execution_id": record.execution_id,
                     "outcome": record.outcome,
+                    "capability_packages": [package.model_dump(mode="json") for package in record.capability_packages],
+                    "capability_activations": [activation.model_dump(mode="json") for activation in record.capability_activations],
                 }
             )
         return {
@@ -523,6 +749,64 @@ class ObserverRepository:
                 if any(existing.hole_id == hole.hole_id for existing in snapshot.compute.typed_holes):
                     raise ValueError(f"duplicate_typed_hole:{hole.hole_id}")
                 snapshot.compute.typed_holes.append(hole)
+            elif kind == "materialize_capability_package_candidate":
+                value = dict(operation.get("value") or operation)
+                package_id = str(value.get("package_id") or f"package-{uuid4().hex[:12]}")
+                package_version = str(value.get("package_version") or "v1")
+                program_ref_payload = value.get("program_content_ref") or value.get("program_ref")
+                if isinstance(program_ref_payload, ResourceRef):
+                    program_ref = program_ref_payload
+                elif isinstance(program_ref_payload, dict):
+                    program_ref = ResourceRef.model_validate(program_ref_payload)
+                elif isinstance(value.get("program"), str):
+                    program_ref = await self.content_store.put(value["program"].encode(), media_type="text/x-python")
+                elif isinstance(value.get("program"), (bytes, bytearray)):
+                    program_ref = await self.content_store.put(bytes(value["program"]), media_type="text/x-python")
+                else:
+                    raise ValueError("program_content_ref_required")
+                expected_digest = str(value.get("expected_program_digest") or value.get("program_digest") or "")
+                actual_digest = program_ref.version_or_digest or ""
+                if expected_digest and expected_digest != actual_digest:
+                    raise ValueError("program_digest_mismatch")
+                operation_ref = value.get("operation_descriptor_ref") or snapshot.program.operation_ref or snapshot.compute.operation_ref
+                if isinstance(operation_ref, dict):
+                    operation_ref = ResourceRef.model_validate(operation_ref)
+                else:
+                    operation_ref = ResourceRef(resource_id=str(operation_ref), identity_criterion="descriptor_digest")
+                descriptor_identity = operation_ref.resource_id if isinstance(operation_ref, ResourceRef) else str(operation_ref)
+                if not descriptor_identity:
+                    raise ValueError("operation_descriptor_required")
+                descriptor_digest = str(value.get("operation_descriptor_digest") or hashlib.sha256(descriptor_identity.encode()).hexdigest())
+                package = CapabilityPackageVersion(
+                    package_id=package_id,
+                    package_version=package_version,
+                    package_closure_version_ref=f"package-closure-{uuid4().hex[:12]}",
+                    source_run_ref=record.run_id,
+                    source_closure_version_ref=record.draft.version_id,
+                    operation_descriptor_ref=operation_ref,
+                    operation_descriptor_digest=descriptor_digest,
+                    program_content_ref=program_ref,
+                    program_digest=actual_digest,
+                    effective_constraint_refs=[Constraint.model_validate(item).ref() if isinstance(item, dict) else ConstraintRef.model_validate(item) for item in value.get("effective_constraint_refs", [])],
+                    provider_fillable_hole_refs=[str(item) for item in value.get("provider_fillable_hole_refs", [])],
+                    provenance=[{"source": "coding_agent", "run_id": record.run_id}],
+                    executor_kind=str(value.get("executor_kind") or "subprocess_json_v1"),
+                    executor_operation=str(value.get("executor_operation") or "run_code"),
+                    effect_class=str(value.get("effect_class") or "Sandboxed"),
+                    permissions=[str(item) for item in value.get("permissions", [])],
+                    replay_safety=str(value.get("replay_safety") or "DeclaredByPackage"),
+                    captures_run_state=bool(value.get("captures_run_state", value.get("run_specific_capture", False))),
+                    captured_secret_refs=[str(item) for item in value.get("captured_secret_refs", value.get("secret_refs", []))],
+                    captured_path_refs=[str(item) for item in value.get("captured_path_refs", value.get("raw_path_refs", []))],
+                    semantic_closed=bool(value.get("semantic_closed", True)),
+                )
+                # Re-materializing the same package/version is idempotent.
+                existing = next((item for item in record.capability_packages if item.package_id == package.package_id and item.package_version == package.package_version), None)
+                if existing is None:
+                    record.capability_packages.append(package)
+                else:
+                    package = existing
+                snapshot.metadata.setdefault("capability_package_refs", []).append(self._package_ref(package))
             elif kind == "bind_compute_hole":
                 value = operation.get("value", {})
                 if isinstance(value, dict) and "binding" in value:
@@ -563,9 +847,12 @@ class ObserverRepository:
             snapshot=snapshot,
             patch_cursor=new_version.patch_cursor,
         )
-        receipt.readiness = self._evaluate_readiness(snapshot)
+        receipt.readiness = await self._evaluate_readiness(snapshot, run_id=run_id)
         self.idempotency[operation_id] = receipt
         record.events.append({"phase": "draft_patched", "operation_id": operation_id, "version": new_version.version_id})
+        package_refs = snapshot.metadata.get("capability_package_refs", [])
+        if package_refs:
+            record.events.append({"phase": "capability_package_candidate_materialized", "operation_id": operation_id, "package_refs": package_refs})
         if self.sessions is not None:
             async with self.sessions() as session:
                 session.add(IdempotencyRow(operation_id=operation_id, receipt={"receipt": receipt.receipt, "run_id": receipt.run_id, "kind": receipt.kind, "draft_version": receipt.draft_version, "draft_digest": receipt.draft_digest, "patch_cursor": receipt.patch_cursor, "readiness": receipt.readiness}))
@@ -577,7 +864,7 @@ class ObserverRepository:
         record = await self._load(run_id)
         if record.draft.version_id != version_id or record.draft.snapshot_digest != digest:
             raise ValueError("version_conflict")
-        readiness = self._evaluate_readiness(record.draft.snapshot)
+        readiness = await self._evaluate_readiness(record.draft.snapshot, run_id=run_id)
         record.events.append(
             {
                 "phase": "readiness_inspected",
@@ -602,7 +889,7 @@ class ObserverRepository:
         record = await self._load(run_id)
         if record.committed is None or record.committed.version_id != version_id:
             raise ValueError("closure_not_committed")
-        readiness = self._evaluate_readiness(record.committed.snapshot)
+        readiness = await self._evaluate_readiness(record.committed.snapshot, run_id=run_id)
         record.events.append(
             {
                 "phase": "readiness_inspected",

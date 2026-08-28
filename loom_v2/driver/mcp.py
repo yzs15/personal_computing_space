@@ -42,6 +42,11 @@ class DriverMCP:
             return await self.open_run(arguments)
         if tool_name == "loom_query_capabilities":
             return self._query_capabilities()
+        if tool_name == "loom_list_run_capability_packages":
+            if self.active_run_id is None:
+                return {"packages": []}
+            packages = await self.repository.list_capability_packages(run_id=self.active_run_id, include_abandoned=True)
+            return {"packages": [package.model_dump(mode="json") for package in packages]}
         if self.active_run_id is None:
             raise ValueError("run_not_open")
         if tool_name == "loom_apply_plan_patch":
@@ -73,6 +78,10 @@ class DriverMCP:
                     "operations": sorted(details.get("operations", set())),
                 }
                 for resource_id, details in sorted(self.repository.slave_capabilities.items())
+            ],
+            "executor_descriptors": [
+                {"kind": "builtin_v1", "version": "1", "operations": ["echo", "hash", "sort", "run_code"]},
+                {"kind": "subprocess_json_v1", "version": "1", "operations": ["run_code"]},
             ],
         }
 
@@ -157,6 +166,7 @@ class DriverMCP:
                         "set_result_expectation",
                         "add_constraint",
                         "tighten_constraint",
+                        "materialize_capability_package_candidate",
                     ],
                 },
                 "op": {"type": "string"},
@@ -205,6 +215,12 @@ class DriverMCP:
                 "type": "function",
                 "name": "loom_inspect_plan_readiness",
                 "description": "Return structured blockers for the current draft closure.",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+            {
+                "type": "function",
+                "name": "loom_list_run_capability_packages",
+                "description": "List candidate capability packages materialized by this Run; publication remains a user decision.",
                 "inputSchema": {"type": "object", "properties": {}},
             },
             {

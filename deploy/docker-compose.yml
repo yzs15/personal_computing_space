@@ -1,4 +1,25 @@
 services:
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: loom
+      MINIO_ROOT_PASSWORD: loom-content-secret
+    volumes: [minio-data:/data]
+    ports: ["9000:9000", "9001:9001"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["mc alias set loom http://minio:9000 loom loom-content-secret && mc mb --ignore-existing loom/loom-content"]
+
   observer-db:
     image: postgres:16-alpine
     environment:
@@ -59,13 +80,25 @@ services:
       LOOM_DATABASE_URL: postgresql+asyncpg://loom:loom@observer-db:5432/loom_observer
       LOOM_CODING_AGENT_BACKEND: codex
       LOOM_CODEX_MODEL: deepseek-v4-flash
+      LOOM_CODING_AGENT_DEADLINE_SECONDS: 86400
+      LOOM_CODING_AGENT_POLL_INTERVAL_SECONDS: 5
+      LOOM_CODING_AGENT_PROTOCOL_FAILURE_SECONDS: 60
+      LOOM_WORKER_OPERATION_TIMEOUT_SECONDS: 90
+      LOOM_CAPABILITY_OPERATION_TIMEOUT_SECONDS: 30
+      LOOM_S3_ENDPOINT_URL: http://minio:9000
+      LOOM_S3_BUCKET: loom-content
+      LOOM_S3_ACCESS_KEY: loom
+      LOOM_S3_SECRET_KEY: loom-content-secret
+      LOOM_S3_REGION: us-east-1
       LOOM_SLAVE_A_URL: http://slave-a:8081
       LOOM_SLAVE_B_URL: http://slave-b:8082
     depends_on:
       observer-db: {condition: service_healthy}
       slave-a: {condition: service_started}
       slave-b: {condition: service_started}
-    ports: ["8080:8080"]
+      minio-init: {condition: service_completed_successfully}
+    # Keep the container port stable; expose Observer on the host at 18080.
+    ports: ["18080:8080"]
 
   slave-a:
     build: ..
@@ -73,8 +106,15 @@ services:
     environment:
       LOOM_SERVICE_NAME: slave-a
       LOOM_DATABASE_URL: postgresql+asyncpg://loom:loom@slave-a-db:5432/loom_slave_a
+      LOOM_CAPABILITY_OPERATION_TIMEOUT_SECONDS: 30
+      LOOM_S3_ENDPOINT_URL: http://minio:9000
+      LOOM_S3_BUCKET: loom-content
+      LOOM_S3_ACCESS_KEY: loom
+      LOOM_S3_SECRET_KEY: loom-content-secret
+      LOOM_S3_REGION: us-east-1
     depends_on:
       slave-a-db: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
     ports: ["8081:8081"]
 
   slave-b:
@@ -83,8 +123,15 @@ services:
     environment:
       LOOM_SERVICE_NAME: slave-b
       LOOM_DATABASE_URL: postgresql+asyncpg://loom:loom@slave-b-db:5432/loom_slave_b
+      LOOM_CAPABILITY_OPERATION_TIMEOUT_SECONDS: 30
+      LOOM_S3_ENDPOINT_URL: http://minio:9000
+      LOOM_S3_BUCKET: loom-content
+      LOOM_S3_ACCESS_KEY: loom
+      LOOM_S3_SECRET_KEY: loom-content-secret
+      LOOM_S3_REGION: us-east-1
     depends_on:
       slave-b-db: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
     ports: ["8082:8082"]
 
 volumes:
@@ -92,3 +139,4 @@ volumes:
   driver-db-data:
   slave-a-db-data:
   slave-b-db-data:
+  minio-data:

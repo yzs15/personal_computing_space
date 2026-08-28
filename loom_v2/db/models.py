@@ -20,6 +20,8 @@ class RunRow(Base):
     outcome: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     attempts: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     events: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    capability_packages: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    capability_activations: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
 
 
 class IdempotencyRow(Base):

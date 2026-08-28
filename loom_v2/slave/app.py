@@ -4,9 +4,10 @@ from fastapi import FastAPI, HTTPException
 
 from loom_v2.db.session import make_engine
 from loom_v2.settings import Settings
+from loom_v2.content_store import ContentStore
 
 from .service import SlaveService
-from loom_v2.contracts.types import ComputeBinding, TaskClosure
+from loom_v2.contracts.types import CapabilityPackageVersion, CapabilityProvisionCommand, ComputeBinding, TaskClosure
 
 
 def create_app(slave_id: str | None = None) -> FastAPI:
@@ -14,7 +15,12 @@ def create_app(slave_id: str | None = None) -> FastAPI:
     app = FastAPI(title=f"Loom v2 {slave_id}")
     settings = Settings()
     app.state.engine = None if settings.database_url.startswith("sqlite+aiosqlite:///:memory:") else make_engine(settings.database_url)
-    app.state.service = SlaveService(slave_id=slave_id, engine=app.state.engine)
+    app.state.service = SlaveService(
+        slave_id=slave_id,
+        engine=app.state.engine,
+        content_store=ContentStore.from_settings(settings),
+        capability_operation_timeout_seconds=settings.capability_operation_timeout_seconds,
+    )
 
     @app.on_event("startup")
     async def initialize_database() -> None:
@@ -73,6 +79,17 @@ def create_app(slave_id: str | None = None) -> FastAPI:
             },
         }
 
+    @app.post("/worker/v1/provision")
+    async def provision(payload: dict[str, object]) -> dict[str, object]:
+        service: SlaveService = app.state.service
+        try:
+            command = CapabilityProvisionCommand.model_validate(payload.get("command") or {})
+            package = CapabilityPackageVersion.model_validate(payload.get("package") or {})
+            report = await service.provision(command, package)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"accepted": True, "health_report": report.model_dump(mode="json")}
+
     @app.get("/worker/v1/capabilities")
     async def capabilities() -> dict[str, object]:
         service: SlaveService = app.state.service
@@ -82,6 +99,9 @@ def create_app(slave_id: str | None = None) -> FastAPI:
             "available": service.available,
             "replica": service.replica.state,
             "operations": sorted(service.supported_operations),
+            "executor_descriptors": [descriptor.__dict__ | {"operations": sorted(descriptor.operations), "digest": descriptor.digest, "descriptor_ref": descriptor.descriptor_ref} for descriptor in service.executor_registry.descriptors()],
+            "activations": [activation.model_dump(mode="json") for activation in service.activations.values()],
+            "resource_events": [event.model_dump(mode="json") for event in service.resource_events],
             "term_support": [support.model_dump(mode="json") for support in service.term_support()],
         }
 

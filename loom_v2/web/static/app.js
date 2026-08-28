@@ -7,6 +7,7 @@ const conversationStatus = document.querySelector('#conversation-status');
 const interruptButton = document.querySelector('#interrupt-conversation');
 const conversationList = document.querySelector('#conversation-list');
 const newConversationButton = document.querySelector('#new-conversation');
+const candidatePackages = document.querySelector('#candidate-packages');
 
 let conversationRef = null;
 let conversationSummaries = [];
@@ -121,6 +122,45 @@ function renderMessages(messages) {
   }
 }
 
+function renderCandidatePackages(packages) {
+  candidatePackages.replaceChildren();
+  if (!packages || !packages.length) {
+    candidatePackages.textContent = 'No candidates';
+    return;
+  }
+  for (const pkg of packages) {
+    const row = document.createElement('div');
+    row.className = 'package-row';
+    const label = document.createElement('span');
+    label.textContent = `${pkg.package_id}@${pkg.package_version} · ${pkg.scope}/${pkg.publication_state}`;
+    row.appendChild(label);
+    if (pkg.publication_state === 'candidate') {
+      const promote = document.createElement('button');
+      promote.type = 'button';
+      promote.textContent = 'Promote';
+      promote.addEventListener('click', async () => {
+        promote.disabled = true;
+        await fetch(`/api/v1/capability-packages/${encodeURIComponent(pkg.package_id)}/promote`, {
+          method: 'POST', headers: {'content-type': 'application/json'},
+          body: JSON.stringify({approved_digest: pkg.package_digest}),
+        });
+        if (conversationRef) await loadConversation(conversationRef);
+      });
+      row.appendChild(promote);
+      const abandon = document.createElement('button');
+      abandon.type = 'button';
+      abandon.textContent = 'Abandon';
+      abandon.addEventListener('click', async () => {
+        abandon.disabled = true;
+        await fetch(`/api/v1/capability-packages/${encodeURIComponent(pkg.package_id)}/abandon`, {method: 'POST'});
+        if (conversationRef) await loadConversation(conversationRef);
+      });
+      row.appendChild(abandon);
+    }
+    candidatePackages.appendChild(row);
+  }
+}
+
 function renderConversationList() {
   conversationList.replaceChildren();
   if (!conversationSummaries.length) {
@@ -149,6 +189,8 @@ async function loadConversation(ref) {
   if (ref !== conversationRef) return;
   renderMessages(conversation.messages || []);
   renderConversationStatus(conversation.status || 'idle');
+  const latestRun = (conversation.runs || []).at(-1);
+  renderCandidatePackages(latestRun?.capability_packages || []);
   const summary = conversationSummaries.find((item) => item.conversation_ref === ref);
   if (summary && summary.status !== (conversation.status || 'idle')) {
     summary.status = conversation.status || 'idle';

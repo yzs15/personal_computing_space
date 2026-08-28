@@ -9,7 +9,8 @@ if ! command -v "$DOCKER_BIN" >/dev/null 2>&1 || ! "$DOCKER_BIN" info >/dev/null
     if [[ -x "$candidate" ]] && "$candidate" info >/dev/null 2>&1; then DOCKER_BIN="$candidate"; break; fi
   done
 fi
-curl -fsS http://localhost:8080/healthz
-curl -fsS http://localhost:8080/ | grep -q "Run drawer"
+OBSERVER_PORT="${LOOM_OBSERVER_PORT:-18080}"
+curl -fsS "http://localhost:${OBSERVER_PORT}/healthz"
+curl -fsS "http://localhost:${OBSERVER_PORT}/" | grep -q "Run drawer"
 "$DOCKER_BIN" compose -f deploy/docker-compose.yml ps --status running
 echo "Loom v2 smoke checks passed"

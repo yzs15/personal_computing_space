@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 import httpx
 
@@ -78,6 +80,9 @@ class SortClosureProvider:
 
 
 class DynamicToolProvider:
+    def __init__(self, *, fail_after_start: bool = False) -> None:
+        self.fail_after_start = fail_after_start
+
     def set_tool_handler(self, tools, handler) -> None:
         self.tool_names = {tool["name"] for tool in tools}
         self.tool_handler = handler
@@ -111,6 +116,15 @@ class DynamicToolProvider:
         yield AgentEvent("tool_call", {"tool": "loom_commit_plan"})
         await self.tool_handler("loom_start_run", {})
         yield AgentEvent("tool_call", {"tool": "loom_start_run"})
+        if self.fail_after_start:
+            yield AgentEvent(
+                "agent_error",
+                {
+                    "code": "coding_agent_stalled",
+                    "source": "composite_signal",
+                    "message": "the turn failed after start_run",
+                },
+            )
 
     async def interrupt(self, turn_ref: str | None = None) -> None:
         return None
@@ -140,6 +154,112 @@ class OpenOnlyProvider:
 
     async def close(self) -> None:
         return None
+
+
+class StalledProvider:
+    async def start(self, conversation_ref: str, workspace_root: str) -> str:
+        return "stalled-thread"
+
+    async def send_turn(self, user_message: str):
+        yield AgentEvent(
+            "open_run",
+            {
+                "closure_contract": {
+                    "closure_id": "closure-stalled",
+                    "goal": user_message,
+                    "body": {"closure_id": "closure-stalled"},
+                }
+            },
+        )
+        yield AgentEvent("turn_started", {"turn_id": "stalled-turn"})
+        yield AgentEvent(
+            "agent_stalled",
+            {
+                "code": "coding_agent_stalled",
+                "source": "composite_signal",
+                "thread_id": "stalled-thread",
+                "turn_id": "stalled-turn",
+                "message": "no item progress",
+            },
+        )
+
+    async def interrupt(self, turn_ref: str | None = None) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+class DelayedOpenOnlyProvider:
+    """A live provider that emits no event for a short period."""
+
+    async def start(self, conversation_ref: str, workspace_root: str) -> str:
+        return "delayed-open-only-thread"
+
+    async def send_turn(self, user_message: str):
+        await asyncio.sleep(0.05)
+        yield AgentEvent(
+            "open_run",
+            {
+                "closure_contract": {
+                    "closure_id": "closure-delayed-open-only",
+                    "goal": user_message,
+                    "body": {"closure_id": "closure-delayed-open-only"},
+                }
+            },
+        )
+
+    async def interrupt(self, turn_ref: str | None = None) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+class NeverEndingProvider:
+    async def start(self, conversation_ref: str, workspace_root: str) -> str:
+        return "never-ending-thread"
+
+    async def send_turn(self, user_message: str):
+        yield AgentEvent(
+            "open_run",
+            {
+                "closure_contract": {
+                    "closure_id": "closure-never-ending",
+                    "goal": user_message,
+                    "body": {"closure_id": "closure-never-ending"},
+                }
+            },
+        )
+        yield AgentEvent("turn_started", {"turn_id": "never-ending-turn"})
+        await asyncio.Event().wait()
+
+    async def interrupt(self, turn_ref: str | None = None) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_driver_does_not_idle_timeout_while_app_server_conversation_is_alive(monkeypatch):
+    # The old fixed turn timeout must not act as an idle timeout.  A live
+    # app-server conversation may remain quiet while it is thinking.
+    monkeypatch.setenv("LOOM_CODING_AGENT_TIMEOUT_SECONDS", "0.01")
+    driver = DriverService(ObserverRepository(), DelayedOpenOnlyProvider(), deadline_seconds=0.5)
+
+    result = await driver.run_prompt("conversation-live", "wait briefly")
+
+    assert result["status"] == "thinking"
+    assert result["conversation_ref"] == "conversation-live"
+
+
+@pytest.mark.asyncio
+async def test_driver_enforces_absolute_conversation_deadline():
+    driver = DriverService(ObserverRepository(), NeverEndingProvider(), deadline_seconds=0.03)
+
+    with pytest.raises(RuntimeError, match="coding_agent_deadline_exceeded"):
+        await driver.run_prompt("conversation-deadline", "never finish")
 
 
 @pytest.mark.asyncio
@@ -185,6 +305,27 @@ async def test_driver_adopts_run_opened_through_dynamic_mcp_tool():
 
 
 @pytest.mark.asyncio
+async def test_driver_keeps_execution_completed_when_turn_fails_after_start():
+    """start_run is an execution boundary; later agent failure must not undo it."""
+
+    repo = ObserverRepository()
+    driver = DriverService(
+        repo,
+        DynamicToolProvider(fail_after_start=True),
+        slaves={"slave-a": SlaveService("slave-a")},
+    )
+
+    result = await driver.run_prompt("conversation-started-then-error", "echo through MCP")
+
+    assert result["state"] == "completed"
+    assert result["agent_error"]["code"] == "coding_agent_stalled"
+
+    runs = (await repo.get_conversation("conversation-started-then-error"))["runs"]
+    assert runs[0]["state"] == "completed"
+    assert runs[0]["outcome"]["value"] == {"text": "echo through MCP"}
+
+
+@pytest.mark.asyncio
 async def test_driver_does_not_commit_or_start_when_agent_only_opens_run():
     repo = ObserverRepository()
     driver = DriverService(repo, OpenOnlyProvider(), slaves={"slave-a": SlaveService("slave-a")})
@@ -196,3 +337,18 @@ async def test_driver_does_not_commit_or_start_when_agent_only_opens_run():
     assert result["status"] == "thinking"
     assert result["closure_version"] is None
     assert result["execution_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_driver_marks_run_and_conversation_failed_with_structured_stall_reason():
+    repo = ObserverRepository()
+    driver = DriverService(repo, StalledProvider())
+
+    with pytest.raises(RuntimeError, match="coding_agent_stalled"):
+        await driver.run_prompt("conversation-stalled", "refine a closure")
+
+    conversation = await repo.get_conversation("conversation-stalled")
+    assert conversation["status"] == "failed"
+    assert conversation["runs"][0]["state"] == "failed"
+    assert conversation["runs"][0]["outcome"]["reason"]["code"] == "coding_agent_stalled"
+    assert conversation["runs"][0]["outcome"]["reason"]["source"] == "composite_signal"

@@ -27,16 +27,45 @@ The deterministic test profile uses Fake coding-agent:
 docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.test.yml --profile test up --build --abort-on-container-exit --exit-code-from driver
 ```
 
-For the local experience, start the four isolated PostgreSQL instances, Observer,
-and both Slaves with `scripts/dev-up.sh`. The default runtime setting remains
+For the local experience, start the four isolated PostgreSQL instances and both
+containerized Slaves with `scripts/dev-up.sh`; the Observer runs on the host so
+it can access the local Codex app-server. The default host port is 18080
+(`LOOM_OBSERVER_PORT` can override it). The default runtime setting remains
 Codex app-server with model `deepseek-v4-flash`; it reads the host Codex CLI
 configuration and never copies credentials into Loom. If the local app-server or
 model is unavailable, the UI reports `coding_agent_unavailable` rather than
 silently switching to Fake.
 
-The host Driver allows up to 90 seconds per Codex turn by default
-(`LOOM_CODING_AGENT_TIMEOUT_SECONDS` can override this) and reports a retryable
-`coding_agent_timeout` if the local upstream does not finish in that window.
+The host Driver treats a live Codex app-server conversation as active even when
+the app-server is temporarily quiet.  A single conversation has a 24-hour
+absolute deadline by default (`LOOM_CODING_AGENT_DEADLINE_SECONDS`); expiry is
+reported as the retryable `coding_agent_deadline_exceeded`.  Child operations
+are bounded independently: WorkerSession HTTP calls use
+`LOOM_WORKER_OPERATION_TIMEOUT_SECONDS` (default 90 seconds), while the
+`subprocess_json_v1` capability executor uses
+`LOOM_CAPABILITY_OPERATION_TIMEOUT_SECONDS` (default 30 seconds).  These child
+timeouts do not turn into coding-agent idle timeouts.
+
+While a turn is `inProgress`, the Codex provider also polls
+`thread/read(includeTurns=true)` and `thread/goal/get` (every
+`LOOM_CODING_AGENT_POLL_INTERVAL_SECONDS`, default 5 seconds).  The provider
+separates turn lifecycle from protocol health: every successful poll response,
+delta, item/turn notification, token-usage update, and thread-status update is
+a heartbeat even when the returned snapshot is unchanged.  Quiet long
+generation is therefore allowed.  Only a continuous RPC failure or missing
+poll response longer than `LOOM_CODING_AGENT_PROTOCOL_FAILURE_SECONDS`
+(default 60 seconds) is reported as `coding_agent_stalled`; the Driver's
+24-hour absolute deadline remains the final safety bound.  `waitingOnUserInput`
+and `waitingOnApproval` are normal thinking states.
+
+Content is stored only in MinIO/S3. Observer and both Slaves resolve the same
+immutable `content://sha256/<digest>` references from their configured bucket;
+no filesystem volume or `program_bytes_b64` transfer is used. The Compose stack
+starts MinIO on ports 9000 (S3) and 9001 (console), initializes the
+`loom-content` bucket, and injects `LOOM_S3_ENDPOINT_URL`, `LOOM_S3_BUCKET`,
+`LOOM_S3_ACCESS_KEY`, `LOOM_S3_SECRET_KEY`, `LOOM_S3_REGION`, and optional
+`LOOM_S3_PREFIX`. Writes are conditional and existing objects are never
+overwritten; reads verify the SHA-256 digest.
 
 `open_run` is a coding-agent decision: after clarifying the user's goal, the
 agent calls it through the conversation-scoped Driver MCP surface. The Driver
@@ -72,5 +101,13 @@ assistant, draft, and event history intact, marks the run `cancelled`, and
 reports the conversation as `interrupted`. If no turn is active, the endpoint
 returns HTTP 409 with `conversation_not_active`.
 
-The next-stage Term/Capability Package work is intentionally roadmap-only in
-this version; an unknown required term fails with a structured capability error.
+Capability-gap refinement is implemented through immutable, content-addressed
+`CapabilityPackageVersion` candidates. A coding-agent can materialize a
+`run_bound/candidate` package, bind it to an exact Slave and execute it through
+the `subprocess_json_v1` adapter. Candidates never enter the Workspace
+capability snapshot automatically. After a terminal Run, the user can inspect
+`GET /api/v1/capability-packages` and explicitly promote or abandon a candidate;
+promotion derives a `workspace_reusable/published` version and optional
+provisioning returns a health report and activation evidence. Unknown required
+terms still fail with a structured capability error; installing new term
+support remains a later roadmap item.

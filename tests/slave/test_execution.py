@@ -1,7 +1,7 @@
 import pytest
 
 from loom_v2.contracts.types import ComputeSpec, TaskClosure, TypedHole
-from loom_v2.slave.executor import execute_operation
+from loom_v2.slave.executor import SubprocessJSONV1Adapter, execute_operation
 from loom_v2.slave.service import SlaveService
 
 
@@ -35,3 +35,13 @@ async def test_slave_rejects_unsupported_operation():
 
     with pytest.raises(RuntimeError, match="capability_unavailable:sort"):
         await service.run("attempt-unsupported", "sort", {"items": [2, 1]})
+
+
+@pytest.mark.asyncio
+async def test_subprocess_capability_timeout_is_independently_configurable(monkeypatch):
+    monkeypatch.setenv("LOOM_CAPABILITY_OPERATION_TIMEOUT_SECONDS", "0.01")
+    adapter = SubprocessJSONV1Adapter()
+    program = b"import time; time.sleep(0.10); print('{}')"
+
+    with pytest.raises(RuntimeError, match="capability_timeout"):
+        await adapter.execute("run_code", {}, program=program)

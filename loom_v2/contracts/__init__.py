@@ -1,6 +1,12 @@
 from .constraints import Constraint, ConstraintRef, ConstraintSpec
+from .errors import DomainError, DomainErrorEnvelope
 from .terms import TermSupport, TypedTerm, VocabularyRegistry, builtin_registry
 from .types import (
+    CapabilityHealthReport,
+    CapabilityPackage,
+    CapabilityPackageActivation,
+    CapabilityPackageVersion,
+    CapabilityProvisionCommand,
     ComputeBinding,
     ComputeRequirement,
     ComputeSpec,
@@ -10,17 +16,25 @@ from .types import (
     ProgramSystems,
     TaskClosure,
     TypedHole,
+    ResourceEventFrame,
 )
 
 __all__ = [
     "Constraint",
     "ConstraintRef",
     "ConstraintSpec",
+    "DomainError",
+    "DomainErrorEnvelope",
     "TermSupport",
     "TypedTerm",
     "VocabularyRegistry",
     "builtin_registry",
     "ComputeBinding",
+    "CapabilityHealthReport",
+    "CapabilityPackage",
+    "CapabilityPackageActivation",
+    "CapabilityPackageVersion",
+    "CapabilityProvisionCommand",
     "ComputeRequirement",
     "ComputeSpec",
     "DataApplication",
@@ -29,4 +43,5 @@ __all__ = [
     "ProgramSystems",
     "TaskClosure",
     "TypedHole",
+    "ResourceEventFrame",
 ]

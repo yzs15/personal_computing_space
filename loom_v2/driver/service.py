@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-from loom_v2.coding_agents.base import CodingAgentProvider
-from loom_v2.contracts.types import ComputeBinding, TaskClosure
+from loom_v2.coding_agents.base import CodingAgentError, CodingAgentProvider
+from loom_v2.contracts.types import CapabilityProvisionCommand, ComputeBinding, TaskClosure
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.observer.worker import WorkerSession
 from loom_v2.slave.service import SlaveService
@@ -24,6 +24,7 @@ class ActiveTurn:
     turn_ref: str | None = None
     interrupt_requested: bool = False
     interrupt_sent: bool = False
+    deadline_exceeded: bool = False
 
 
 class DriverService:
@@ -34,6 +35,7 @@ class DriverService:
         executor=execute_operation,
         slaves: dict[str, SlaveService] | None = None,
         workers: dict[str, WorkerSession] | None = None,
+        deadline_seconds: float | None = None,
     ) -> None:
         self.repository = repository
         self.provider = provider
@@ -41,15 +43,41 @@ class DriverService:
         self.executor = executor
         self.slaves = slaves or {}
         self.workers = workers or {}
+        configured_deadline = os.getenv("LOOM_CODING_AGENT_DEADLINE_SECONDS", "86400")
+        self.deadline_seconds = deadline_seconds if deadline_seconds is not None else float(configured_deadline)
         self.active_turns: dict[str, ActiveTurn] = {}
 
     async def run_prompt(self, conversation_ref: str, prompt: str) -> dict[str, Any]:
-        timeout_seconds = float(os.getenv("LOOM_CODING_AGENT_TIMEOUT_SECONDS", "90"))
+        # A live app-server conversation is allowed to stay quiet while the
+        # coding agent thinks.  This wait is an absolute safety deadline, not
+        # an idle/progress timeout; child operations enforce their own
+        # operation-specific limits at the Worker/Slave boundary.
+        work = asyncio.create_task(self._run_prompt(conversation_ref, prompt))
         try:
-            async with asyncio.timeout(timeout_seconds):
-                return await self._run_prompt(conversation_ref, prompt)
-        except TimeoutError as exc:
-            raise RuntimeError("coding_agent_timeout") from exc
+            done, _pending = await asyncio.wait({work}, timeout=self.deadline_seconds)
+            if done:
+                return work.result()
+
+            # Mark the active turn before cancelling it so the run's failure
+            # reason distinguishes a conversation deadline from an external
+            # task cancellation.
+            active = self.active_turns.get(conversation_ref)
+            if active is not None:
+                active.deadline_exceeded = True
+            work.cancel()
+            try:
+                await work
+            except asyncio.CancelledError:
+                pass
+            raise RuntimeError("coding_agent_deadline_exceeded")
+        except asyncio.CancelledError:
+            if not work.done():
+                work.cancel()
+                try:
+                    await work
+                except asyncio.CancelledError:
+                    pass
+            raise
 
     async def interrupt(self, conversation_ref: str) -> dict[str, Any]:
         active = self.active_turns.get(conversation_ref)
@@ -73,6 +101,8 @@ class DriverService:
         assistant_parts: list[str] = []
         pending_assistant_parts: list[str] = []
         interrupted = False
+        execution_record: Any | None = None
+        execution_result: ExecutionResult | None = None
         try:
             set_tool_handler = getattr(self.provider, "set_tool_handler", None)
             if callable(set_tool_handler):
@@ -105,6 +135,8 @@ class DriverService:
                     elif tool_name == "loom_commit_plan" and active.run_id is not None:
                         record = await self.repository.get_run(active.run_id)
                         committed = record.committed.version_id if record.committed is not None else committed
+                    elif tool_name == "loom_start_run" and active.run_id is not None and execution_result is None:
+                        execution_record, execution_result = await self._dispatch_execution(active.run_id, prompt)
                     continue
                 elif event.kind == "apply_plan_patch":
                     if active.run_id is None:
@@ -132,12 +164,21 @@ class DriverService:
                     if committed is None:
                         raise RuntimeError("closure_not_committed")
                     await self.tools.start_run(active.run_id, committed)
+                    if execution_result is None:
+                        execution_record, execution_result = await self._dispatch_execution(active.run_id, prompt)
                 elif event.kind == "inspect_plan_readiness":
                     if active.run_id is None:
                         raise RuntimeError("run_not_open")
                     readiness = await self.tools.inspect_plan_readiness(active.run_id)
                     if not readiness["ready"]:
                         raise ValueError("readiness_blocked:" + json.dumps(readiness["blockers"], ensure_ascii=False, sort_keys=True))
+                elif event.kind in {"agent_error", "agent_stalled"}:
+                    reason = dict(event.payload)
+                    reason.setdefault("code", "coding_agent_error")
+                    raise CodingAgentError(reason)
+                elif event.kind in {"agent_warning", "thread_status", "goal_status"}:
+                    if active.run_id is not None:
+                        await self.repository.record_agent_signal(active.run_id, event.kind, event.payload)
             if interrupted or active.interrupt_requested:
                 if active.run_id is None:
                     return {
@@ -198,48 +239,12 @@ class DriverService:
                     "execution_epoch": record.execution_epoch,
                     "assistant_text": "\n\n".join(assistant_parts),
                 }
-            execution_id = record.execution_id
-            execution_epoch = record.execution_epoch
-            snapshot = record.committed.snapshot if record.committed is not None else TaskClosure.minimal()
-            operation = self._operation_name(snapshot.program.operation_ref or snapshot.compute.operation_ref) or "echo"
-            payload = self._execution_payload(snapshot, operation, prompt)
-            binding = self._binding_for_operation(snapshot)
-            if self.workers or self.slaves:
-                target = binding.target_resource_ref.resource_id if binding is not None else "slave-a"
-                record = await self.repository.get_run(active.run_id)
-                attempt_id = next((item["attempt_id"] for item in record.attempts if item.get("target") == target), None)
-                if attempt_id is None:
-                    raise RuntimeError("attempt_not_created")
-                worker = self.workers.get(target)
-                if worker is not None:
-                    workspace_id = record.closure_contract.workspace_id if record.closure_contract else "workspace-default"
-                    result = await worker.dispatch(
-                        attempt_id=attempt_id,
-                        execution_id=execution_id,
-                        execution_epoch=execution_epoch,
-                        workspace_id=workspace_id,
-                        operation=operation,
-                        payload=payload,
-                        closure=snapshot,
-                        binding=binding,
-                    )
-                else:
-                    slave = self.slaves.get(target)
-                    if slave is None:
-                        raise RuntimeError(f"capability_unavailable:{target}")
-                    result = await slave.run(
-                        attempt_id,
-                        operation,
-                        payload,
-                        closure=snapshot,
-                        binding=binding,
-                    )
-            else:
-                result = await self.executor(operation, payload)
-            completed = await self.repository.record_result(
-                active.run_id,
-                {"resource_ref": result.resource_ref.resource_id, "digest": result.digest, "value": result.value},
-            )
+            if execution_result is None:
+                execution_record, execution_result = await self._dispatch_execution(active.run_id, prompt)
+            completed = execution_record
+            result = execution_result
+            if completed is None or result is None:
+                raise RuntimeError("execution_not_completed")
             return {
                 "run_id": active.run_id,
                 "conversation_ref": conversation_ref,
@@ -248,20 +253,47 @@ class DriverService:
                 "state": completed.state,
                 "status": "completed",
                 "resource_ref": result.resource_ref.resource_id,
-                "execution_id": execution_id,
-                "execution_epoch": execution_epoch,
+                "execution_id": completed.execution_id,
+                "execution_epoch": completed.execution_epoch,
                 "assistant_text": "\n\n".join(assistant_parts),
             }
         except asyncio.CancelledError:
             if active.run_id is not None:
                 if active.interrupt_requested:
                     await self.repository.cancel_run(active.run_id)
+                elif active.deadline_exceeded:
+                    await self.repository.fail_run(active.run_id, "coding_agent_deadline_exceeded")
                 else:
                     await self.repository.fail_run(active.run_id, "driver_cancelled")
             raise
         except Exception as exc:
             if active.run_id is not None:
-                await self.repository.fail_run(active.run_id, str(exc))
+                reason = exc.reason if isinstance(exc, CodingAgentError) else str(exc)
+                if execution_record is not None and execution_result is not None:
+                    # The execution boundary has already crossed.  Preserve
+                    # its terminal result and surface the later app-server
+                    # failure as diagnostic metadata instead of turning a
+                    # successful Run into a false failure.
+                    signal = reason if isinstance(reason, dict) else {
+                        "code": str(reason),
+                        "source": "driver",
+                        "message": str(reason),
+                    }
+                    await self.repository.record_agent_signal(active.run_id, "agent_error", signal)
+                    return {
+                        "run_id": active.run_id,
+                        "conversation_ref": conversation_ref,
+                        "closure_version": committed or (execution_record.committed.version_id if execution_record.committed else None),
+                        "patches": patches,
+                        "state": execution_record.state,
+                        "status": "completed",
+                        "resource_ref": execution_result.resource_ref.resource_id,
+                        "execution_id": execution_record.execution_id,
+                        "execution_epoch": execution_record.execution_epoch,
+                        "assistant_text": "\n\n".join(assistant_parts),
+                        "agent_error": signal,
+                    }
+                await self.repository.fail_run(active.run_id, reason)
             raise
         finally:
             if self.active_turns.get(conversation_ref) is active:
@@ -283,6 +315,89 @@ class DriverService:
         for pending in pending_assistant_parts:
             await self.repository.append_message(active.run_id, "assistant", pending)
         pending_assistant_parts.clear()
+
+    async def _dispatch_execution(self, run_id: str, prompt: str) -> tuple[Any, ExecutionResult]:
+        """Dispatch exactly once after the coding agent commits and starts a Run.
+
+        ``loom_start_run`` is an execution boundary, not merely another plan
+        mutation.  Dispatching here means a later app-server/turn failure does
+        not roll back work that has already completed.
+        """
+        record = await self.repository.get_run(run_id)
+        if record.execution_id is None:
+            raise RuntimeError("execution_not_started")
+        execution_id = record.execution_id
+        execution_epoch = record.execution_epoch
+        snapshot = record.committed.snapshot if record.committed is not None else TaskClosure.minimal()
+        operation = self._operation_name(snapshot.program.operation_ref or snapshot.compute.operation_ref) or "echo"
+        payload = self._execution_payload(snapshot, operation, prompt)
+        binding = self._binding_for_operation(snapshot)
+        if self.workers or self.slaves:
+            target = binding.target_resource_ref.resource_id if binding is not None else "slave-a"
+            attempt_id = next((item["attempt_id"] for item in record.attempts if item.get("target") == target), None)
+            if attempt_id is None:
+                raise RuntimeError("attempt_not_created")
+            worker = self.workers.get(target)
+            if worker is not None:
+                if binding is not None and binding.capability_package_ref is not None:
+                    package = await self.repository.get_capability_package(binding.capability_package_ref.resource_id)
+                    command = CapabilityProvisionCommand(
+                        command_id=f"provision-{package.package_id}-{target}",
+                        package_version_ref=f"{package.package_id}:{package.package_version}",
+                        package_digest=package.package_digest,
+                        target_slave=target,
+                        workspace_id=record.closure_contract.workspace_id if record.closure_contract else "workspace-default",
+                        activation_closure_version_ref=record.committed.version_id if record.committed else package.package_closure_version_ref,
+                        compute_binding=binding,
+                        program_content_ref=package.program_content_ref,
+                        idempotency_key=f"run-{execution_id}-{package.package_digest}-{target}",
+                    )
+                    report = await worker.provision(command=command, package=package)
+                    await self.repository.record_capability_health(report)
+                workspace_id = record.closure_contract.workspace_id if record.closure_contract else "workspace-default"
+                result = await worker.dispatch(
+                    attempt_id=attempt_id,
+                    execution_id=execution_id,
+                    execution_epoch=execution_epoch,
+                    workspace_id=workspace_id,
+                    operation=operation,
+                    payload=payload,
+                    closure=snapshot,
+                    binding=binding,
+                )
+            else:
+                slave = self.slaves.get(target)
+                if slave is None:
+                    raise RuntimeError(f"capability_unavailable:{target}")
+                if binding is not None and binding.capability_package_ref is not None:
+                    package = await self.repository.get_capability_package(binding.capability_package_ref.resource_id)
+                    command = CapabilityProvisionCommand(
+                        command_id=f"provision-{package.package_id}-{target}",
+                        package_version_ref=f"{package.package_id}:{package.package_version}",
+                        package_digest=package.package_digest,
+                        target_slave=target,
+                        workspace_id=record.closure_contract.workspace_id if record.closure_contract else "workspace-default",
+                        activation_closure_version_ref=record.committed.version_id if record.committed else package.package_closure_version_ref,
+                        compute_binding=binding,
+                        program_content_ref=package.program_content_ref,
+                        idempotency_key=f"run-{execution_id}-{package.package_digest}-{target}",
+                    )
+                    report = await slave.provision(command, package)
+                    await self.repository.record_capability_health(report)
+                result = await slave.run(
+                    attempt_id,
+                    operation,
+                    payload,
+                    closure=snapshot,
+                    binding=binding,
+                )
+        else:
+            result = await self.executor(operation, payload)
+        completed = await self.repository.record_result(
+            run_id,
+            {"resource_ref": result.resource_ref.resource_id, "digest": result.digest, "value": result.value},
+        )
+        return completed, result
 
     @staticmethod
     def _operation_name(operation_ref: str) -> str:
