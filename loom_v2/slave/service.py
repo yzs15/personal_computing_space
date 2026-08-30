@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -12,9 +15,11 @@ from loom_v2.contracts.types import (
     CapabilityPackageVersion,
     CapabilityProvisionCommand,
     ComputeBinding,
+    IoContract,
     ResourceRef,
     ResourceEventFrame,
     TaskClosure,
+    ValidationEvidence,
 )
 from loom_v2.db.base import SlaveBase
 from loom_v2.db.models import SlaveAttemptRow, SlaveReplicaRow
@@ -23,6 +28,7 @@ from loom_v2.settings import Settings
 
 from .executor import ExecutionResult, ExecutorRegistry, default_registry
 from loom_v2.content_store import ContentStore
+from loom_v2.contracts.io_schema import ValidationError as SchemaValidationError, validate, validate_schema
 
 
 @dataclass
@@ -81,6 +87,12 @@ class SlaveService:
         package = package or self.package_cache.get(command.package_version_ref)
         if package is None:
             raise RuntimeError("capability_package_not_found")
+        if package.io_contract_ref is None:
+            raise RuntimeError("io_contract_required")
+        try:
+            await self._load_io_contract(package.io_contract_ref)
+        except (FileNotFoundError, RuntimeError, ValueError, TypeError) as exc:
+            raise RuntimeError("io_contract_invalid") from exc
         if package.package_digest != command.package_digest:
             raise RuntimeError("capability_package_digest_mismatch")
         if command.program_content_ref is not None and command.program_content_ref.version_or_digest not in {None, package.program_digest}:
@@ -138,6 +150,187 @@ class SlaveService:
         self.resource_events.append(ResourceEventFrame(event_id=f"resource-{report.report_id}", resource_ref=ref, event_type="activation_ready", package_version_ref=ref, package_digest=package.package_digest, target_slave=self.slave_id, evidence_refs=report.evidence_refs))
         return report
 
+    async def _load_io_contract(self, ref: ResourceRef) -> IoContract:
+        raw = await self.content_store.get(ref)
+        try:
+            return IoContract.model_validate(json.loads(raw))
+        except (TypeError, json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError("io_contract_invalid") from exc
+
+    async def _admission_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        operation: str,
+        closure: TaskClosure | None,
+        package: CapabilityPackageVersion | None,
+    ) -> dict[str, Any]:
+        """Resolve and validate the immutable input binding at the Slave.
+
+        Driver-provided payloads are deliberately ignored when a closure has
+        a ``NodeInputBinding``.  The binding is the execution input authority;
+        the Slave rereads it from the shared ContentStore so a mutated
+        dispatch envelope cannot bypass readiness validation.
+        """
+
+        if closure is None or not closure.node_input_bindings:
+            return payload
+        operation_ref = closure.program.operation_ref or closure.compute.operation_ref
+        operation_name = operation_ref.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1] if operation_ref else operation
+        candidates = {operation_ref, operation_name, operation, "default"}
+        binding = next((item for item in closure.node_input_bindings if item.node_id in candidates), None)
+        if binding is None:
+            raise RuntimeError("input_binding_missing")
+
+        contract_ref = (
+            package.io_contract_ref
+            if package is not None and package.io_contract_ref is not None
+            else closure.program.io_contract_ref
+        )
+        contract = await self._load_io_contract(contract_ref) if contract_ref is not None else None
+        try:
+            raw = await self.content_store.get(binding.input_ref)
+            value = json.loads(raw)
+        except (FileNotFoundError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("payload_schema_mismatch") from exc
+
+        if contract is not None and contract.input_schema_ref is not None:
+            try:
+                schema = json.loads(await self.content_store.get(contract.input_schema_ref))
+                validate_schema(schema)
+                errors = validate(schema, value)
+            except (FileNotFoundError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("payload_schema_mismatch") from exc
+            if errors:
+                raise RuntimeError("payload_schema_mismatch")
+        return value if isinstance(value, dict) else {"value": value}
+
+    @staticmethod
+    def _evidence(
+        *,
+        attempt_id: str,
+        execution_epoch: int,
+        schema_ref: ResourceRef | None,
+        validator_ref: ResourceRef | None,
+        input_digest: str | None,
+        output_digest: str | None,
+        result: str,
+        errors: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        evidence = ValidationEvidence(
+            evidence_id=f"evidence-{attempt_id}-{uuid4().hex[:10]}",
+            attempt_id=attempt_id,
+            execution_epoch=execution_epoch,
+            validator_ref=validator_ref,
+            schema_ref=schema_ref,
+            input_digest=input_digest,
+            output_digest=output_digest,
+            result=result,
+            errors=list(errors or []),
+            issuer="slave",
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return evidence.model_dump(mode="json")
+
+    async def _validate_terminal_result(
+        self,
+        result: ExecutionResult,
+        *,
+        attempt_id: str,
+        execution_epoch: int,
+        closure: TaskClosure | None,
+        package: CapabilityPackageVersion | None,
+        binding: ComputeBinding | None,
+    ) -> ExecutionResult:
+        contract_ref = package.io_contract_ref if package is not None and package.io_contract_ref is not None else closure.program.io_contract_ref if closure is not None else None
+        if contract_ref is None:
+            return result
+        contract = await self._load_io_contract(contract_ref)
+        input_digest = None
+        if closure is not None and closure.node_input_bindings:
+            operation_ref = closure.program.operation_ref or closure.compute.operation_ref
+            candidates = {operation_ref, operation_ref.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1], "default"}
+            input_binding = next((item for item in closure.node_input_bindings if item.node_id in candidates), None)
+            input_digest = input_binding.input_ref.version_or_digest if input_binding is not None else None
+        evidence: list[dict[str, Any]] = []
+        if contract.output_schema_ref is not None:
+            try:
+                schema_raw = await self.content_store.get(contract.output_schema_ref)
+                schema = json.loads(schema_raw)
+                validate_schema(schema)
+                errors = validate(schema, result.value)
+            except (FileNotFoundError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                errors = [
+                    SchemaValidationError(
+                        path="$",
+                        keyword="schema",
+                        message="output schema could not be evaluated",
+                        expected="valid output schema",
+                        observed=str(exc),
+                    )
+                ]
+            if errors:
+                failed = self._evidence(
+                    attempt_id=attempt_id,
+                    execution_epoch=execution_epoch,
+                    schema_ref=contract.output_schema_ref,
+                    validator_ref=contract.success_validator_ref,
+                    input_digest=input_digest,
+                    output_digest=result.digest,
+                    result="fail",
+                    errors=[item.model_dump(mode="json") for item in errors],
+                )
+                return replace(
+                    result,
+                    terminal_state="failed",
+                    terminal_error={"code": "output_schema_mismatch", "errors": failed["errors"]},
+                    validation_evidence=[failed],
+                )
+            evidence.append(
+                self._evidence(
+                    attempt_id=attempt_id,
+                    execution_epoch=execution_epoch,
+                    schema_ref=contract.output_schema_ref,
+                    validator_ref=contract.success_validator_ref,
+                    input_digest=input_digest,
+                    output_digest=result.digest,
+                    result="pass",
+                )
+            )
+        if contract.success_validator_ref is not None:
+            plugin = await self.content_store.get(contract.success_validator_ref)
+            plugin_input = result.value if isinstance(result.value, dict) else {"value": result.value}
+            plugin_result = await self.executor_registry.execute("subprocess_json_v1", "run_code", plugin_input, program=plugin)
+            payload = plugin_result.value if isinstance(plugin_result.value, dict) else {}
+            plugin_status = payload.get("result")
+            plugin_errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
+            plugin_evidence = self._evidence(
+                attempt_id=attempt_id,
+                execution_epoch=execution_epoch,
+                schema_ref=contract.output_schema_ref,
+                validator_ref=contract.success_validator_ref,
+                input_digest=input_digest,
+                output_digest=result.digest,
+                result="pass" if plugin_status == "pass" else "fail",
+                errors=plugin_errors,
+            )
+            evidence.append(plugin_evidence)
+            if plugin_status != "pass":
+                return replace(
+                    result,
+                    terminal_state="failed",
+                    terminal_error={"code": "success_validation_failed", "errors": plugin_errors},
+                    validation_evidence=evidence,
+                )
+        elif contract.success_semantics is not None:
+            return replace(
+                result,
+                terminal_state="decision_required",
+                terminal_error={"code": "attestation_required"},
+                validation_evidence=evidence,
+            )
+        return replace(result, validation_evidence=evidence)
+
     async def run(
         self,
         attempt_id: str,
@@ -146,6 +339,7 @@ class SlaveService:
         *,
         closure: TaskClosure | None = None,
         binding: ComputeBinding | None = None,
+        execution_epoch: int = 1,
     ) -> ExecutionResult:
         if not self.available or self.replica.state != "ready":
             raise RuntimeError("slave_unavailable")
@@ -198,14 +392,26 @@ class SlaveService:
                         value=result_payload["value"],
                         replay_safety=result_payload["replay_safety"],
                         digest=result_payload["digest"],
+                        terminal_state=result_payload.get("terminal_state", "completed"),
+                        terminal_error=result_payload.get("terminal_error"),
+                        validation_evidence=result_payload.get("validation_evidence", []),
                     )
                     self.attempts[attempt_id] = result
                     return result
+        payload = await self._admission_payload(payload, operation=operation, closure=closure, package=package)
         if package is not None:
             program = await self.content_store.get(package.program_content_ref, expected_digest=package.program_digest)
             result = await self.executor_registry.execute(package.executor_kind, package.executor_operation, payload, program=program)
         else:
             result = await self.executor_registry.execute("builtin_v1", operation, payload)
+        result = await self._validate_terminal_result(
+            result,
+            attempt_id=attempt_id,
+            execution_epoch=execution_epoch,
+            closure=closure,
+            package=package,
+            binding=binding,
+        )
         self.attempts[attempt_id] = result
         if self.sessions is not None:
             async with self.sessions() as session:
@@ -215,12 +421,15 @@ class SlaveService:
                     workspace_id=self.workspace_id,
                     operation=operation,
                     payload=payload,
-                    state="completed",
+                    state=result.terminal_state,
                     result={
                         "resource_ref": result.resource_ref.model_dump(mode="json"),
                         "value": result.value,
                         "replay_safety": result.replay_safety,
                         "digest": result.digest,
+                        "terminal_state": result.terminal_state,
+                        "terminal_error": result.terminal_error,
+                        "validation_evidence": result.validation_evidence,
                     },
                 ))
                 await session.commit()

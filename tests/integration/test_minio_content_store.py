@@ -27,15 +27,21 @@ async def test_observer_and_slave_share_immutable_content_store():
     repo = ObserverRepository(content_store=observer_store)
     run = await repo.open_run("run-minio-e2e", "conversation-minio-e2e", "double")
     code = 'import sys,json; print(json.dumps({"value": json.load(sys.stdin)["x"] * 2}))'
+    program_ref = await observer_store.put(code.encode(), media_type="text/x-python")
+    io_contract_ref = await observer_store.put(
+        b'{"schema_version":"io.v1","input_schema_ref":null,"output_schema_ref":null,"success_semantics":null,"success_validator_ref":null}',
+        media_type="application/vnd.loom.io-contract+json",
+    )
     patch = await repo.apply_patch(
         run.run_id,
         run.draft_version,
         run.draft_digest,
         "materialize-minio-e2e",
-        [
-            {"kind": "set_program_ref", "value": "loom://double"},
-            {"kind": "add_typed_hole", "value": {"hole_id": "h_double"}},
-            {"kind": "materialize_capability_package_candidate", "value": {"package_id": "pkg-minio-e2e", "program": code, "operation_descriptor_ref": "loom://double"}},
+            [
+                {"kind": "set_program_ref", "value": "loom://double"},
+                {"kind": "set_io_contract_ref", "value": io_contract_ref.model_dump(mode="json")},
+                {"kind": "add_typed_hole", "value": {"hole_id": "h_double"}},
+            {"kind": "materialize_capability_package_candidate", "value": {"package_id": "pkg-minio-e2e", "program_content_ref": program_ref.model_dump(mode="json"), "io_contract_ref": io_contract_ref.model_dump(mode="json"), "operation_descriptor_ref": "loom://double"}},
         ],
     )
     package = (await repo.get_run(run.run_id)).capability_packages[0]

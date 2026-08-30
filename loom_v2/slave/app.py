@@ -41,6 +41,7 @@ def create_app(slave_id: str | None = None) -> FastAPI:
         service: SlaveService = app.state.service
         try:
             attempt_id = str(payload["attempt_id"])
+            execution_id = str(payload["execution_id"])
             operation = str(payload["operation"])
             body = payload.get("payload", {})
             if not isinstance(body, dict):
@@ -53,7 +54,14 @@ def create_app(slave_id: str | None = None) -> FastAPI:
             if workspace_id != service.workspace_id:
                 raise ValueError("workspace_binding_mismatch")
             execution_epoch = int(payload.get("execution_epoch", 1))
-            result = await service.run(attempt_id, operation, body, closure=closure, binding=binding)
+            result = await service.run(
+                attempt_id,
+                operation,
+                body,
+                closure=closure,
+                binding=binding,
+                execution_epoch=execution_epoch,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=f"missing_field:{exc.args[0]}") from exc
         except ValueError as exc:
@@ -64,12 +72,16 @@ def create_app(slave_id: str | None = None) -> FastAPI:
             "type": "dispatch_ack",
             "accepted": True,
             "attempt_id": attempt_id,
+            "execution_id": execution_id,
             "execution_epoch": execution_epoch,
             "terminal_report": {
                 "type": "terminal_report",
                 "attempt_id": attempt_id,
+                "execution_id": execution_id,
                 "execution_epoch": execution_epoch,
-                "state": "completed",
+                "state": result.terminal_state,
+                "error": result.terminal_error,
+                "validation_evidence": result.validation_evidence,
                 "result": {
                     "resource_ref": result.resource_ref.model_dump(mode="json"),
                     "value": result.value,

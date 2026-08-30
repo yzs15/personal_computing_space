@@ -53,3 +53,59 @@ async def test_observer_repository_normalizes_legacy_structured_operation_ref():
 
     restored = await ObserverRepository(engine).get_run(created.run_id)
     assert restored.draft.snapshot.program.operation_ref == "loom://echo"
+
+
+async def test_repository_recovers_orphaned_refinement_after_restart():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    repo = ObserverRepository(engine)
+    await repo.init_db()
+    created = await repo.open_run("orphan-refinement", "conversation-recovery", "echo")
+    await repo.begin_refinement(created.run_id)
+
+    restored = ObserverRepository(engine)
+    await restored.init_db()
+    recovered = await restored.recover_stale_runs()
+
+    assert recovered == [created.run_id]
+    record = await restored.get_run(created.run_id)
+    assert record.state == "failed"
+    assert record.outcome == {"reason": {"code": "observer_restarted"}}
+    assert record.events[-1]["phase"] == "run_recovered"
+    assert record.events[-1]["reason"] == {"code": "observer_restarted"}
+
+
+async def test_repository_recovers_orphaned_execution_and_fences_attempt():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    repo = ObserverRepository(engine)
+    await repo.init_db()
+    created = await repo.open_run("orphan-execution", "conversation-recovery-exec", "echo")
+    committed = await repo.commit(created.run_id, created.draft.version_id, created.draft.snapshot_digest)
+    await repo.start(created.run_id, committed.version_id)
+
+    restored = ObserverRepository(engine)
+    await restored.init_db()
+    recovered = await restored.recover_stale_runs()
+
+    assert recovered == [created.run_id]
+    record = await restored.get_run(created.run_id)
+    assert record.state == "failed"
+    assert record.execution_id is not None
+    assert record.attempts[0]["state"] == "failed"
+    assert record.outcome == {"reason": {"code": "observer_restarted"}}
+
+
+async def test_repository_recovery_does_not_change_terminal_runs():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    repo = ObserverRepository(engine)
+    await repo.init_db()
+    created = await repo.open_run("completed-run", "conversation-recovery-terminal", "echo")
+    created.state = "completed"
+    created.outcome = {"value": "ok"}
+    await repo._persist(created)
+
+    restored = ObserverRepository(engine)
+    await restored.init_db()
+    assert await restored.recover_stale_runs() == []
+    record = await restored.get_run(created.run_id)
+    assert record.state == "completed"
+    assert record.outcome == {"value": "ok"}

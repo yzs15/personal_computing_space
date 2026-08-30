@@ -60,19 +60,30 @@ class WorkerSession:
             "execution_epoch": execution_epoch,
             "workspace_id": workspace_id,
             "operation": operation,
-            "payload": payload,
             "closure": closure.model_dump(mode="json"),
             "binding": binding.model_dump(mode="json") if binding is not None else None,
         }
+        # A bound closure carries an immutable content reference.  Do not
+        # transmit a mutable duplicate payload across the Worker boundary;
+        # the Slave rereads and validates the binding itself.  Legacy closures
+        # without an input binding still use the small inline envelope for
+        # built-in operations such as echo/sort.
+        if not closure.node_input_bindings:
+            request["payload"] = payload
         response = await self._post("/worker/v1/dispatch", request)
         if response.status_code >= 400:
             detail = response.json().get("detail", "worker_dispatch_failed")
             raise RuntimeError(str(detail))
         envelope = response.json()
         report = envelope.get("terminal_report") or {}
-        if not envelope.get("accepted") or report.get("state") != "completed":
+        terminal_state = str(report.get("state") or "")
+        if envelope.get("accepted") is not True or terminal_state not in {"completed", "failed", "decision_required"}:
             raise RuntimeError("worker_dispatch_not_completed")
-        if report.get("execution_epoch") not in {None, execution_epoch}:
+        if envelope.get("attempt_id") != attempt_id or report.get("attempt_id") != attempt_id:
+            raise RuntimeError("stale_attempt")
+        if envelope.get("execution_id") != execution_id or report.get("execution_id") != execution_id:
+            raise RuntimeError("stale_execution_id")
+        if report.get("execution_epoch") != execution_epoch or envelope.get("execution_epoch") != execution_epoch:
             raise RuntimeError("stale_execution_epoch")
         result = report.get("result") or {}
         return ExecutionResult(
@@ -80,6 +91,9 @@ class WorkerSession:
             value=result["value"],
             replay_safety=result.get("replay_safety", "Idempotent"),
             digest=result["digest"],
+            terminal_state=terminal_state,
+            terminal_error=report.get("error") or report.get("terminal_error"),
+            validation_evidence=report.get("validation_evidence") or [],
         )
 
     async def provision(

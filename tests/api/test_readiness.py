@@ -1,5 +1,7 @@
+import pytest
 from fastapi.testclient import TestClient
 
+from loom_v2.contracts.types import ClosureContract, TaskClosure
 from loom_v2.observer.app import create_app
 from loom_v2.observer.repository import ObserverRepository
 
@@ -90,3 +92,124 @@ def test_binding_requires_target_capability_and_then_allows_start():
     started = client.post(f"/api/v1/runs/{run2['run_id']}/start", json={"closure_version": commit2.json()["closure_version"]})
     assert started.status_code == 200
     assert client.get(f"/api/v1/runs/{run2['run_id']}/readiness").json()["ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_input_schema_requires_bound_ref_and_rejects_wrapped_payload() -> None:
+    repo = ObserverRepository()
+    schema_ref = await repo.put_content(
+        {"type": "object", "required": ["scores"], "properties": {"scores": {"type": "array"}}},
+        media_type="application/schema+json",
+    )
+    contract_ref = await repo.put_content(
+        {
+            "schema_version": "io.v1",
+            "input_schema_ref": schema_ref.model_dump(mode="json"),
+            "output_schema_ref": None,
+            "success_semantics": None,
+            "success_validator_ref": None,
+        },
+        media_type="application/vnd.loom.io-contract+json",
+    )
+    contract = ClosureContract(
+        closure_id="closure-input-schema",
+        goal="echo scores",
+        body=TaskClosure(
+            closure_id="closure-input-schema",
+            program={"operation_ref": "loom://echo", "io_contract_ref": contract_ref.model_dump(mode="json")},
+        ),
+    )
+    record = await repo.open_run("run-input-schema", "task-input-schema", "echo scores", closure_contract=contract)
+
+    missing = await repo.inspect_readiness(record.run_id)
+    assert missing["ready"] is False
+    assert any(item["code"] == "payload_missing" for item in missing["blockers"])
+
+    wrapped_ref = await repo.put_content({"payload": {"scores": [80]}}, media_type="application/json")
+    wrapped = await repo.apply_patch(
+        record.run_id,
+        record.draft_version,
+        record.draft_digest,
+        "input-wrapped",
+        [{"kind": "set_execution_payload", "value": {"node_id": "loom://echo", "input_ref": wrapped_ref.model_dump(mode="json")}}],
+    )
+    mismatch = next(item for item in wrapped.readiness["blockers"] if item["code"] == "payload_schema_mismatch")
+    assert mismatch["schema_digest"] == schema_ref.version_or_digest
+    assert mismatch["errors"][0]["keyword"] == "required"
+
+    input_ref = await repo.put_content({"scores": [80]}, media_type="application/json")
+    valid = await repo.apply_patch(
+        record.run_id,
+        wrapped.draft_version,
+        wrapped.draft_digest,
+        "input-valid",
+        [{"kind": "set_execution_payload", "value": {"node_id": "loom://echo", "input_ref": input_ref.model_dump(mode="json")}}],
+    )
+    assert valid.readiness["ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_commit_and_start_reuse_input_readiness_blockers() -> None:
+    repo = ObserverRepository()
+    schema_ref = await repo.put_content({"type": "object", "required": ["value"]}, media_type="application/schema+json")
+    contract_ref = await repo.put_content(
+        {
+            "schema_version": "io.v1",
+            "input_schema_ref": schema_ref.model_dump(mode="json"),
+            "output_schema_ref": None,
+            "success_semantics": None,
+            "success_validator_ref": None,
+        },
+        media_type="application/vnd.loom.io-contract+json",
+    )
+    contract = ClosureContract(
+        closure_id="closure-commit-input",
+        goal="echo input",
+        body=TaskClosure(
+            closure_id="closure-commit-input",
+            program={"operation_ref": "loom://echo", "io_contract_ref": contract_ref.model_dump(mode="json")},
+        ),
+    )
+    record = await repo.open_run("run-commit-input", "task-commit-input", "echo input", closure_contract=contract)
+
+    with pytest.raises(ValueError, match="payload_missing"):
+        await repo.commit(record.run_id, record.draft_version, record.draft_digest)
+
+
+@pytest.mark.asyncio
+async def test_program_inline_io_fields_are_not_an_executable_contract() -> None:
+    repo = ObserverRepository()
+    contract_ref = await repo.put_content(
+        {
+            "schema_version": "io.v1",
+            "input_schema_ref": None,
+            "output_schema_ref": None,
+            "success_semantics": None,
+            "success_validator_ref": None,
+        },
+        media_type="application/vnd.loom.io-contract+json",
+    )
+    contract = ClosureContract(
+        closure_id="closure-inline-schema",
+        goal="echo input",
+        body=TaskClosure(
+            closure_id="closure-inline-schema",
+            program={
+                "operation_ref": "loom://echo",
+                "io_contract_ref": contract_ref.model_dump(mode="json"),
+                "input_schema": {"type": "object"},
+                "output_schema": {"type": "object"},
+                "success_semantics": {"criterion": "echoed"},
+            },
+        ),
+    )
+    record = await repo.open_run("run-inline-schema", "task-inline-schema", "echo input", closure_contract=contract)
+
+    readiness = await repo.inspect_readiness(record.run_id)
+
+    assert readiness["ready"] is False
+    blocker = next(item for item in readiness["blockers"] if item["code"] == "inline_io_contract_forbidden")
+    assert blocker == {
+        "code": "inline_io_contract_forbidden",
+        "fields": ["input_schema", "output_schema", "success_semantics"],
+    }

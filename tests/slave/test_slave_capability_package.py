@@ -3,7 +3,7 @@ import os
 import pytest
 
 from loom_v2.contracts.types import CapabilityPackageVersion, CapabilityProvisionCommand, ComputeBinding, ResourceRef
-from loom_v2.content_store import ContentStore
+from loom_v2.content_store import ContentStore, canonical_json_bytes
 from loom_v2.slave.service import SlaveService
 from loom_v2.observer.worker import WorkerSession
 from loom_v2.slave.app import create_app
@@ -24,6 +24,10 @@ async def test_subprocess_package_is_provisioned_and_executed():
     store = _store()
     code = b'import sys,json\nd=json.load(sys.stdin)\nprint(json.dumps({"value": d["x"] * 2}))'
     program_ref = await store.put(code, media_type="text/x-python")
+    contract_ref = await store.put(
+        canonical_json_bytes({"schema_version": "io.v1", "input_schema_ref": None, "output_schema_ref": None, "success_semantics": None, "success_validator_ref": None}),
+        media_type="application/vnd.loom.io-contract+json",
+    )
     package = CapabilityPackageVersion(
         package_id="pkg",
         package_version="v1",
@@ -34,6 +38,7 @@ async def test_subprocess_package_is_provisioned_and_executed():
         operation_descriptor_digest="descriptor",
         program_content_ref=program_ref,
         program_digest=program_ref.version_or_digest,
+        io_contract_ref=contract_ref,
     )
     service = SlaveService("slave-a", content_store=store)
     binding = ComputeBinding(
@@ -54,11 +59,16 @@ async def test_subprocess_package_is_provisioned_and_executed():
 async def test_worker_session_provision_uses_content_ref_and_reports_health():
     store = _store()
     program_ref = await store.put(b'import sys,json; print(json.dumps({"ok": True}))', media_type="text/x-python")
+    contract_ref = await store.put(
+        canonical_json_bytes({"schema_version": "io.v1", "input_schema_ref": None, "output_schema_ref": None, "success_semantics": None, "success_validator_ref": None}),
+        media_type="application/vnd.loom.io-contract+json",
+    )
     package = CapabilityPackageVersion(
         package_id="pkg-http", package_version="v1", package_closure_version_ref="closure",
         source_run_ref="run", source_closure_version_ref="version",
         operation_descriptor_ref=ResourceRef(resource_id="loom://check"), operation_descriptor_digest="d",
         program_content_ref=program_ref, program_digest=program_ref.version_or_digest,
+        io_contract_ref=contract_ref,
     )
     app = create_app("slave-a")
     session = WorkerSession("slave-a", "http://slave-a", transport=httpx.ASGITransport(app=app))

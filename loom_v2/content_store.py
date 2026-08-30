@@ -9,12 +9,22 @@ from dataclasses import dataclass
 from typing import Any
 
 import boto3
+import rfc8785
 from botocore.exceptions import ClientError
 
 from loom_v2.contracts.types import ResourceRef
 
 
 _DIGEST_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    """Return RFC 8785/JCS bytes for a JSON-compatible Python value."""
+
+    try:
+        return rfc8785.dumps(value)
+    except (TypeError, ValueError, rfc8785.CanonicalizationError) as exc:
+        raise ValueError("json_canonicalization_error") from exc
 
 
 @dataclass(frozen=True)

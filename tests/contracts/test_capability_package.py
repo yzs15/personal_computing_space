@@ -30,6 +30,10 @@ async def test_content_store_is_content_addressed():
 async def test_package_digest_and_scope_are_explicit():
     store = _store()
     program = await store.put(b"print(1)", media_type="text/x-python")
+    contract = await store.put(
+        b'{"schema_version":"io.v1","input_schema_ref":null,"output_schema_ref":null,"success_semantics":null,"success_validator_ref":null}',
+        media_type="application/vnd.loom.io-contract+json",
+    )
     package = CapabilityPackageVersion(
         package_id="pkg",
         package_version="v1",
@@ -40,6 +44,7 @@ async def test_package_digest_and_scope_are_explicit():
         operation_descriptor_digest="descriptor-digest",
         program_content_ref=program,
         program_digest=program.version_or_digest,
+        io_contract_ref=contract,
     )
     assert package.scope == "run_bound"
     assert package.publication_state == "candidate"

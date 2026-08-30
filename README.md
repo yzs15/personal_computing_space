@@ -67,6 +67,16 @@ starts MinIO on ports 9000 (S3) and 9001 (console), initializes the
 `LOOM_S3_PREFIX`. Writes are conditional and existing objects are never
 overwritten; reads verify the SHA-256 digest.
 
+There is one public content upload operation: `loom_put_content` (also
+`POST /api/v1/content`). Upload JSON Schema and `io.v1` contract documents
+before refining a closure, then place only their `ResourceRef` values in the
+closure. `set_execution_payload` likewise accepts only an input
+`ResourceRef`/`NodeInputBinding`; raw payloads and inline program bodies are
+not executable inputs. The I/O validator uses a strict, local JSON Schema
+2020-12 subset (`type`, `required`, `properties`, `items`, `enum`, `const`,
+`minimum`, `maximum`) and rejects unsupported keywords instead of ignoring
+them.
+
 `open_run` is a coding-agent decision: after clarifying the user's goal, the
 agent calls it through the conversation-scoped Driver MCP surface. The Driver
 injects and verifies the conversation/user/Workspace identity, while Observer
@@ -93,7 +103,8 @@ history after a browser refresh. Codex `agentMessage` events and Fake test
 messages use the same normalized `assistant_text` path.
 
 Each conversation exposes a derived status (`idle`, `thinking`, `executing`,
-`completed`, `interrupted`, or `failed`) in both conversation projections. The
+`completed`, `decision_required`, `interrupted`, or `failed`) in both
+conversation projections. The
 workspace refreshes the selected conversation while a turn is active and shows
 an Interrupt button. `POST /api/v1/conversations/{conversation_ref}/interrupt`
 requests cancellation of the active Codex turn; it leaves persisted user,

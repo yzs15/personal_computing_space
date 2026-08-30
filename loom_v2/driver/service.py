@@ -8,7 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from loom_v2.coding_agents.base import CodingAgentError, CodingAgentProvider
-from loom_v2.contracts.types import CapabilityProvisionCommand, ComputeBinding, TaskClosure
+from loom_v2.contracts.types import CapabilityProvisionCommand, ComputeBinding, ResourceRef, TaskClosure
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.observer.worker import WorkerSession
 from loom_v2.slave.service import SlaveService
@@ -251,8 +251,8 @@ class DriverService:
                 "closure_version": committed,
                 "patches": patches,
                 "state": completed.state,
-                "status": "completed",
-                "resource_ref": result.resource_ref.resource_id,
+                "status": ObserverStatus.status(completed.state),
+                "resource_ref": result.resource_ref.resource_id if completed.state == "completed" else None,
                 "execution_id": completed.execution_id,
                 "execution_epoch": completed.execution_epoch,
                 "assistant_text": "\n\n".join(assistant_parts),
@@ -286,8 +286,8 @@ class DriverService:
                         "closure_version": committed or (execution_record.committed.version_id if execution_record.committed else None),
                         "patches": patches,
                         "state": execution_record.state,
-                        "status": "completed",
-                        "resource_ref": execution_result.resource_ref.resource_id,
+                        "status": ObserverStatus.status(execution_record.state),
+                        "resource_ref": execution_result.resource_ref.resource_id if execution_record.state == "completed" else None,
                         "execution_id": execution_record.execution_id,
                         "execution_epoch": execution_record.execution_epoch,
                         "assistant_text": "\n\n".join(assistant_parts),
@@ -330,17 +330,37 @@ class DriverService:
         execution_epoch = record.execution_epoch
         snapshot = record.committed.snapshot if record.committed is not None else TaskClosure.minimal()
         operation = self._operation_name(snapshot.program.operation_ref or snapshot.compute.operation_ref) or "echo"
-        payload = self._execution_payload(snapshot, operation, prompt)
+        payload = await self._execution_payload(snapshot, operation, prompt)
         binding = self._binding_for_operation(snapshot)
+        current_attempt = next(
+            (
+                item
+                for item in reversed(record.attempts)
+                if item.get("execution_epoch", execution_epoch) == execution_epoch
+                and item.get("state") in {"created", "running"}
+            ),
+            None,
+        )
+        target = str(current_attempt.get("target")) if current_attempt is not None else binding.target_resource_ref.resource_id if binding is not None else "slave-a"
+        if binding is not None and binding.target_resource_ref.resource_id != target:
+            binding = binding.model_copy(update={"target_resource_ref": ResourceRef(resource_id=target)})
+        attempt_id = next(
+            (
+                item["attempt_id"]
+                for item in reversed(record.attempts)
+                if item.get("target") == target
+                and item.get("execution_epoch", execution_epoch) == execution_epoch
+                and item.get("state") in {"created", "running"}
+            ),
+            None,
+        )
+        if attempt_id is None:
+            raise RuntimeError("attempt_not_created")
         if self.workers or self.slaves:
-            target = binding.target_resource_ref.resource_id if binding is not None else "slave-a"
-            attempt_id = next((item["attempt_id"] for item in record.attempts if item.get("target") == target), None)
-            if attempt_id is None:
-                raise RuntimeError("attempt_not_created")
             worker = self.workers.get(target)
             if worker is not None:
                 if binding is not None and binding.capability_package_ref is not None:
-                    package = await self.repository.get_capability_package(binding.capability_package_ref.resource_id)
+                    package = await self.repository.get_capability_package(binding.capability_package_ref)
                     command = CapabilityProvisionCommand(
                         command_id=f"provision-{package.package_id}-{target}",
                         package_version_ref=f"{package.package_id}:{package.package_version}",
@@ -370,7 +390,7 @@ class DriverService:
                 if slave is None:
                     raise RuntimeError(f"capability_unavailable:{target}")
                 if binding is not None and binding.capability_package_ref is not None:
-                    package = await self.repository.get_capability_package(binding.capability_package_ref.resource_id)
+                    package = await self.repository.get_capability_package(binding.capability_package_ref)
                     command = CapabilityProvisionCommand(
                         command_id=f"provision-{package.package_id}-{target}",
                         package_version_ref=f"{package.package_id}:{package.package_version}",
@@ -390,12 +410,23 @@ class DriverService:
                     payload,
                     closure=snapshot,
                     binding=binding,
+                    execution_epoch=execution_epoch,
                 )
         else:
             result = await self.executor(operation, payload)
         completed = await self.repository.record_result(
             run_id,
-            {"resource_ref": result.resource_ref.resource_id, "digest": result.digest, "value": result.value},
+            {
+                "attempt_id": attempt_id,
+                "execution_id": execution_id,
+                "execution_epoch": execution_epoch,
+                "resource_ref": result.resource_ref.model_dump(mode="json"),
+                "digest": result.digest,
+                "value": result.value,
+                "terminal_state": result.terminal_state,
+                "terminal_error": result.terminal_error,
+                "validation_evidence": result.validation_evidence,
+            },
         )
         return completed, result
 
@@ -405,20 +436,25 @@ class DriverService:
             return ""
         return operation_ref.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
 
-    @staticmethod
-    def _execution_payload(snapshot: TaskClosure, operation: str, prompt: str) -> dict[str, Any]:
-        payload = snapshot.metadata.get("execution_payload", {})
-        payload = dict(payload) if isinstance(payload, dict) else {}
+    async def _execution_payload(self, snapshot: TaskClosure, operation: str, prompt: str) -> dict[str, Any]:
+        # Executable input is always a content-addressed NodeInputBinding.
+        # Resolve it at dispatch time so the closure carries only semantic
+        # references and no mutable/raw payload in metadata.
+        operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
+        binding = self.repository._input_binding_for(snapshot, operation_ref)
+        if binding is not None:
+            value = await self.repository._load_json_content(binding.input_ref)
+            return dict(value) if isinstance(value, dict) else {"value": value}
+
+        payload: dict[str, Any] = {}
         if operation in {"echo", "hash"}:
             payload.setdefault("text", prompt)
         elif operation == "sort" and "items" not in payload:
-            items = snapshot.metadata.get("items", [])
-            if not items:
-                try:
-                    decoded = json.loads(prompt)
-                    items = decoded if isinstance(decoded, list) else []
-                except (TypeError, json.JSONDecodeError):
-                    items = []
+            try:
+                decoded = json.loads(prompt)
+                items = decoded if isinstance(decoded, list) else []
+            except (TypeError, json.JSONDecodeError):
+                items = []
             payload["items"] = items
         return payload
 

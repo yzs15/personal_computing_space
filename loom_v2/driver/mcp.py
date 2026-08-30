@@ -42,6 +42,14 @@ class DriverMCP:
             return await self.open_run(arguments)
         if tool_name == "loom_query_capabilities":
             return self._query_capabilities()
+        if tool_name == "loom_put_content":
+            if "content" not in arguments:
+                raise ValueError("content_required")
+            ref = await self.repository.put_content(
+                arguments["content"],
+                media_type=str(arguments.get("media_type") or ""),
+            )
+            return {"resource_ref": ref.model_dump(mode="json")}
         if tool_name == "loom_list_run_capability_packages":
             if self.active_run_id is None:
                 return {"packages": []}
@@ -159,6 +167,7 @@ class DriverMCP:
                     "type": "string",
                     "enum": [
                         "set_program_ref",
+                        "set_io_contract_ref",
                         "set_compute_spec",
                         "add_typed_hole",
                         "bind_compute_hole",
@@ -194,13 +203,30 @@ class DriverMCP:
             },
             {
                 "type": "function",
+                "name": "loom_put_content",
+                "description": "Upload one immutable content object. JSON Schema and IoContract bodies are canonicalized and validated; use media_type to distinguish schemas, contracts, programs, and artifacts.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "media_type": {"type": "string"},
+                        "content": {},
+                    },
+                    "required": ["media_type", "content"],
+                },
+            },
+            {
+                "type": "function",
                 "name": "loom_apply_plan_patch",
                 "description": (
                     "Apply deterministic closure refinement operations after open_run. "
                     "Batch independent operations in one ordered `ops` array whenever possible: "
                     "the complete array is applied atomically and creates one draft version, "
                     "receipt, and draft_patched event. Split into multiple calls only when an "
-                    "intermediate readiness result or a prior operation's result is required."
+                    "intermediate readiness result or a prior operation's result is required. "
+                    "For `set_execution_payload`, provide `value.input_ref` (a ResourceRef "
+                    "returned by `loom_put_content`); raw payload values are rejected. "
+                    "Capability package materialization likewise requires pre-uploaded "
+                    "`program_content_ref` and `io_contract_ref`."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -259,6 +285,7 @@ class ObserverStatus:
             "committed": "executing",
             "running": "executing",
             "completed": "completed",
+            "decision_required": "decision_required",
             "cancelled": "interrupted",
             "failed": "failed",
             "closed": "idle",

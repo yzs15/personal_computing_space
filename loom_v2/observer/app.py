@@ -85,6 +85,10 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
     @app.on_event("startup")
     async def initialize_database() -> None:
         await app.state.repo.init_db()
+        # Driver ownership is in-memory.  Any active-looking Run persisted by
+        # a previous Observer process has lost its owner and must be fenced so
+        # it cannot remain visible as a live conversation forever.
+        await app.state.repo.recover_stale_runs()
 
     @app.on_event("shutdown")
     async def close_database() -> None:
@@ -120,6 +124,16 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=404, detail="content_not_found") from exc
         return Response(content=body, media_type="application/octet-stream", headers={"X-Content-Digest": digest})
+
+    @app.post("/api/v1/content")
+    async def put_content(payload: dict[str, Any]) -> dict[str, Any]:
+        if "content" not in payload:
+            raise HTTPException(status_code=400, detail="content_required")
+        try:
+            ref = await app.state.repo.put_content(payload["content"], media_type=str(payload.get("media_type") or ""))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return ref.model_dump(mode="json")
 
     @app.post("/mcp")
     async def mcp(payload: dict[str, Any], request: Request) -> dict[str, Any]:
@@ -343,13 +357,6 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
     @app.post("/api/v1/runs/{run_id}/reconcile")
     async def reconcile(run_id: str) -> dict[str, Any]:
         return _run_view(await app.state.repo.reconcile(run_id))
-
-    @app.post("/worker/v1/terminal")
-    async def terminal(payload: dict[str, Any]) -> dict[str, Any]:
-        try:
-            return await app.state.repo.terminal(payload)
-        except ValueError as exc:
-            return JSONResponse(status_code=409, content={"code": str(exc), "retryable": False})
 
     @app.get("/")
     async def home() -> FileResponse:

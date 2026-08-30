@@ -22,14 +22,18 @@ from loom_v2.contracts.types import (
     ClosureVersion,
     ComputeBinding,
     ComputeSpec,
+    IoContract,
     ResourceRef,
     TaskClosure,
     TypedHole,
+    NodeInputBinding,
+    ValidationEvidence,
 )
 from loom_v2.db.base import Base
 from loom_v2.db.models import IdempotencyRow, RunRow
 from loom_v2.db.session import make_session_factory
-from loom_v2.content_store import ContentStore
+from loom_v2.content_store import ContentStore, canonical_json_bytes
+from loom_v2.contracts.io_schema import ValidationError as SchemaValidationError, validate, validate_schema
 from loom_v2.settings import Settings
 from loom_v2.slave.executor import default_registry
 
@@ -104,6 +108,78 @@ class ObserverRepository:
                 await connection.execute(text("ALTER TABLE runs ADD COLUMN IF NOT EXISTS closure_contract JSONB"))
                 await connection.execute(text("ALTER TABLE runs ADD COLUMN IF NOT EXISTS capability_packages JSONB NOT NULL DEFAULT '[]'::jsonb"))
                 await connection.execute(text("ALTER TABLE runs ADD COLUMN IF NOT EXISTS capability_activations JSONB NOT NULL DEFAULT '[]'::jsonb"))
+
+    async def recover_stale_runs(self, active_run_ids: set[str] | None = None) -> list[str]:
+        """Fence Runs left active by a lost Observer/Driver process.
+
+        ``thinking`` and ``running`` are leased states: they require a live
+        Driver owner.  A process restart cannot reconstruct that in-memory
+        owner, so persisted records in those states must not remain visible as
+        active forever.  The optional owner set lets a caller preserve Runs
+        that it has explicitly reattached before running recovery; the normal
+        Observer startup path passes no owners because its Driver starts empty.
+        """
+
+        owners = active_run_ids or set()
+        recovered: list[str] = []
+        for record in await self._all_records():
+            if record.run_id in owners or record.state not in {"thinking", "running"}:
+                continue
+            reason = {"code": "observer_restarted"}
+            for attempt in record.attempts:
+                if attempt.get("state") in {"created", "running"}:
+                    attempt["state"] = "failed"
+                    attempt["terminal_error"] = reason
+            record.state = "failed"
+            record.outcome = {"reason": reason}
+            record.events.append(
+                {
+                    "phase": "run_recovered",
+                    "run_id": record.run_id,
+                    "execution_id": record.execution_id,
+                    "reason": reason,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            await self._persist(record)
+            recovered.append(record.run_id)
+        return recovered
+
+    async def put_content(self, content: Any, *, media_type: str) -> ResourceRef:
+        """Canonicalize and persist content through the single upload path."""
+
+        normalized_media_type = str(media_type or "").split(";", 1)[0].strip().lower()
+        if not normalized_media_type:
+            raise ValueError("media_type_required")
+
+        json_media_types = {
+            "application/json",
+            "application/schema+json",
+            "application/vnd.loom.io-contract+json",
+        }
+        if normalized_media_type in json_media_types:
+            if isinstance(content, (bytes, bytearray, str)):
+                try:
+                    parsed = json.loads(content)
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError("invalid_json") from exc
+            else:
+                parsed = content
+            if normalized_media_type == "application/schema+json":
+                validate_schema(parsed)
+            elif normalized_media_type == "application/vnd.loom.io-contract+json":
+                try:
+                    IoContract.model_validate(parsed)
+                except Exception as exc:
+                    raise ValueError("io_contract_invalid") from exc
+            body = canonical_json_bytes(parsed)
+        elif isinstance(content, str):
+            body = content.encode("utf-8")
+        elif isinstance(content, (bytes, bytearray)):
+            body = bytes(content)
+        else:
+            raise TypeError("content_must_be_string_or_bytes")
+        return await self.content_store.put(body, media_type=normalized_media_type)
 
     @staticmethod
     def _record_from_row(row: RunRow) -> RunRecord:
@@ -234,6 +310,7 @@ class ObserverRepository:
             "committed": "executing",
             "running": "executing",
             "completed": "completed",
+            "decision_required": "decision_required",
             "cancelled": "interrupted",
             "failed": "failed",
         }.get(state, "idle")
@@ -304,14 +381,10 @@ class ObserverRepository:
             packages = [package for package in packages if package.publication_state != "abandoned"]
         return packages
 
-    async def get_capability_package(self, package_ref: str) -> CapabilityPackageVersion:
+    async def get_capability_package(self, package_ref: str | ResourceRef) -> CapabilityPackageVersion:
+        if self.sessions is not None:
+            await self._all_records()
         package = self._find_package(package_ref)
-        if package is None and self.sessions is not None:
-            for record in await self._all_records():
-                for candidate in record.capability_packages:
-                    if package_ref in {candidate.package_id, self._package_ref(candidate), f"{candidate.package_id}:{candidate.package_version}", candidate.package_version}:
-                        package = candidate
-                        break
         if package is None:
             raise KeyError(package_ref)
         return package
@@ -412,10 +485,105 @@ class ObserverRepository:
         await self._persist(record)
         return activation
 
+    @staticmethod
+    def _input_binding_for(snapshot: TaskClosure, operation_ref: str) -> NodeInputBinding | None:
+        candidates = {operation_ref, ObserverRepository._operation_name(operation_ref), "default"}
+        return next((binding for binding in snapshot.node_input_bindings if binding.node_id in candidates), None)
+
+    @classmethod
+    def _input_digest_for(cls, snapshot: TaskClosure) -> str | None:
+        operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
+        binding = cls._input_binding_for(snapshot, operation_ref)
+        return binding.input_ref.version_or_digest if binding is not None else None
+
+    @staticmethod
+    def _result_digest(value: Any) -> str:
+        return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+    async def _load_json_content(self, ref: ResourceRef) -> Any:
+        raw = await self.content_store.get(ref)
+        try:
+            return json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid_json") from exc
+
+    @staticmethod
+    def _schema_blocker(
+        *,
+        code: str,
+        schema_ref: ResourceRef,
+        input_ref: ResourceRef | None = None,
+        errors: list[SchemaValidationError] | None = None,
+    ) -> dict[str, Any]:
+        blocker: dict[str, Any] = {
+            "code": code,
+            "schema_digest": schema_ref.version_or_digest,
+            "errors": [item.model_dump(mode="json") for item in (errors or [])],
+        }
+        if input_ref is not None:
+            blocker["input_ref"] = input_ref.resource_id
+        return blocker
+
+    async def _evaluate_input_schema(self, snapshot: TaskClosure, operation_ref: str) -> list[dict[str, Any]]:
+        contract_ref = snapshot.program.io_contract_ref
+        if contract_ref is None:
+            return []
+        blockers: list[dict[str, Any]] = []
+        try:
+            contract_payload = await self._load_json_content(contract_ref)
+            io_contract = IoContract.model_validate(contract_payload)
+        except (FileNotFoundError, ValueError, TypeError):
+            blockers.append({"code": "io_contract_unavailable", "io_contract_ref": contract_ref.resource_id})
+            return blockers
+        schema_ref = io_contract.input_schema_ref
+        if schema_ref is None:
+            return blockers
+        binding = self._input_binding_for(snapshot, operation_ref)
+        if binding is None:
+            blockers.append(
+                {
+                    "code": "payload_missing",
+                    "node_id": operation_ref or "default",
+                    "schema_digest": schema_ref.version_or_digest,
+                }
+            )
+            return blockers
+        try:
+            schema = await self._load_json_content(schema_ref)
+            validate_schema(schema)
+            value = await self._load_json_content(binding.input_ref)
+        except (FileNotFoundError, ValueError, TypeError) as exc:
+            error = SchemaValidationError(
+                path="$",
+                keyword="json",
+                message="input content is not valid JSON",
+                expected="JSON value",
+                observed=str(exc),
+            )
+            blockers.append(self._schema_blocker(code="payload_schema_mismatch", schema_ref=schema_ref, input_ref=binding.input_ref, errors=[error]))
+            return blockers
+        errors = validate(schema, value)
+        if errors:
+            blockers.append(self._schema_blocker(code="payload_schema_mismatch", schema_ref=schema_ref, input_ref=binding.input_ref, errors=errors))
+        return blockers
+
     async def _evaluate_readiness(self, snapshot: TaskClosure, *, run_id: str | None = None) -> dict[str, Any]:
         operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
         operation = self._operation_name(operation_ref)
         blockers: list[dict[str, Any]] = []
+        inline_io_fields = [
+            field_name
+            for field_name in ("input_schema", "output_schema", "success_semantics")
+            if getattr(snapshot.program, field_name, None) is not None
+        ]
+        if inline_io_fields:
+            blockers.append(
+                {
+                    "code": "inline_io_contract_forbidden",
+                    "fields": inline_io_fields,
+                }
+            )
+        blockers.extend(await self._evaluate_input_schema(snapshot, operation_ref))
         bindings_by_hole = {binding.hole_id: binding for binding in snapshot.compute_bindings}
 
         for hole in snapshot.compute.typed_holes:
@@ -439,6 +607,22 @@ class ObserverRepository:
             elif package is not None:
                 if package.scope == "run_bound" and run_id is not None and package.source_run_ref != run_id:
                     blockers.append({"code": "capability_package_scope_mismatch", "hole_id": hole.hole_id, "source_run_ref": package.source_run_ref})
+                closure_contract_ref = snapshot.program.io_contract_ref
+                package_contract_ref = package.io_contract_ref
+                if (
+                    closure_contract_ref is None
+                    or package_contract_ref is None
+                    or (closure_contract_ref.version_or_digest or closure_contract_ref.resource_id)
+                    != (package_contract_ref.version_or_digest or package_contract_ref.resource_id)
+                ):
+                    blockers.append(
+                        {
+                            "code": "io_contract_mismatch",
+                            "hole_id": hole.hole_id,
+                            "closure_io_contract_ref": closure_contract_ref.resource_id if closure_contract_ref else None,
+                            "package_io_contract_ref": package_contract_ref.resource_id if package_contract_ref else None,
+                        }
+                    )
                 if package.publication_state == "abandoned":
                     blockers.append({"code": "capability_package_abandoned", "package_ref": self._package_ref(package)})
                 stat = await self.content_store.stat(package.program_content_ref)
@@ -744,6 +928,14 @@ class ObserverRepository:
                 if not isinstance(value, str) or not value:
                     raise ValueError("invalid_program_ref")
                 snapshot.program.operation_ref = value
+            elif kind == "set_io_contract_ref":
+                value = operation.get("value")
+                if isinstance(value, dict) and "io_contract_ref" in value:
+                    value = value["io_contract_ref"]
+                try:
+                    snapshot.program.io_contract_ref = ResourceRef.model_validate(value)
+                except Exception as exc:
+                    raise ValueError("io_contract_ref_required") from exc
             elif kind == "add_typed_hole":
                 hole = TypedHole.model_validate(operation["value"])
                 if any(existing.hole_id == hole.hole_id for existing in snapshot.compute.typed_holes):
@@ -753,15 +945,21 @@ class ObserverRepository:
                 value = dict(operation.get("value") or operation)
                 package_id = str(value.get("package_id") or f"package-{uuid4().hex[:12]}")
                 package_version = str(value.get("package_version") or "v1")
+                io_contract_payload = value.get("io_contract_ref")
+                if not io_contract_payload:
+                    raise ValueError("io_contract_required")
+                try:
+                    io_contract_ref = ResourceRef.model_validate(io_contract_payload)
+                    IoContract.model_validate(await self._load_json_content(io_contract_ref))
+                except (FileNotFoundError, TypeError, ValueError) as exc:
+                    if str(exc) in {"io_contract_invalid", "invalid_json"}:
+                        raise
+                    raise ValueError("io_contract_invalid") from exc
                 program_ref_payload = value.get("program_content_ref") or value.get("program_ref")
                 if isinstance(program_ref_payload, ResourceRef):
                     program_ref = program_ref_payload
                 elif isinstance(program_ref_payload, dict):
                     program_ref = ResourceRef.model_validate(program_ref_payload)
-                elif isinstance(value.get("program"), str):
-                    program_ref = await self.content_store.put(value["program"].encode(), media_type="text/x-python")
-                elif isinstance(value.get("program"), (bytes, bytearray)):
-                    program_ref = await self.content_store.put(bytes(value["program"]), media_type="text/x-python")
                 else:
                     raise ValueError("program_content_ref_required")
                 expected_digest = str(value.get("expected_program_digest") or value.get("program_digest") or "")
@@ -787,6 +985,7 @@ class ObserverRepository:
                     operation_descriptor_digest=descriptor_digest,
                     program_content_ref=program_ref,
                     program_digest=actual_digest,
+                    io_contract_ref=io_contract_ref,
                     effective_constraint_refs=[Constraint.model_validate(item).ref() if isinstance(item, dict) else ConstraintRef.model_validate(item) for item in value.get("effective_constraint_refs", [])],
                     provider_fillable_hole_refs=[str(item) for item in value.get("provider_fillable_hole_refs", [])],
                     provenance=[{"source": "coding_agent", "run_id": record.run_id}],
@@ -823,10 +1022,17 @@ class ObserverRepository:
                 hole.status = "bound"
                 hole.binding_ref = binding.binding_id
             elif kind == "set_execution_payload":
-                payload = operation.get("value", {})
-                if not isinstance(payload, dict):
-                    raise ValueError("invalid_execution_payload")
-                snapshot.metadata["execution_payload"] = payload
+                value = operation.get("value", {})
+                if not isinstance(value, dict) or "input_ref" not in value:
+                    raise ValueError("input_ref_required")
+                try:
+                    input_ref = ResourceRef.model_validate(value["input_ref"])
+                except Exception as exc:
+                    raise ValueError("input_ref_required") from exc
+                node_id = str(value.get("node_id") or snapshot.program.operation_ref or snapshot.compute.operation_ref or "default")
+                binding = NodeInputBinding(node_id=node_id, input_ref=input_ref, provenance=list(value.get("provenance", [])))
+                snapshot.node_input_bindings = [item for item in snapshot.node_input_bindings if item.node_id != node_id]
+                snapshot.node_input_bindings.append(binding)
             else:
                 raise ValueError(f"unsupported_patch:{kind}")
         new_version = ClosureVersion(
@@ -910,7 +1116,7 @@ class ObserverRepository:
         target = "slave-a"
         if record.committed.snapshot.compute_bindings:
             target = record.committed.snapshot.compute_bindings[0].target_resource_ref.resource_id
-        record.attempts.append({"attempt_id": f"attempt-{uuid4().hex[:12]}", "target": target, "state": "created"})
+        record.attempts.append({"attempt_id": f"attempt-{uuid4().hex[:12]}", "target": target, "state": "created", "execution_epoch": record.execution_epoch})
         record.events.append({"phase": "execution_started", "execution_id": record.execution_id})
         await self._persist(record)
         return {"execution_id": record.execution_id, "state": record.state, "execution_epoch": record.execution_epoch}
@@ -922,9 +1128,237 @@ class ObserverRepository:
         record = await self._load(run_id)
         if record.state != "running":
             raise ValueError("execution_not_running")
-        record.outcome = result
-        record.state = "completed"
-        record.events.append({"phase": "execution_completed", "execution_id": record.execution_id, "resource_ref": result.get("resource_ref")})
+
+        # Terminal reports are scoped to the exact attempt and execution epoch
+        # that Observer created.  Never let a late retry (or a report for a
+        # different attempt) mutate the current Run projection.
+        attempt_id = result.get("attempt_id")
+        attempt = next((item for item in record.attempts if item.get("attempt_id") == attempt_id), None)
+        if attempt is None:
+            raise ValueError("stale_attempt")
+        try:
+            execution_epoch = int(result.get("execution_epoch"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("stale_execution_epoch") from exc
+        if execution_epoch != record.execution_epoch:
+            raise ValueError("stale_execution_epoch")
+        if attempt.get("execution_epoch", execution_epoch) != execution_epoch:
+            raise ValueError("stale_execution_epoch")
+        if attempt.get("state") not in {"created", "running"}:
+            raise ValueError("stale_attempt")
+        if result.get("execution_id") != record.execution_id:
+            raise ValueError("stale_execution_id")
+
+        if "value" not in result or "digest" not in result:
+            raise ValueError("output_missing")
+        expected_digest = self._result_digest(result["value"])
+        if result.get("digest") != expected_digest:
+            raise ValueError("output_digest_mismatch")
+        raw_resource_ref = result.get("resource_ref")
+        if raw_resource_ref is not None:
+            try:
+                resource_ref = ResourceRef.model_validate(raw_resource_ref)
+            except Exception as exc:
+                raise ValueError("invalid_resource_ref") from exc
+            if resource_ref.version_or_digest != expected_digest:
+                raise ValueError("resource_ref_digest_mismatch")
+
+        # Validate Slave-produced evidence before accepting it.  Evidence is
+        # descriptive, but it is still fenced to this attempt/epoch and to
+        # the contract refs Observer resolved below.
+        raw_evidence = result.get("validation_evidence") or []
+        if not isinstance(raw_evidence, list):
+            raise ValueError("invalid_validation_evidence")
+        evidence: list[dict[str, Any]] = []
+        for item in raw_evidence:
+            try:
+                parsed = ValidationEvidence.model_validate(item)
+            except Exception as exc:
+                raise ValueError("invalid_validation_evidence") from exc
+            if parsed.attempt_id != attempt_id or parsed.execution_epoch != execution_epoch:
+                raise ValueError("stale_validation_evidence")
+            if parsed.issuer != "slave":
+                raise ValueError("invalid_validation_evidence")
+            output_digest = result.get("digest")
+            if parsed.output_digest is not None and output_digest is not None and parsed.output_digest != output_digest:
+                raise ValueError("validation_evidence_digest_mismatch")
+            evidence.append(parsed.model_dump(mode="json"))
+
+        snapshot = record.committed.snapshot if record.committed is not None else None
+        contract: IoContract | None = None
+        output_schema_ref: ResourceRef | None = None
+        if snapshot is not None and snapshot.program.io_contract_ref is not None:
+            try:
+                contract = IoContract.model_validate(await self._load_json_content(snapshot.program.io_contract_ref))
+            except (FileNotFoundError, TypeError, ValueError) as exc:
+                raise ValueError("io_contract_invalid") from exc
+            output_schema_ref = contract.output_schema_ref
+
+        expected_input_digest = self._input_digest_for(snapshot) if snapshot is not None else None
+        expected_validator_ref = contract.success_validator_ref if contract else None
+        def _same_ref(left: ResourceRef | None, right: ResourceRef | None) -> bool:
+            if left is None or right is None:
+                return left is right
+            return (left.version_or_digest or left.resource_id) == (right.version_or_digest or right.resource_id)
+
+        for item in evidence:
+            parsed_schema = ResourceRef.model_validate(item["schema_ref"]) if item.get("schema_ref") is not None else None
+            parsed_validator = ResourceRef.model_validate(item["validator_ref"]) if item.get("validator_ref") is not None else None
+            if output_schema_ref is not None and not _same_ref(parsed_schema, output_schema_ref):
+                raise ValueError("validation_evidence_schema_mismatch")
+            if not _same_ref(parsed_validator, expected_validator_ref):
+                raise ValueError("validation_evidence_validator_mismatch")
+            if item.get("input_digest") is not None and item.get("input_digest") != expected_input_digest:
+                raise ValueError("validation_evidence_input_digest_mismatch")
+        # Observer is the final authority: it repeats output schema
+        # validation even when a Slave supplied a pass evidence.  A mismatch
+        # is a failed Attempt/ExecutionOutcome and a decision point for the
+        # coding agent; it must never be projected as completed.
+        observer_evidence: dict[str, Any] | None = None
+        if output_schema_ref is not None:
+            try:
+                schema = await self._load_json_content(output_schema_ref)
+                validate_schema(schema)
+                schema_errors = validate(schema, result.get("value"))
+            except (FileNotFoundError, TypeError, ValueError) as exc:
+                schema_errors = [
+                    SchemaValidationError(
+                        path="$",
+                        keyword="schema",
+                        message="output schema could not be evaluated",
+                        expected="valid output schema",
+                        observed=str(exc),
+                    )
+                ]
+            observer_evidence = ValidationEvidence(
+                evidence_id=f"evidence-{attempt_id}-{uuid4().hex[:10]}",
+                attempt_id=attempt_id,
+                execution_epoch=execution_epoch,
+                validator_ref=contract.success_validator_ref if contract else None,
+                schema_ref=output_schema_ref,
+                input_digest=self._input_digest_for(snapshot) if snapshot is not None else None,
+                output_digest=result.get("digest"),
+                result="fail" if schema_errors else "pass",
+                errors=[item.model_dump(mode="json") for item in schema_errors],
+                issuer="observer",
+                created_at=datetime.now(timezone.utc).isoformat(),
+            ).model_dump(mode="json")
+            evidence.append(observer_evidence)
+
+            if schema_errors:
+                attempt["state"] = "failed"
+                terminal_error = {"code": "output_schema_mismatch", "errors": observer_evidence["errors"]}
+                outcome = {**result, "resource_ref": None, "terminal_state": "failed", "terminal_error": terminal_error, "error": terminal_error, "validation_evidence": evidence}
+                record.outcome = outcome
+                record.state = "decision_required"
+                record.events.append(
+                    {
+                        "phase": "io_schema_rejected",
+                        "execution_id": record.execution_id,
+                        "attempt_id": attempt_id,
+                        "execution_epoch": execution_epoch,
+                        "evidence_id": observer_evidence["evidence_id"],
+                        "error": outcome["terminal_error"],
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                await self._persist(record)
+                return record
+
+        validator_terminal_error: dict[str, Any] | None = None
+        if expected_validator_ref is not None:
+            validator_errors: list[dict[str, Any]] = []
+            validator_status = "fail"
+            try:
+                validator_program = await self.content_store.get(expected_validator_ref)
+                validator_input = result["value"] if isinstance(result["value"], dict) else {"value": result["value"]}
+                validator_result = await default_registry.execute(
+                    "subprocess_json_v1",
+                    "run_code",
+                    validator_input,
+                    program=validator_program,
+                )
+                validator_payload = validator_result.value if isinstance(validator_result.value, dict) else {}
+                validator_status = str(validator_payload.get("result") or "fail")
+                raw_errors = validator_payload.get("errors")
+                if isinstance(raw_errors, list):
+                    validator_errors = [
+                        {
+                            "path": str(item.get("path", "$")),
+                            "keyword": str(item.get("keyword", "validator")),
+                            "message": str(item.get("message", "validator failed"))[:512],
+                        }
+                        for item in raw_errors
+                        if isinstance(item, dict)
+                    ]
+            except Exception as exc:
+                validator_errors = [{"path": "$", "keyword": "validator", "message": str(exc)[:512]}]
+            validator_evidence = ValidationEvidence(
+                evidence_id=f"evidence-{attempt_id}-{uuid4().hex[:10]}",
+                attempt_id=attempt_id,
+                execution_epoch=execution_epoch,
+                validator_ref=expected_validator_ref,
+                schema_ref=output_schema_ref,
+                input_digest=expected_input_digest,
+                output_digest=result.get("digest"),
+                result="pass" if validator_status == "pass" else "fail",
+                errors=validator_errors,
+                issuer="observer",
+                created_at=datetime.now(timezone.utc).isoformat(),
+            ).model_dump(mode="json")
+            evidence.append(validator_evidence)
+            if validator_status != "pass":
+                validator_terminal_error = {"code": "success_validation_failed", "errors": validator_errors}
+
+        terminal_state = str(result.get("terminal_state") or "completed")
+        if terminal_state not in {"completed", "failed", "decision_required"}:
+            raise ValueError("invalid_terminal_state")
+        if validator_terminal_error is not None and terminal_state == "completed":
+            terminal_state = "failed"
+        terminal_error = validator_terminal_error or result.get("terminal_error")
+        if terminal_state == "failed":
+            attempt["state"] = "failed"
+            record.state = "decision_required"
+            record.outcome = {**result, "resource_ref": None, "terminal_state": "failed", "terminal_error": terminal_error, "error": terminal_error, "validation_evidence": evidence}
+            record.events.append(
+                {
+                    "phase": "io_schema_rejected" if terminal_error and terminal_error.get("code") in {"output_schema_mismatch", "success_validation_failed"} else "execution_failed",
+                    "execution_id": record.execution_id,
+                    "attempt_id": attempt_id,
+                    "execution_epoch": execution_epoch,
+                    "error": terminal_error,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        elif terminal_state == "decision_required":
+            attempt["state"] = "decision_required"
+            record.state = "decision_required"
+            record.outcome = {**result, "resource_ref": None, "terminal_state": "decision_required", "terminal_error": terminal_error, "error": terminal_error, "validation_evidence": evidence}
+            record.events.append(
+                {
+                    "phase": "attestation_required",
+                    "execution_id": record.execution_id,
+                    "attempt_id": attempt_id,
+                    "execution_epoch": execution_epoch,
+                    "error": terminal_error,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        else:
+            attempt["state"] = "completed"
+            record.outcome = {**result, "terminal_state": "completed", "validation_evidence": evidence}
+            record.state = "completed"
+            record.events.append(
+                {
+                    "phase": "io_schema_validated" if observer_evidence is not None else "execution_completed",
+                    "execution_id": record.execution_id,
+                    "attempt_id": attempt_id,
+                    "execution_epoch": execution_epoch,
+                    "resource_ref": result.get("resource_ref"),
+                    "evidence_id": observer_evidence["evidence_id"] if observer_evidence else None,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
         await self._persist(record)
         return record
 
@@ -947,14 +1381,11 @@ class ObserverRepository:
         record = await self._load(run_id)
         if record.allow_reassignment and record.execution_id and record.attempts and not self.slave_availability.get("slave-a", True):
             if not any(attempt["target"] == "slave-b" for attempt in record.attempts):
-                record.attempts.append({"attempt_id": f"attempt-{uuid4().hex[:12]}", "target": "slave-b", "state": "created", "reason": "slave_a_unavailable", "provenance": {"from": "slave-a", "to": "slave-b"}})
+                record.execution_epoch += 1
+                for attempt in record.attempts:
+                    if attempt.get("state") in {"created", "running"}:
+                        attempt["state"] = "reassigned"
+                record.attempts.append({"attempt_id": f"attempt-{uuid4().hex[:12]}", "target": "slave-b", "state": "created", "execution_epoch": record.execution_epoch, "reason": "slave_a_unavailable", "provenance": {"from": "slave-a", "to": "slave-b"}})
                 record.events.append({"phase": "reassigned", "execution_id": record.execution_id, "from": "slave-a", "to": "slave-b"})
                 await self._persist(record)
         return record
-
-    async def terminal(self, payload: dict[str, Any]) -> dict[str, Any]:
-        attempt = next((item for record in self.runs.values() for item in record.attempts if item["attempt_id"] == payload.get("attempt_id")), None)
-        if attempt is None or payload.get("execution_epoch") != 2:
-            raise ValueError("stale_execution_epoch")
-        attempt["state"] = "completed"
-        return {"accepted": True}

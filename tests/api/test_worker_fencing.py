@@ -3,7 +3,7 @@ from fastapi.testclient import TestClient
 from loom_v2.observer.app import create_app
 
 
-def test_stale_epoch_terminal_report_is_rejected():
+def test_legacy_terminal_report_endpoint_is_removed():
     client = TestClient(create_app())
     response = client.post(
         "/worker/v1/terminal",
@@ -15,5 +15,4 @@ def test_stale_epoch_terminal_report_is_rejected():
             "outcome": {"status": "completed"},
         },
     )
-    assert response.status_code == 409
-    assert response.json()["code"] == "stale_execution_epoch"
+    assert response.status_code == 404

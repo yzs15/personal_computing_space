@@ -50,7 +50,6 @@ class SortClosureProvider:
         yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "set_program_ref", "value": "loom://sort"}]})
         yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "set_compute_spec", "value": {"operation_ref": "loom://sort"}}]})
         yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "add_typed_hole", "value": {"hole_id": "h_sort"}}]})
-        yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "set_execution_payload", "value": {"items": [3, 1, 2]}}]})
         yield AgentEvent(
             "apply_plan_patch",
             {
@@ -267,7 +266,7 @@ async def test_driver_dispatches_committed_operation_to_bound_slave():
     repo = ObserverRepository()
     driver = DriverService(repo, SortClosureProvider(), slaves={"slave-a": SlaveService("slave-a")})
 
-    result = await driver.run_prompt("conversation-sort", "sort this")
+    result = await driver.run_prompt("conversation-sort", "[3, 1, 2]")
 
     assert result["state"] == "completed"
     run = await repo.get_run(result["run_id"])
@@ -282,7 +281,7 @@ async def test_driver_dispatches_through_worker_session_http_boundary():
     worker = WorkerSession("slave-a", "http://slave-a", transport=httpx.ASGITransport(app=slave_app))
     driver = DriverService(repo, SortClosureProvider(), workers={"slave-a": worker})
 
-    result = await driver.run_prompt("conversation-worker-http", "sort this")
+    result = await driver.run_prompt("conversation-worker-http", "[3, 1, 2]")
 
     assert result["state"] == "completed"
     run = await repo.get_run(result["run_id"])

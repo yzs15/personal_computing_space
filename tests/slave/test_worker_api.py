@@ -6,8 +6,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from loom_v2.content_store import ContentStore
-from loom_v2.contracts.types import CapabilityHealthReport, CapabilityPackageVersion, CapabilityProvisionCommand, ResourceRef, TaskClosure
+from loom_v2.content_store import ContentStore, canonical_json_bytes
+from loom_v2.contracts.types import CapabilityHealthReport, CapabilityPackageVersion, CapabilityProvisionCommand, NodeInputBinding, ResourceRef, TaskClosure
 from loom_v2.observer.worker import WorkerSession
 from loom_v2.slave.app import create_app
 
@@ -42,6 +42,10 @@ def test_slave_dispatch_endpoint_returns_ack_and_terminal_report():
     assert response.status_code == 200
     payload = response.json()
     assert payload["accepted"] is True
+    assert payload["execution_id"] == "execution-worker-api"
+    assert payload["terminal_report"]["attempt_id"] == "attempt-worker-api"
+    assert payload["terminal_report"]["execution_id"] == "execution-worker-api"
+    assert payload["terminal_report"]["execution_epoch"] == 1
     assert payload["terminal_report"]["result"]["value"] == {"items": [1, 2, 3]}
 
 
@@ -61,6 +65,39 @@ async def test_worker_session_dispatches_over_http_envelope():
         binding=None,
     )
     assert result.value == {"items": [2, 4, 5]}
+
+
+@pytest.mark.asyncio
+async def test_worker_session_preserves_slave_terminal_validation_state():
+    app = create_app("slave-a")
+    schema_ref = await app.state.service.content_store.put(
+        canonical_json_bytes({"type": "object", "required": ["missing"]}),
+        media_type="application/schema+json",
+    )
+    contract_ref = await app.state.service.content_store.put(
+        canonical_json_bytes({
+            "schema_version": "io.v1",
+            "input_schema_ref": None,
+            "output_schema_ref": schema_ref.model_dump(mode="json"),
+            "success_semantics": None,
+            "success_validator_ref": None,
+        }),
+        media_type="application/vnd.loom.io-contract+json",
+    )
+    session = WorkerSession("slave-a", "http://slave-a", transport=httpx.ASGITransport(app=app))
+    result = await session.dispatch(
+        attempt_id="attempt-worker-validation",
+        execution_id="execution-worker-validation",
+        execution_epoch=1,
+        workspace_id="workspace-default",
+        operation="echo",
+        payload={"text": "hello"},
+        closure=TaskClosure(program={"operation_ref": "loom://echo", "io_contract_ref": contract_ref.model_dump(mode="json")}),
+        binding=None,
+    )
+    assert result.terminal_state == "failed"
+    assert result.terminal_error["code"] == "output_schema_mismatch"
+    assert result.validation_evidence
 
 
 @pytest.mark.asyncio
@@ -94,6 +131,131 @@ async def test_worker_session_timeout_is_independent_from_coding_agent_deadline(
 
 
 @pytest.mark.asyncio
+async def test_worker_session_rejects_terminal_report_with_wrong_attempt_id():
+    app = FastAPI()
+
+    @app.post("/worker/v1/dispatch")
+    async def mismatched_dispatch() -> dict[str, object]:
+        return {
+            "accepted": True,
+            "attempt_id": "attempt-worker-fencing",
+            "execution_id": "execution-worker-fencing",
+            "execution_epoch": 1,
+            "terminal_report": {
+                "type": "terminal_report",
+                "attempt_id": "attempt-other",
+                "execution_id": "execution-worker-fencing",
+                "execution_epoch": 1,
+                "state": "completed",
+                "result": {
+                    "resource_ref": {"resource_id": "result-fencing"},
+                    "value": {"ok": True},
+                    "digest": "digest",
+                },
+            },
+        }
+
+    session = WorkerSession("slave-a", "http://slave-a", transport=httpx.ASGITransport(app=app))
+    with pytest.raises(RuntimeError, match="stale_attempt"):
+        await session.dispatch(
+            attempt_id="attempt-worker-fencing",
+            execution_id="execution-worker-fencing",
+            execution_epoch=1,
+            workspace_id="workspace-default",
+            operation="echo",
+            payload={"text": "hello"},
+            closure=TaskClosure(program={"operation_ref": "loom://echo"}),
+            binding=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_worker_session_rejects_terminal_report_with_wrong_execution_id():
+    app = FastAPI()
+
+    @app.post("/worker/v1/dispatch")
+    async def mismatched_dispatch() -> dict[str, object]:
+        return {
+            "accepted": True,
+            "attempt_id": "attempt-worker-fencing-exec",
+            "execution_id": "execution-worker-fencing-exec",
+            "execution_epoch": 1,
+            "terminal_report": {
+                "type": "terminal_report",
+                "attempt_id": "attempt-worker-fencing-exec",
+                "execution_id": "execution-other",
+                "execution_epoch": 1,
+                "state": "completed",
+                "result": {
+                    "resource_ref": {"resource_id": "result-fencing-exec"},
+                    "value": {"ok": True},
+                    "digest": "digest",
+                },
+            },
+        }
+
+    session = WorkerSession("slave-a", "http://slave-a", transport=httpx.ASGITransport(app=app))
+    with pytest.raises(RuntimeError, match="stale_execution_id"):
+        await session.dispatch(
+            attempt_id="attempt-worker-fencing-exec",
+            execution_id="execution-worker-fencing-exec",
+            execution_epoch=1,
+            workspace_id="workspace-default",
+            operation="echo",
+            payload={"text": "hello"},
+            closure=TaskClosure(program={"operation_ref": "loom://echo"}),
+            binding=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_worker_session_omits_mutable_payload_when_closure_has_input_binding():
+    app = FastAPI()
+    captured: dict[str, object] = {}
+
+    @app.post("/worker/v1/dispatch")
+    async def dispatch(payload: dict[str, object]) -> dict[str, object]:
+        captured.update(payload)
+        return {
+            "accepted": True,
+            "attempt_id": "attempt-input-ref",
+            "execution_id": "execution-input-ref",
+            "execution_epoch": 1,
+            "terminal_report": {
+                "type": "terminal_report",
+                "attempt_id": "attempt-input-ref",
+                "execution_id": "execution-input-ref",
+                "execution_epoch": 1,
+                "state": "completed",
+                "result": {
+                    "resource_ref": {"resource_id": "result-input-ref"},
+                    "value": {"ok": True},
+                    "digest": "digest",
+                },
+            },
+        }
+
+    input_ref = ResourceRef(resource_id="content://sha256/" + "a" * 64, version_or_digest="a" * 64)
+    closure = TaskClosure(
+        program={"operation_ref": "loom://echo"},
+        node_input_bindings=[NodeInputBinding(node_id="echo", input_ref=input_ref)],
+    )
+    session = WorkerSession("slave-a", "http://slave-a", transport=httpx.ASGITransport(app=app))
+    await session.dispatch(
+        attempt_id="attempt-input-ref",
+        execution_id="execution-input-ref",
+        execution_epoch=1,
+        workspace_id="workspace-default",
+        operation="echo",
+        payload={"text": "untrusted"},
+        closure=closure,
+        binding=None,
+    )
+
+    assert "payload" not in captured
+
+
+@pytest.mark.asyncio
 async def test_worker_session_provision_sends_only_content_references():
     app = FastAPI()
     captured: dict[str, object] = {}
@@ -118,6 +280,10 @@ async def test_worker_session_provision_sends_only_content_references():
         secret_key=os.environ["LOOM_S3_SECRET_KEY"],
     )
     program_ref = await store.put(b"print(1)", media_type="text/x-python")
+    contract_ref = await store.put(
+        canonical_json_bytes({"schema_version": "io.v1", "input_schema_ref": None, "output_schema_ref": None, "success_semantics": None, "success_validator_ref": None}),
+        media_type="application/vnd.loom.io-contract+json",
+    )
     package = CapabilityPackageVersion(
         package_id="pkg-reference-only",
         package_version="v1",
@@ -128,6 +294,7 @@ async def test_worker_session_provision_sends_only_content_references():
         operation_descriptor_digest="descriptor",
         program_content_ref=program_ref,
         program_digest=program_ref.version_or_digest,
+        io_contract_ref=contract_ref,
     )
     session = WorkerSession("slave-a", "http://slave-a", transport=httpx.ASGITransport(app=app))
     await session.provision(

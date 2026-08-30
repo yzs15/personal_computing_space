@@ -6,10 +6,11 @@ import json
 import os
 import signal
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from loom_v2.contracts.types import ResourceRef
+from loom_v2.content_store import canonical_json_bytes
 
 
 @dataclass
@@ -18,6 +19,9 @@ class ExecutionResult:
     value: Any
     replay_safety: str
     digest: str
+    terminal_state: str = "completed"
+    terminal_error: dict[str, Any] | None = None
+    validation_evidence: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -45,7 +49,7 @@ class ExecutorAdapter(Protocol):
 
 
 def _result(value: Any, replay_safety: str = "Idempotent") -> ExecutionResult:
-    digest = hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    digest = hashlib.sha256(canonical_json_bytes(value)).hexdigest()
     return ExecutionResult(
         resource_ref=ResourceRef(resource_id=f"result-{digest[:16]}", version_or_digest=digest, identity_criterion="content_digest"),
         value=value,

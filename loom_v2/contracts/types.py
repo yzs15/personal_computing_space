@@ -38,12 +38,42 @@ class DataSystems(ContractModel):
     terms: list[TypedTerm] = Field(default_factory=list)
 
 
+class IoContract(ContractModel):
+    """Content-addressed input/output contract for an executable node."""
+
+    schema_version: Literal["io.v1"] = "io.v1"
+    input_schema_ref: ResourceRef | None = None
+    output_schema_ref: ResourceRef | None = None
+    success_semantics: Any | None = None
+    success_validator_ref: ResourceRef | None = None
+
+
+class ValidationEvidence(ContractModel):
+    """Deterministic schema/validator evidence accepted by Observer."""
+
+    evidence_id: str
+    attempt_id: str
+    execution_epoch: int
+    validator_ref: ResourceRef | None = None
+    schema_ref: ResourceRef | None = None
+    input_digest: str | None = None
+    output_digest: str | None = None
+    result: Literal["pass", "fail"]
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+    issuer: Literal["slave", "observer"]
+    created_at: str
+
+
 class ProgramApplication(ContractModel):
     operation_ref: str = ""
     semantics_digest: str = ""
-    input_schema: str = ""
-    output_schema: str = ""
-    success_semantics: dict[str, Any] = Field(default_factory=dict)
+    # These fields remain the v2 application view.  Executable validation is
+    # anchored by ``io_contract_ref``; the repository will resolve the view
+    # from that content-addressed contract instead of trusting free text.
+    input_schema: Any | None = None
+    output_schema: Any | None = None
+    success_semantics: Any | None = None
+    io_contract_ref: ResourceRef | None = None
     terms: list[TypedTerm] = Field(default_factory=list)
 
 
@@ -127,6 +157,9 @@ class CapabilityPackageVersion(ContractModel):
     operation_descriptor_digest: str
     program_content_ref: ResourceRef
     program_digest: str
+    # Nullable only so persisted pre-I/O records can be read; every new
+    # executable materialization/provision/readiness path rejects ``None``.
+    io_contract_ref: ResourceRef | None = None
     effective_constraint_refs: list[ConstraintRef] = Field(default_factory=list)
     provider_fillable_hole_refs: list[str] = Field(default_factory=list)
     scope: Literal["run_bound", "workspace_reusable"] = "run_bound"
@@ -228,6 +261,14 @@ class ResourceEventFrame(ContractModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class NodeInputBinding(ContractModel):
+    """Binding of one executable node to a content-addressed input."""
+
+    node_id: str
+    input_ref: ResourceRef
+    provenance: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class TaskClosure(ContractModel):
     closure_id: str = "closure-default"
     schema_version: str = "1"
@@ -235,6 +276,7 @@ class TaskClosure(ContractModel):
     data_systems: DataSystems = Field(default_factory=DataSystems)
     program: ProgramApplication = Field(default_factory=ProgramApplication)
     program_systems: ProgramSystems = Field(default_factory=ProgramSystems)
+    node_input_bindings: list[NodeInputBinding] = Field(default_factory=list)
     compute: ComputeSpec = Field(default_factory=ComputeSpec)
     compute_bindings: list[ComputeBinding] = Field(default_factory=list)
     compute_application: ComputeApplication = Field(default_factory=ComputeApplication)
