@@ -6,7 +6,7 @@
 
 ## 1. 目标与验收范围
 
-本项目在 `.` 建立一个物理隔离于旧 `../loom` 的 Python project，落地 v2 文档的 M0 单域管道和 M1 单域价值灯塔。首版必须可通过 Docker Compose 启动，并提供 Conversation-first Web 体验。
+本项目在当前仓库建立一个物理隔离于旧 `../loom` 的 Python project，落地 v2 文档的 M0 单域管道和 M1 单域价值灯塔。首版必须可通过 Docker Compose 启动，并提供 Conversation-first Web 体验。
 
 首版验收包含：
 

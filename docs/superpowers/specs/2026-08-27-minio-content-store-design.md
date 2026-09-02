@@ -5,7 +5,7 @@
 
 ## 1. 背景与目标
 
-当前内容存储是 `ContentStore` 的本地文件系统实现（[observer/content_store.py](loom_v2/observer/content_store.py)）：内容寻址、每个 blob 一个文件（文件名 = sha256 digest），默认根目录 `/tmp/loom-v2-content`；跨容器靠 compose 共享 volume `loom-content`，或 provision 时经 `program_bytes_b64` 数据面携带。
+当前内容存储是 `ContentStore` 的本地文件系统实现（[`loom_v2/observer/content_store.py`](../../loom_v2/observer/content_store.py)）：内容寻址、每个 blob 一个文件（文件名 = sha256 digest），默认根目录 `/tmp/loom-v2-content`；跨容器靠 compose 共享 volume `loom-content`，或 provision 时经 `program_bytes_b64` 数据面携带。
 
 问题：
 

@@ -47,7 +47,8 @@ the configured upstream requires authentication. Driver's generated
 `wire_api = "responses"`, `model_reasoning_effort = "xhigh"`,
 `approvals_reviewer = "guardian_subagent"`, and
 `sandbox_mode = "danger-full-access"`). The host model catalog is mounted from
-`LOOM_CODEX_MODEL_CATALOG_PATH` (default `../../.codex/model_catalog.json`) so
+`LOOM_CODEX_MODEL_CATALOG_PATH` (default `../../.codex/model_catalog.json`,
+relative to `deploy/docker-compose.yml`) so
 custom model metadata such as `deepseek-v4-flash` remains available. Set
 `CODEX_VERSION` when rebuilding the Driver image.
 
