@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from loom_v2.contracts.types import ClosureContract, TaskClosure
+from loom_v2.contracts.errors import DomainError
 from loom_v2.observer.app import create_app
 from loom_v2.observer.repository import ObserverRepository
 
@@ -47,7 +48,9 @@ def test_unbound_typed_hole_blocks_commit_and_reports_readiness():
     )
 
     assert response.status_code == 409
-    assert "typed_hole_unbound" in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert detail["code"] == "readiness_blocked"
+    assert detail["details"]["blockers"][0]["code"] == "typed_hole_unbound"
 
 
 def test_binding_requires_target_capability_and_then_allows_start():
@@ -70,7 +73,9 @@ def test_binding_requires_target_capability_and_then_allows_start():
     )
 
     assert commit.status_code == 409
-    assert "capability_unavailable" in commit.json()["detail"]
+    detail = commit.json()["detail"]
+    assert detail["code"] == "readiness_blocked"
+    assert detail["details"]["blockers"][0]["code"] == "capability_unavailable"
 
     repository.slave_capabilities["slave-a"]["operations"] = {"echo", "hash", "sort"}
     run2, patch2 = _add_sort_hole(client, "valid")
@@ -171,9 +176,12 @@ async def test_commit_and_start_reuse_input_readiness_blockers() -> None:
         ),
     )
     record = await repo.open_run("run-commit-input", "task-commit-input", "echo input", closure_contract=contract)
+    await repo.begin_refinement(record.run_id)
 
-    with pytest.raises(ValueError, match="payload_missing"):
+    with pytest.raises(DomainError) as caught:
         await repo.commit(record.run_id, record.draft_version, record.draft_digest)
+    assert caught.value.envelope.code == "readiness_blocked"
+    assert caught.value.envelope.details["blockers"][0]["code"] == "payload_missing"
 
 
 @pytest.mark.asyncio

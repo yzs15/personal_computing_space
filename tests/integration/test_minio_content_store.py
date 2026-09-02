@@ -9,7 +9,7 @@ from loom_v2.content_store import ContentStore
 from loom_v2.contracts.types import CapabilityPackageVersion, CapabilityProvisionCommand, ComputeBinding, ResourceRef
 from loom_v2.slave.app import create_app
 from loom_v2.observer.repository import ObserverRepository
-from loom_v2.observer.worker import WorkerSession
+from loom_v2.driver.worker import WorkerSession
 
 
 def _store() -> ContentStore:

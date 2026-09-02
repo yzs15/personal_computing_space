@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .mcp import DriverMCP
 from loom_v2.observer.repository import ObserverRepository
+from loom_v2.content_store import ContentStore
+from loom_v2.contracts.errors import DomainError
 
 
 class DriverMCPServer:
@@ -15,15 +18,27 @@ class DriverMCPServer:
     from the transport header and never from model arguments.
     """
 
-    def __init__(self, repository: ObserverRepository) -> None:
+    def __init__(
+        self,
+        repository: ObserverRepository,
+        content_store: ContentStore | None = None,
+        run_executor: Callable[[str, str], Awaitable[Any]] | None = None,
+    ) -> None:
         self.repository = repository
+        self.content_store = content_store
+        self.run_executor = run_executor
         self.sessions: dict[str, DriverMCP] = {}
 
     def session(self, conversation_ref: str) -> DriverMCP:
         if not conversation_ref:
             raise ValueError("conversation_ref_required")
         if conversation_ref not in self.sessions:
-            self.sessions[conversation_ref] = DriverMCP(self.repository, conversation_ref)
+            self.sessions[conversation_ref] = DriverMCP(
+                self.repository,
+                conversation_ref,
+                content_store=self.content_store,
+                run_executor=self.run_executor,
+            )
         return self.sessions[conversation_ref]
 
     async def handle(self, request: dict[str, Any], conversation_ref: str) -> dict[str, Any]:
@@ -48,6 +63,12 @@ class DriverMCPServer:
                 result = {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}], "isError": False}
             else:
                 return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"method_not_found:{method}"}}
+        except DomainError as exc:
+            if method == "tools/call":
+                envelope = {"code": exc.envelope.code, **exc.envelope.details}
+                result = {"content": [{"type": "text", "text": json.dumps({"error": envelope}, ensure_ascii=False)}], "isError": True, "error": envelope}
+            else:
+                return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": str(exc)}}
         except Exception as exc:
             if method == "tools/call":
                 result = {"content": [{"type": "text", "text": json.dumps({"code": str(exc)}, ensure_ascii=False)}], "isError": True}

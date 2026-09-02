@@ -1,0 +1,16 @@
+{
+  "closure_id": "closure-bandgap-stats",
+  "goal": "Compute per-family band-gap statistics (count, sum, min, max, mean, population stddev) for every family plus overall, using a map-reduce fan-out across slave-a and slave-b, returning a report JSON",
+  "allowed_effects": ["read_workspace"],
+  "resource_budget": {"max_nodes": 8, "max_live_nodes": 2},
+  "recovery_policy": {"allow_reassignment": true},
+  "result_expectations": [{"kind": "content", "identity_criterion": "content_digest"}],
+  "required_success_criteria": [{"criterion_id": "bandgap_report_well_formed", "kind": "deterministic"}],
+  "body": {
+    "closure_id": "closure-bandgap-stats",
+    "program": {
+      "operation_ref": "loom://orchestrate",
+      "io_contract_ref": "PARENT_IO_CONTRACT_REF_PLACEHOLDER"
+    }
+  }
+}

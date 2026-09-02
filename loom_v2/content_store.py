@@ -94,6 +94,14 @@ class ContentStore:
     @classmethod
     def _digest_from_ref(cls, ref: ResourceRef | str) -> str:
         if isinstance(ref, ResourceRef):
+            if ref.identity_criterion not in {None, "content_digest"}:
+                raise ValueError("invalid_content_digest")
+            if ref.version_or_digest and ref.resource_id.startswith("content://sha256/"):
+                resource_digest = cls._normalize_digest(ref.resource_id)
+                version_digest = cls._normalize_digest(ref.version_or_digest)
+                if resource_digest != version_digest:
+                    raise ValueError("content_digest_mismatch")
+                return version_digest
             return cls._normalize_digest(ref.version_or_digest or ref.resource_id)
         return cls._normalize_digest(ref)
 

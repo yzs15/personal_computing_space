@@ -20,6 +20,7 @@ const statusLabels = {
   thinking: 'Thinking',
   executing: 'Executing',
   completed: 'Completed',
+  awaiting_decision: 'Awaiting Decision',
   interrupted: 'Interrupted',
   failed: 'Failed',
 };
@@ -274,10 +275,13 @@ form.addEventListener('submit', async (event) => {
   renderConversationStatus('thinking');
   startStatusPolling();
   try {
+    const requestId = (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function')
+      ? globalThis.crypto.randomUUID()
+      : `request-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const response = await fetch('/api/v1/messages', {
       method: 'POST',
       headers: {'content-type': 'application/json'},
-      body: JSON.stringify({conversation_ref: conversationRef, text: prompt}),
+      body: JSON.stringify({request_id: requestId, conversation_ref: conversationRef, text: prompt}),
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {

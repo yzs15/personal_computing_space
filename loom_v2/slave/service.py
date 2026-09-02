@@ -79,28 +79,74 @@ class SlaveService:
             TermSupport(kind="loom.compute.precision.v1", schema_ref="loom.compute.precision/1", support={"parse", "preserve", "validate"}, execution_stages={"commit", "admission"}),
         ]
 
+    @staticmethod
+    def _package_cache_key(package_ref: str, package_digest: str) -> str:
+        return f"{package_ref}#digest:{package_digest.lower()}"
+
+    @staticmethod
+    def _package_aliases(package: CapabilityPackageVersion, command_ref: str) -> set[str]:
+        return {
+            command_ref,
+            package.version_ref,
+            f"{package.package_id}:{package.package_version}",
+            package.package_closure_version_ref,
+            package.package_version,
+            package.package_id,
+            package.package_digest,
+            package.program_digest,
+        }
+
+    def _cache_package(self, package: CapabilityPackageVersion, command_ref: str) -> None:
+        aliases = self._package_aliases(package, command_ref)
+        for alias in aliases:
+            self.package_cache[self._package_cache_key(alias, package.package_digest)] = package
+            self.package_cache[alias] = package
+
+    def _find_cached_package(self, package_ref: str, package_digest: str | None = None) -> CapabilityPackageVersion | None:
+        if package_digest:
+            requested_digest = package_digest.lower()
+            exact = self.package_cache.get(self._package_cache_key(package_ref, requested_digest))
+            if exact is not None and exact.package_digest.lower() == requested_digest:
+                return exact
+            for item in self.package_cache.values():
+                if item.package_digest.lower() != requested_digest:
+                    continue
+                if package_ref in {
+                    item.package_id,
+                    item.version_ref,
+                    f"{item.package_id}:{item.package_version}",
+                    item.package_closure_version_ref,
+                    item.package_version,
+                }:
+                    return item
+            return None
+        return self.package_cache.get(package_ref)
+
     async def provision(self, command: CapabilityProvisionCommand, package: CapabilityPackageVersion | None = None) -> CapabilityHealthReport:
         if command.target_slave != self.slave_id:
             raise RuntimeError("provision_target_mismatch")
         if command.compute_binding is not None and command.compute_binding.target_resource_ref.resource_id != self.slave_id:
             raise RuntimeError("binding_target_mismatch")
-        package = package or self.package_cache.get(command.package_version_ref)
+        package = package or self._find_cached_package(command.package_version_ref, command.package_digest)
         if package is None:
             raise RuntimeError("capability_package_not_found")
+        if package.executor_kind == "orchestrator_python_v1":
+            raise RuntimeError("driver_side_executor_required")
         if package.io_contract_ref is None:
             raise RuntimeError("io_contract_required")
         try:
             await self._load_io_contract(package.io_contract_ref)
         except (FileNotFoundError, RuntimeError, ValueError, TypeError) as exc:
             raise RuntimeError("io_contract_invalid") from exc
-        if package.package_digest != command.package_digest:
+        if package.package_digest.lower() != command.package_digest.lower():
             raise RuntimeError("capability_package_digest_mismatch")
         if command.program_content_ref is not None and command.program_content_ref.version_or_digest not in {None, package.program_digest}:
             raise RuntimeError("program_digest_mismatch")
         if package.provider_fillable_hole_refs and (command.compute_binding is None or not command.compute_binding.runtime_profile):
             raise RuntimeError("provider_fillable_binding_required")
         ref = package.version_ref
-        existing_activation = self.activations.get(ref)
+        activation_key = self._package_cache_key(ref, package.package_digest)
+        existing_activation = self.activations.get(activation_key)
         if existing_activation is not None and existing_activation.activation_state == "ready":
             return CapabilityHealthReport(
                 report_id=f"health-{package.package_id}-{self.slave_id}",
@@ -123,16 +169,8 @@ class SlaveService:
             activation_state="ready",
             evidence_refs=[f"package-test:{package.package_digest[:16]}", f"health:{package.package_digest[:16]}"],
         )
-        self.package_cache[ref] = package
-        self.package_cache[f"capability-package://{package.package_id}/{package.package_version}"] = package
-        self.package_cache[command.package_version_ref] = package
-        # Bindings may reference the package by package_id, version ref, or
-        # digest; keep every alias resolvable so a lenient lookup in ``run``
-        # mirrors the Observer's ``_find_package`` matching.
-        self.package_cache[package.package_id] = package
-        self.package_cache[package.package_digest] = package
-        self.package_cache[package.program_digest] = package
-        self.activations[ref] = activation
+        self._cache_package(package, command.package_version_ref)
+        self.activations[activation_key] = activation
         operation_ref = package.operation_descriptor_ref
         operation_name = operation_ref.resource_id if isinstance(operation_ref, ResourceRef) else str(operation_ref)
         if package.scope == "workspace_reusable" and package.publication_state == "published":
@@ -347,19 +385,7 @@ class SlaveService:
         if binding is not None and binding.capability_package_ref is not None:
             package_ref = binding.capability_package_ref.resource_id
             digest = binding.capability_package_ref.version_or_digest
-            package = self.package_cache.get(package_ref) or (self.package_cache.get(digest) if digest else None)
-            if package is None:
-                package = next(
-                    (
-                        item
-                        for item in self.package_cache.values()
-                        if item.package_id == package_ref
-                        or item.version_ref == package_ref
-                        or f"{item.package_id}:{item.package_version}" == package_ref
-                        or (digest and digest in {item.package_digest, item.program_digest})
-                    ),
-                    None,
-                )
+            package = self._find_cached_package(package_ref, digest)
             if package is None:
                 raise RuntimeError("capability_package_not_installed")
             if binding.realization_digest and binding.realization_digest not in {package.program_digest, package.package_digest}:

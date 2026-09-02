@@ -4,10 +4,88 @@ import json
 import pytest
 
 from loom_v2.coding_agents.codex import CodexAppServerProvider
+from loom_v2.contracts.errors import DomainError, DomainErrorEnvelope
 
 
 def test_codex_provider_defaults_to_requested_model():
     assert CodexAppServerProvider().model == "deepseek-v4-flash"
+
+
+@pytest.mark.asyncio
+async def test_codex_provider_resumes_existing_thread(monkeypatch):
+    provider = CodexAppServerProvider()
+    sent: list[dict] = []
+
+    class Proc:
+        stdin = None
+        stdout = None
+
+    async def spawn(*_args, **_kwargs):
+        return Proc()
+
+    async def send(message):
+        sent.append(message)
+
+    async def response(_request_id):
+        return {"result": {"thread": {"id": "thread-7"}}}
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    provider._send = send
+    provider._read_response = response
+    thread_id = await provider.start("conversation-1", "/workspace", existing_thread_id="thread-7")
+    assert thread_id == "thread-7"
+    assert [item["method"] for item in sent] == ["initialize", "thread/resume"]
+    assert sent[-1]["params"]["threadId"] == "thread-7"
+
+
+@pytest.mark.asyncio
+async def test_codex_provider_rejects_thread_start_error(monkeypatch):
+    provider = CodexAppServerProvider()
+
+    class Proc:
+        stdin = None
+        stdout = None
+
+    async def spawn(*_args, **_kwargs):
+        return Proc()
+
+    responses = iter([
+        {"result": {"ok": True}},
+        {"error": {"code": -32000, "message": "provider unavailable"}},
+    ])
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    provider._send = lambda _message: _noop()
+    provider._read_response = lambda _request_id: _next_response(responses)
+    with pytest.raises(RuntimeError, match="coding_agent_unavailable"):
+        await provider.start("conversation-1", "/workspace")
+
+
+@pytest.mark.asyncio
+async def test_codex_provider_reads_resumed_thread_history(monkeypatch):
+    provider = CodexAppServerProvider()
+    provider.process = object()
+    provider.thread_id = "thread-7"
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def response(_request_id):
+        return {"result": {"thread": {"id": "thread-7", "turns": []}}}
+
+    provider._send = send
+    provider._read_response = response
+    result = await provider.read_thread()
+    assert result["thread"]["id"] == "thread-7"
+    assert sent[0]["method"] == "thread/read"
+
+
+async def _noop():
+    return None
+
+
+async def _next_response(responses):
+    return next(responses)
 
 
 @pytest.mark.asyncio
@@ -38,6 +116,80 @@ async def test_codex_provider_reads_large_jsonl_message_in_chunks():
 
     assert message == payload
     assert stdout.read_calls > 1
+
+
+@pytest.mark.asyncio
+async def test_provider_releases_turn_lock_when_start_fails():
+    provider = CodexAppServerProvider(executable="loom-no-codex")
+    with pytest.raises(RuntimeError, match="coding_agent_unavailable"):
+        await provider.start("conversation", "/workspace")
+    assert not provider._turn_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_provider_write_lock_serializes_stdin_writes():
+    class FakeStdin:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+
+        def write(self, data: bytes) -> None:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+
+        async def drain(self) -> None:
+            await asyncio.sleep(0.005)
+            self.active -= 1
+
+    provider = CodexAppServerProvider()
+    provider.process = type("Process", (), {"stdin": FakeStdin()})()
+
+    async def send_one(index: int) -> None:
+        await provider._send({"jsonrpc": "2.0", "id": index, "method": "thread/read"})
+
+    await asyncio.gather(*(send_one(index) for index in range(6)))
+    assert provider.process.stdin.max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_turn_lock_serializes_concurrent_starts(monkeypatch):
+    provider = CodexAppServerProvider()
+
+    class Proc:
+        stdin = None
+        stdout = None
+
+        def terminate(self) -> None:
+            return None
+
+        async def wait(self) -> int:
+            return 0
+
+    async def spawn(*_args, **_kwargs):
+        return Proc()
+
+    async def send(_message: dict) -> None:
+        return None
+
+    async def response(_request_id: int) -> dict:
+        return {"result": {"thread": {"id": "thread-lock"}}}
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    provider._send = send
+    provider._read_response = response
+
+    first = asyncio.create_task(provider.start("conversation-a", "/workspace"))
+    await asyncio.sleep(0.01)
+    second = asyncio.create_task(provider.start("conversation-b", "/workspace"))
+    await asyncio.sleep(0.05)
+    assert not second.done()
+
+    await provider.close()
+    assert await asyncio.wait_for(second, timeout=1) == "thread-lock"
+    # The second turn now owns the turn lock until its own close().
+    assert provider._turn_lock.locked()
+    await provider.close()
+    assert not provider._turn_lock.locked()
 
 
 @pytest.mark.asyncio
@@ -155,6 +307,34 @@ async def test_codex_provider_registers_and_answers_dynamic_tools():
         "id": 7,
         "result": {"contentItems": [{"type": "inputText", "text": '{"tool": "loom_open_run", "goal": "sort"}'}], "success": True},
     }
+
+
+@pytest.mark.asyncio
+async def test_codex_provider_returns_structured_dynamic_tool_error():
+    provider = CodexAppServerProvider()
+    provider.process = object()
+    provider.thread_id = "thread-1"
+
+    async def handler(_name, _args):
+        raise DomainError(
+            DomainErrorEnvelope(
+                code="readiness_blocked",
+                details={"blockers": [{"code": "orchestration_program_unresolved_name", "diagnostics": []}]},
+            )
+        )
+
+    provider.set_tool_handler([], handler)
+    sent: list[dict] = []
+
+    async def send(message):
+        sent.append(message)
+
+    provider._send = send
+    await provider._handle_dynamic_tool_call({"id": 8, "params": {"tool": "loom_commit_plan", "arguments": {}}})
+    assert sent[0]["result"]["success"] is False
+    assert sent[0]["result"]["error"]["code"] == "readiness_blocked"
+    content = json.loads(sent[0]["result"]["contentItems"][0]["text"])
+    assert content["error"]["blockers"][0]["code"] == "orchestration_program_unresolved_name"
 
 
 @pytest.mark.asyncio

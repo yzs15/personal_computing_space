@@ -1,8 +1,15 @@
+import asyncio
+import hashlib
+
 import pytest
 
-from loom_v2.contracts.types import TaskClosure
+from loom_v2.content_store import canonical_json_bytes
+from loom_v2.contracts.types import ResourceRef, TaskClosure
 from loom_v2.driver.mcp import DriverMCP
+from loom_v2.driver.service import DriverService
 from loom_v2.observer.repository import ObserverRepository
+from loom_v2.coding_agents.fake import FakeCodingAgentProvider
+from loom_v2.slave.executor import ExecutionResult
 
 
 @pytest.mark.asyncio
@@ -132,3 +139,124 @@ async def test_open_run_coerces_natural_language_body_to_task_closure_metadata()
 
     run = await repo.get_run(opened["run_id"])
     assert run.closure_contract.body.metadata["description"].startswith("Invoke the sort")
+
+
+@pytest.mark.asyncio
+async def test_open_run_uses_goal_as_execution_prompt_when_transport_has_no_prompt():
+    mcp = DriverMCP(ObserverRepository(), "conversation-mcp-no-prompt")
+
+    await mcp.call(
+        "loom_open_run",
+        {
+            "closure_contract": {
+                "closure_id": "closure-no-prompt",
+                "goal": "echo the run goal",
+                "body": {"closure_id": "closure-no-prompt"},
+            }
+        },
+    )
+
+    assert mcp.prompt == "echo the run goal"
+
+
+@pytest.mark.asyncio
+async def test_start_run_returns_repair_outcome_as_successful_tool_call():
+    repo = ObserverRepository()
+
+    async def failing_executor(_operation, payload):
+        digest = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+        return ExecutionResult(
+            resource_ref=ResourceRef(
+                resource_id=f"result-{digest[:16]}",
+                version_or_digest=digest,
+                identity_criterion="content_digest",
+            ),
+            value=payload,
+            replay_safety="Idempotent",
+            digest=digest,
+            terminal_state="failed",
+            terminal_error={"code": "worker_failed"},
+        )
+
+    service = DriverService(repo, FakeCodingAgentProvider(), executor=failing_executor)
+    mcp = DriverMCP(
+        repo,
+        "conversation-mcp-repair",
+        prompt="echo failure",
+        run_executor=service._execute_and_wait_local,
+    )
+    await mcp.call(
+        "loom_open_run",
+        {
+            "closure_contract": {
+                "closure_id": "closure-mcp-repair",
+                "goal": "echo failure",
+                "body": {
+                    "closure_id": "closure-mcp-repair",
+                    "program": {"operation_ref": "loom://echo"},
+                },
+            }
+        },
+    )
+    await mcp.call("loom_apply_plan_patch", {"ops": []})
+    committed = await mcp.call("loom_commit_plan")
+
+    result = await mcp.call("loom_start_run", {"closure_version": committed["closure_version"]})
+
+    assert result["success"] is True
+    assert result["state"] == "awaiting_decision"
+    assert result["disposition"] == "awaiting_decision"
+    assert result["decision"] == "repair"
+    assert result["terminal_error"] == {"code": "worker_failed"}
+    assert result["decision_hint"] == "repair_plan_and_retry"
+
+
+@pytest.mark.asyncio
+async def test_start_run_wakes_when_run_is_cancelled():
+    repo = ObserverRepository()
+    executor_started = asyncio.Event()
+    executor_cancelled = asyncio.Event()
+
+    async def blocking_executor(_operation, _payload):
+        executor_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            executor_cancelled.set()
+            raise
+
+    service = DriverService(repo, FakeCodingAgentProvider(), executor=blocking_executor)
+    mcp = DriverMCP(
+        repo,
+        "conversation-mcp-cancelled",
+        prompt="wait",
+        run_executor=service._execute_and_wait_local,
+    )
+    await mcp.call(
+        "loom_open_run",
+        {
+            "closure_contract": {
+                "closure_id": "closure-mcp-cancelled",
+                "goal": "wait",
+                "body": {
+                    "closure_id": "closure-mcp-cancelled",
+                    "program": {"operation_ref": "loom://echo"},
+                },
+            }
+        },
+    )
+    await mcp.call("loom_apply_plan_patch", {"ops": []})
+    committed = await mcp.call("loom_commit_plan")
+    start_task = asyncio.create_task(
+        mcp.call("loom_start_run", {"closure_version": committed["closure_version"]})
+    )
+    await asyncio.wait_for(executor_started.wait(), timeout=1)
+
+    await repo.cancel_run(mcp.run_id)
+    result = await asyncio.wait_for(start_task, timeout=1)
+
+    assert result["success"] is True
+    assert result["state"] == "cancelled"
+    assert result["disposition"] == "cancelled"
+    assert result["decision"] is None
+    assert executor_cancelled.is_set()

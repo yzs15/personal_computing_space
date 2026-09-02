@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .env
+secrets/*
+!secrets/*.example
 *.egg-info/
 data/
 logs/

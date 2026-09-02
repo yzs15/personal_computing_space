@@ -4,7 +4,7 @@ import hashlib
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .constraints import Constraint, ConstraintRef
 from .terms import TypedTerm
@@ -174,7 +174,30 @@ class CapabilityPackageVersion(ContractModel):
     captured_secret_refs: list[str] = Field(default_factory=list)
     captured_path_refs: list[str] = Field(default_factory=list)
     semantic_closed: bool = True
+    allowed_node_package_refs: list[ResourceRef] = Field(default_factory=list)
+    max_nodes: int | None = None
+    max_live_nodes: int | None = None
     package_digest: str = ""
+
+    @model_validator(mode="after")
+    def validate_orchestration_policy(self) -> "CapabilityPackageVersion":
+        fields_set = bool(self.allowed_node_package_refs or self.max_nodes is not None or self.max_live_nodes is not None)
+        if self.executor_kind != "orchestrator_python_v1":
+            if fields_set:
+                raise ValueError("orchestration_fields_require_orchestrator")
+            return self
+        if (
+            not self.allowed_node_package_refs
+            or self.max_nodes is None
+            or self.max_live_nodes is None
+            or self.max_nodes <= 0
+            or self.max_live_nodes <= 0
+            or self.max_live_nodes > self.max_nodes
+            or self.executor_operation != "orchestrate"
+            or self.io_contract_ref is None
+        ):
+            raise ValueError("orchestration_package_invalid")
+        return self
 
     @property
     def version_ref(self) -> str:
@@ -189,6 +212,12 @@ class CapabilityPackageVersion(ContractModel):
             if isinstance(payload.get("program_content_ref"), dict):
                 ref = payload["program_content_ref"]
                 payload["program_content_ref"] = {key: ref.get(key) for key in ("resource_id", "version_or_digest", "identity_criterion") if ref.get(key) is not None}
+            if isinstance(payload.get("allowed_node_package_refs"), list):
+                payload["allowed_node_package_refs"] = [
+                    {key: ref.get(key) for key in ("resource_id", "version_or_digest", "identity_criterion") if ref.get(key) is not None}
+                    if isinstance(ref, dict) else ref
+                    for ref in payload["allowed_node_package_refs"]
+                ]
             self.package_digest = hashlib.sha256(
                 json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
             ).hexdigest()
@@ -246,6 +275,27 @@ class CapabilityHealthReport(ContractModel):
     evidence_refs: list[str] = Field(default_factory=list)
     details: dict[str, Any] = Field(default_factory=dict)
     session_generation: int = 1
+
+
+class NodeIntent(ContractModel):
+    """Deterministic node request emitted by an orchestration program."""
+
+    intent_id: str = Field(min_length=1)
+    execution_id: str = Field(min_length=1)
+    package_ref: ResourceRef
+    input_refs: list[ResourceRef] = Field(default_factory=list)
+
+
+class DynamicNode(ContractModel):
+    """Observer-accepted execution record derived from a NodeIntent."""
+
+    node_id: str = Field(min_length=1)
+    parent_execution_ref: str = Field(min_length=1)
+    intent_id: str = Field(min_length=1)
+    package_ref: ResourceRef
+    package_digest: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    input_refs: list[ResourceRef] = Field(default_factory=list)
+    state: Literal["accepted", "dispatched", "completed", "failed", "decision_required"] = "accepted"
 
 
 class ResourceEventFrame(ContractModel):

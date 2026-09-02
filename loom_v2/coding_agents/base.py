@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Protocol
+from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
+
+from .turn import TurnContext
 
 
 @dataclass
@@ -20,10 +22,20 @@ class CodingAgentError(RuntimeError):
 
 
 class CodingAgentProvider(Protocol):
-    async def start(self, conversation_ref: str, workspace_root: str) -> str: ...
+    async def begin_turn(
+        self,
+        conversation_ref: str,
+        request_id: str,
+        workspace_root: str,
+        existing_thread_id: str | None,
+        tools: list[dict[str, Any]],
+        handler: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None,
+    ) -> TurnContext: ...
 
-    def send_turn(self, user_message: str) -> AsyncIterator[AgentEvent]: ...
+    def send_turn(self, context: TurnContext, user_message: str) -> AsyncIterator[AgentEvent]: ...
 
-    async def interrupt(self, turn_ref: str | None = None) -> None: ...
+    async def interrupt(self, context: TurnContext) -> None: ...
 
-    async def close(self) -> None: ...
+    async def end_turn(self, context: TurnContext) -> None: ...
+
+    async def force_shutdown(self) -> None: ...

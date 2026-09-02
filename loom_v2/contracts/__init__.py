@@ -1,6 +1,8 @@
 from .constraints import Constraint, ConstraintRef, ConstraintSpec
 from .errors import DomainError, DomainErrorEnvelope
 from .terms import TermSupport, TypedTerm, VocabularyRegistry, builtin_registry
+from .agents import AgentLease, AgentRegistration, DriverCommand, DriverRequestReceipt, DriverThreadBinding
+from .messages import MessageReceipt, MessageReceiptState, message_payload_digest
 from .types import (
     CapabilityHealthReport,
     CapabilityPackage,
@@ -12,7 +14,9 @@ from .types import (
     ComputeSpec,
     DataApplication,
     DataSystems,
+    DynamicNode,
     IoContract,
+    NodeIntent,
     NodeInputBinding,
     ValidationEvidence,
     ProgramApplication,
@@ -23,11 +27,19 @@ from .types import (
 )
 
 __all__ = [
+    "AgentLease",
+    "AgentRegistration",
     "Constraint",
     "ConstraintRef",
     "ConstraintSpec",
     "DomainError",
     "DomainErrorEnvelope",
+    "DriverCommand",
+    "DriverRequestReceipt",
+    "DriverThreadBinding",
+    "MessageReceipt",
+    "MessageReceiptState",
+    "message_payload_digest",
     "TermSupport",
     "TypedTerm",
     "VocabularyRegistry",
@@ -42,7 +54,9 @@ __all__ = [
     "ComputeSpec",
     "DataApplication",
     "DataSystems",
+    "DynamicNode",
     "IoContract",
+    "NodeIntent",
     "NodeInputBinding",
     "ValidationEvidence",
     "ProgramApplication",

@@ -1,7 +1,7 @@
 # 程序化分布式任务编排与校验压力测试设计（B + A）
 
 **日期：** 2026-08-26
-**修订：** 2026-08-30（从静态 DAG 改为受约束的 Python 动态编排，并收敛抽象与安全边界）
+**修订：** 2026-08-30（从静态 DAG 改为受约束的 Python 动态编排，并收敛抽象与安全边界）；2026-09-02（明确能力包 digest 身份、同 Run 冲突处理与无限制 attempt 默认）
 **状态：** 设计（待评审）
 **对应文档：** `docs/superpowers/specs/2026-08-24-single-user-workspace-v2-design.md`；`docs/superpowers/specs/2026-08-27-minio-content-store-design.md`；`docs/superpowers/specs/2026-08-28-io-schema-validation-design.md`
 
@@ -60,6 +60,8 @@ ProgramSystems = {
 
 ```text
 OrchestrationPackage = CapabilityPackageVersion {
+  package_id: PackageId,
+  package_version: Version,
   executor_kind: "orchestrator_python_v1",
   program_content_ref: ResourceRef,
   program_digest: Digest,
@@ -69,6 +71,25 @@ OrchestrationPackage = CapabilityPackageVersion {
   max_live_nodes: int
 }
 ```
+
+### 3.1 能力包身份与尝试预算
+
+`package_id`/`package_version` 是包的逻辑坐标；可执行包的不可变身份始终是二元组
+`(version_ref, package_digest)`。`run_bound` 包允许不同 Run 使用相同的逻辑坐标，
+因为 `source_run_ref` 等运行来源会参与 `package_digest`。因此所有绑定、provision、
+activation 和 Slave 缓存命中都必须同时校验版本引用与 digest；只按裸
+`package_id` 或 `version_ref` 命中不得作为带 digest 请求的回退。若是同一逻辑包的
+新发布版本，则由发布方选择新的 `package_version`；不通过随机改名掩盖 digest
+冲突。同一 Run 内再次物化相同 `package_id/package_version` 时，只有 digest 完全一致
+才按幂等请求复用；digest 不一致必须返回
+`capability_package_identity_conflict`，由调用方改用新的版本（或包 ID）。
+晋升为 `workspace_reusable` 时同样禁止占用已有的
+`package_id/package_version-reusable` 不同 digest；需要发布新逻辑版本。
+
+父闭包 `resource_budget.max_attempts` 是可选的 Run 级总尝试预算，包含首次执行和
+重指派产生的每个 node attempt。字段省略表示不限制；设置后，Observer 在创建
+attempt 前拒绝超出预算的 dispatch。`max_nodes` 与 `max_live_nodes` 仍是独立的
+编排限制。
 
 约束：
 

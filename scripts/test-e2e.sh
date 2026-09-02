@@ -12,5 +12,7 @@ fi
 OBSERVER_PORT="${LOOM_OBSERVER_PORT:-18080}"
 curl -fsS "http://localhost:${OBSERVER_PORT}/healthz"
 curl -fsS "http://localhost:${OBSERVER_PORT}/" | grep -q "Run drawer"
+curl -fsS "http://localhost:${OBSERVER_PORT}/api/v1/capabilities" | grep -q 'slave-a'
+curl -fsS "http://localhost:${OBSERVER_PORT}/api/v1/capabilities" | grep -q 'slave-b'
 "$DOCKER_BIN" compose -f deploy/docker-compose.yml ps --status running
 echo "Loom v2 smoke checks passed"

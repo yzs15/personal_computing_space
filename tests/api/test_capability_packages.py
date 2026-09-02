@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from loom_v2.contracts.agents import AgentRegistration, DriverCommand
 from loom_v2.contracts.types import ClosureContract, ComputeBinding, ResourceRef, TaskClosure
 from loom_v2.observer.repository import ObserverRepository
 
@@ -21,6 +22,49 @@ async def _empty_io_contract_ref(repo: ObserverRepository):
 
 async def _program_ref(repo: ObserverRepository):
     return await repo.put_content("print(1)", media_type="text/x-python")
+
+
+@pytest.mark.asyncio
+async def test_capability_get_command_normalizes_resource_ref_dict():
+    repo = ObserverRepository()
+    lease = await repo.register_agent(
+        AgentRegistration(
+            role="driver",
+            agent_id="driver-default",
+            instance_id="instance-1",
+            workspace_id="workspace-default",
+            endpoint_url="http://driver:8090",
+            protocol_version="loom.v1",
+        )
+    )
+    run = await repo.open_run("run-cg", "conversation-cg", "check")
+    program_ref = await _program_ref(repo)
+    io_contract_ref = await _empty_io_contract_ref(repo)
+    await repo.apply_patch(
+        run.run_id,
+        run.draft_version,
+        run.draft_digest,
+        "materialize-cg",
+        [
+            {"kind": "set_program_ref", "value": "loom://check"},
+            {"kind": "add_typed_hole", "value": {"hole_id": "h"}},
+            {"kind": "materialize_capability_package_candidate", "value": {"package_id": "cgpkg", "program_content_ref": program_ref.model_dump(mode="json"), "io_contract_ref": io_contract_ref.model_dump(mode="json"), "operation_descriptor_ref": "loom://check"}},
+        ],
+    )
+    package = (await repo.get_run(run.run_id)).capability_packages[0]
+    dict_ref = ResourceRef(resource_id=package.version_ref).model_dump(mode="json")
+    result = await repo.execute_driver_command(
+        DriverCommand(
+            request_id="capability-get-1",
+            driver_id="driver-default",
+            instance_id="instance-1",
+            lease_id=lease.lease_id,
+            driver_epoch=lease.epoch,
+            command="capability.get",
+            arguments={"package_ref": dict_ref, "run_id": run.run_id, "workspace_id": "workspace-default"},
+        )
+    )
+    assert result["package_id"] == "cgpkg"
 
 
 @pytest.mark.asyncio
@@ -59,6 +103,126 @@ async def test_candidate_is_run_bound_and_cannot_be_used_by_another_run():
     )
     assert any(blocker["code"] == "capability_package_scope_mismatch" for blocker in result.readiness["blockers"])
     assert all(item.package_id != "pkg" for item in await repo.list_capability_packages(run_id=second.run_id))
+
+
+@pytest.mark.asyncio
+async def test_same_run_package_coordinate_rejects_digest_conflict():
+    repo = ObserverRepository()
+    run = await repo.open_run("run-package-conflict", "conversation-package-conflict", "check")
+    first_program_ref = await _program_ref(repo)
+    second_program_ref = await repo.put_content("print(2)", media_type="text/x-python")
+    io_contract_ref = await _empty_io_contract_ref(repo)
+    first = await repo.apply_patch(
+        run.run_id,
+        run.draft_version,
+        run.draft_digest,
+        "materialize-package-conflict-first",
+        [
+            {
+                "kind": "materialize_capability_package_candidate",
+                "value": {
+                    "package_id": "same-coordinate",
+                    "package_version": "v1",
+                    "program_content_ref": first_program_ref.model_dump(mode="json"),
+                    "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                    "operation_descriptor_ref": "loom://check",
+                },
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="capability_package_identity_conflict"):
+        await repo.apply_patch(
+            run.run_id,
+            first.draft_version,
+            first.draft_digest,
+            "materialize-package-conflict-second",
+            [
+                {
+                    "kind": "materialize_capability_package_candidate",
+                    "value": {
+                        "package_id": "same-coordinate",
+                        "package_version": "v1",
+                        "program_content_ref": second_program_ref.model_dump(mode="json"),
+                        "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                        "operation_descriptor_ref": "loom://check",
+                    },
+                }
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_same_package_coordinate_across_runs_resolves_by_digest():
+    repo = ObserverRepository()
+    program_ref = await _program_ref(repo)
+    io_contract_ref = await _empty_io_contract_ref(repo)
+    packages = []
+    for run_id in ("run-package-one", "run-package-two"):
+        run = await repo.open_run(run_id, f"conversation-{run_id}", "check")
+        await repo.apply_patch(
+            run.run_id,
+            run.draft_version,
+            run.draft_digest,
+            f"materialize-{run_id}",
+            [
+                {
+                    "kind": "materialize_capability_package_candidate",
+                    "value": {
+                        "package_id": "cross-run-coordinate",
+                        "package_version": "v1",
+                        "program_content_ref": program_ref.model_dump(mode="json"),
+                        "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                        "operation_descriptor_ref": "loom://check",
+                    },
+                }
+            ],
+        )
+        packages.append((await repo.get_run(run.run_id)).capability_packages[0])
+
+    first, second = packages
+    assert first.version_ref == second.version_ref
+    assert first.package_digest != second.package_digest
+    first_ref = ResourceRef(resource_id=first.version_ref, version_or_digest=first.package_digest)
+    second_ref = ResourceRef(resource_id=second.version_ref, version_or_digest=second.package_digest)
+    assert (await repo.get_capability_package(first_ref)).package_digest == first.package_digest
+    assert (await repo.get_capability_package(second_ref)).package_digest == second.package_digest
+
+
+@pytest.mark.asyncio
+async def test_promoting_different_digest_same_reusable_coordinate_is_rejected():
+    repo = ObserverRepository()
+    io_contract_ref = await _empty_io_contract_ref(repo)
+    candidates = []
+    for run_id, source in (("run-promote-one", "print(1)"), ("run-promote-two", "print(2)")):
+        run = await repo.open_run(run_id, f"conversation-{run_id}", "check")
+        program_ref = await repo.put_content(source, media_type="text/x-python")
+        await repo.apply_patch(
+            run.run_id,
+            run.draft_version,
+            run.draft_digest,
+            f"materialize-{run_id}",
+            [
+                {
+                    "kind": "materialize_capability_package_candidate",
+                    "value": {
+                        "package_id": "promote-coordinate",
+                        "package_version": "v1",
+                        "program_content_ref": program_ref.model_dump(mode="json"),
+                        "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                        "operation_descriptor_ref": "loom://check",
+                    },
+                }
+            ],
+        )
+        await repo.fail_run(run.run_id, "test")
+        candidates.append((await repo.get_run(run.run_id)).capability_packages[0])
+
+    first, second = candidates
+    first_ref = ResourceRef(resource_id=first.version_ref, version_or_digest=first.package_digest)
+    second_ref = ResourceRef(resource_id=second.version_ref, version_or_digest=second.package_digest)
+    await repo.promote_capability_package(first_ref, approved_digest=first.package_digest)
+    with pytest.raises(ValueError, match="capability_package_identity_conflict"):
+        await repo.promote_capability_package(second_ref, approved_digest=second.package_digest)
 
 
 @pytest.mark.asyncio

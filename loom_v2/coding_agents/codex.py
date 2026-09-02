@@ -9,6 +9,8 @@ from collections.abc import AsyncIterator
 from typing import Any, Awaitable, Callable
 
 from .base import AgentEvent
+from .turn import TurnContext
+from loom_v2.contracts.errors import DomainError
 
 
 class CodexAppServerProvider:
@@ -44,6 +46,15 @@ class CodexAppServerProvider:
         self.current_turn_id: str | None = None
         self.dynamic_tools: list[dict[str, Any]] = []
         self.tool_handler: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
+        # The provider owns a single app-server subprocess.  A turn spans
+        # ``start`` -> ``send_turn`` -> ``close``; the turn lock guarantees
+        # only one conversation drives the process at a time so the shared
+        # stdout reader can never race a concurrent reader.  The read/write
+        # locks additionally serialize the stdio boundary against cross-turn
+        # activity such as ``interrupt`` while a turn is in flight.
+        self._turn_lock = asyncio.Lock()
+        self._read_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
         self._poll_task: asyncio.Task[None] | None = None
         self._poll_requests: dict[int, tuple[str, float]] = {}
         self.last_protocol_heartbeat_at: float | None = None
@@ -51,6 +62,8 @@ class CodexAppServerProvider:
         self._protocol_failure_reason: dict[str, Any] | None = None
         self._protocol_failure_event: asyncio.Event | None = None
         self._protocol_failure_reported = False
+        self._active_context: TurnContext | None = None
+        self._legacy_context: TurnContext | None = None
 
     def set_tool_handler(
         self,
@@ -60,48 +73,148 @@ class CodexAppServerProvider:
         self.dynamic_tools = list(tools)
         self.tool_handler = handler
 
-    async def start(self, conversation_ref: str, workspace_root: str) -> str:
+    async def begin_turn(
+        self,
+        conversation_ref: str,
+        request_id: str,
+        workspace_root: str,
+        existing_thread_id: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        handler: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
+    ) -> TurnContext:
+        await self._turn_lock.acquire()
+        context = TurnContext(
+            workspace_id=os.getenv("LOOM_WORKSPACE_ID", "workspace-default"),
+            conversation_ref=conversation_ref,
+            request_id=request_id,
+            claim_token="",
+            driver_epoch=0,
+            owner_generation=f"{request_id}:{id(self)}",
+            dynamic_tools=list(tools if tools is not None else self.dynamic_tools),
+            mcp_handler=handler if handler is not None else self.tool_handler,
+        )
+        self._read_buffer = context.read_buffer
         try:
-            self._read_buffer.clear()
-            self.process = await asyncio.create_subprocess_exec(
-                self.executable,
-                "app-server",
-                "--listen",
-                "stdio://",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+            try:
+                self._read_buffer.clear()
+                context.process = await asyncio.create_subprocess_exec(
+                    self.executable,
+                    "app-server",
+                    "--listen",
+                    "stdio://",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                self.process = context.process
+            except (FileNotFoundError, OSError) as exc:
+                raise RuntimeError("coding_agent_unavailable") from exc
+            initialize_id = self._next_id()
+            await self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": initialize_id,
+                    "method": "initialize",
+                    "params": {
+                        "clientInfo": {"name": "loom-v2", "version": "0.1.0"},
+                        "capabilities": {"experimentalApi": True},
+                    },
+                }
             )
-        except (FileNotFoundError, OSError) as exc:
-            raise RuntimeError("coding_agent_unavailable") from exc
-        initialize_id = self._next_id()
+            initialize_response = await self._read_response(initialize_id)
+            if initialize_response.get("error") or not isinstance(initialize_response.get("result"), dict):
+                raise RuntimeError("coding_agent_unavailable")
+            thread_request_id = self._next_id()
+            thread_params: dict[str, Any] = {
+                "model": self.model,
+                "cwd": workspace_root,
+                "runtimeWorkspaceRoots": [workspace_root],
+                "metadata": {"conversation_ref": conversation_ref},
+            }
+            if context.dynamic_tools:
+                thread_params["dynamicTools"] = context.dynamic_tools
+            method = "thread/resume" if existing_thread_id else "thread/start"
+            if existing_thread_id:
+                thread_params["threadId"] = existing_thread_id
+            await self._send({"jsonrpc": "2.0", "id": thread_request_id, "method": method, "params": thread_params})
+            try:
+                response = await self._read_response(thread_request_id)
+            except Exception as exc:
+                if existing_thread_id:
+                    raise RuntimeError("codex_thread_unavailable") from exc
+                raise
+            if response.get("error") or not isinstance(response.get("result"), dict):
+                raise RuntimeError("codex_thread_unavailable" if existing_thread_id else "coding_agent_unavailable")
+            result_payload = response.get("result", {}) if isinstance(response.get("result"), dict) else {}
+            thread_payload = result_payload.get("thread", {}) if isinstance(result_payload.get("thread"), dict) else {}
+            context.thread_id = str(thread_payload.get("id") or result_payload.get("threadId") or existing_thread_id or conversation_ref)
+            self.thread_id = context.thread_id
+            self._active_context = context
+            return context
+        except Exception:
+            process = context.process
+            context.process = None
+            if process is not None:
+                with suppress(Exception):
+                    process.terminate()
+                with suppress(Exception):
+                    await asyncio.wait_for(process.wait(), timeout=5)
+            if self.process is process:
+                self.process = None
+            if self._active_context is context:
+                self._active_context = None
+            if self._turn_lock.locked():
+                self._turn_lock.release()
+            raise
+
+    async def start(self, conversation_ref: str, workspace_root: str, existing_thread_id: str | None = None) -> str:
+        context = await self.begin_turn(
+            conversation_ref,
+            f"legacy-{conversation_ref}",
+            workspace_root,
+            existing_thread_id=existing_thread_id,
+            tools=self.dynamic_tools,
+            handler=self.tool_handler,
+        )
+        self._legacy_context = context
+        return str(context.thread_id)
+
+    async def read_thread(self, context: TurnContext | None = None) -> dict[str, Any]:
+        if context is not None and self._active_context is not context:
+            raise RuntimeError("stale_turn_context")
+        context = context or self._active_context
+        thread_id = context.thread_id if context is not None else self.thread_id
+        process = context.process if context is not None else self.process
+        if process is None or not thread_id:
+            raise RuntimeError("coding_agent_unavailable")
+        request_id = self._next_id()
         await self._send(
             {
                 "jsonrpc": "2.0",
-                "id": initialize_id,
-                "method": "initialize",
-                "params": {
-                    "clientInfo": {"name": "loom-v2", "version": "0.1.0"},
-                    "capabilities": {"experimentalApi": True},
-                },
+                "id": request_id,
+                "method": "thread/read",
+                "params": {"threadId": thread_id, "includeTurns": True},
             }
         )
-        await self._read_response(initialize_id)
-        thread_request_id = self._next_id()
-        thread_params: dict[str, Any] = {
-            "model": self.model,
-            "cwd": workspace_root,
-            "runtimeWorkspaceRoots": [workspace_root],
-            "metadata": {"conversation_ref": conversation_ref},
-        }
-        if self.dynamic_tools:
-            thread_params["dynamicTools"] = self.dynamic_tools
-        await self._send({"jsonrpc": "2.0", "id": thread_request_id, "method": "thread/start", "params": thread_params})
-        response = await self._read_response(thread_request_id)
-        self.thread_id = str(response.get("result", {}).get("thread", {}).get("id", conversation_ref))
-        return self.thread_id
+        response = await self._read_response(request_id)
+        if response.get("error") or not isinstance(response.get("result"), dict):
+            raise RuntimeError("codex_thread_unavailable")
+        return response["result"]
 
-    async def send_turn(self, user_message: str) -> AsyncIterator[AgentEvent]:
+    async def send_turn(self, context_or_message: TurnContext | str, user_message: str | None = None) -> AsyncIterator[AgentEvent]:
+        context = context_or_message if isinstance(context_or_message, TurnContext) else self._active_context
+        if isinstance(context_or_message, TurnContext):
+            if self._active_context is not context:
+                raise RuntimeError("stale_turn_context")
+            self._active_context = context
+            self.process = context.process
+            self.thread_id = context.thread_id
+            self._read_buffer = context.read_buffer
+            self.dynamic_tools = list(context.dynamic_tools)
+            self.tool_handler = context.mcp_handler
+            user_message = str(user_message or "")
+        else:
+            user_message = str(context_or_message)
         if self.process is None:
             raise RuntimeError("coding_agent_unavailable")
         self.current_turn_id = None
@@ -157,6 +270,8 @@ class CodexAppServerProvider:
                         if isinstance(started_turn, dict):
                             if started_turn.get("id"):
                                 self.current_turn_id = str(started_turn["id"])
+                                if context is not None:
+                                    context.turn_id = self.current_turn_id
                             if started_turn.get("status"):
                                 turn_status = str(started_turn["status"])
                             if started_turn.get("error"):
@@ -179,6 +294,8 @@ class CodexAppServerProvider:
                         params = self._thread_status(poll_result)
                         if params.get("turn_id"):
                             self.current_turn_id = params["turn_id"]
+                            if context is not None:
+                                context.turn_id = self.current_turn_id
                         if params.get("turn_status"):
                             turn_status = params["turn_status"]
                         yield AgentEvent("thread_status", params)
@@ -238,6 +355,8 @@ class CodexAppServerProvider:
                         turn_id = params.get("turnId") or params.get("turn_id")
                     if turn_id is not None:
                         self.current_turn_id = str(turn_id)
+                        if context is not None:
+                            context.turn_id = self.current_turn_id
                     status = turn.get("status") if isinstance(turn, dict) else None
                     status = status or params.get("status")
                     turn_status = str(status or "completed")
@@ -255,6 +374,8 @@ class CodexAppServerProvider:
                         turn_id = params.get("turnId") or params.get("turn_id")
                     if turn_id is not None:
                         self.current_turn_id = str(turn_id)
+                        if context is not None:
+                            context.turn_id = self.current_turn_id
                     turn_status = str((turn.get("status") if isinstance(turn, dict) else None) or "inProgress")
                     yield AgentEvent("turn_started", {"turn_id": self.current_turn_id} if self.current_turn_id else {})
                     if isinstance(turn, dict) and turn.get("error"):
@@ -479,30 +600,70 @@ class CodexAppServerProvider:
             return str(error.get("message") or error.get("data") or error.get("code") or "Codex request failed")
         return str(error or "Codex request failed")
 
-    async def interrupt(self, turn_ref: str | None = None) -> None:
+    async def interrupt(self, context_or_turn: TurnContext | str | None = None) -> None:
+        context = context_or_turn if isinstance(context_or_turn, TurnContext) else self._active_context
+        if isinstance(context_or_turn, TurnContext):
+            if self._active_context is not context:
+                raise RuntimeError("stale_turn_context")
+        turn_ref = context.turn_id if context is not None else context_or_turn
         turn_ref = turn_ref or self.current_turn_id
+        thread_id = context.thread_id if context is not None else self.thread_id
         if self.process is not None and turn_ref:
             await self._send(
                 {
                     "jsonrpc": "2.0",
                     "id": self._next_id(),
                     "method": "turn/interrupt",
-                    "params": {"threadId": self.thread_id, "turnId": turn_ref},
+                    "params": {"threadId": thread_id, "turnId": turn_ref},
                 }
             )
 
+    async def end_turn(self, context: TurnContext) -> None:
+        if self._active_context is not context or context.owner_generation != self._active_context.owner_generation:
+            return
+        try:
+            process = context.process
+            if process is not None:
+                with suppress(Exception):
+                    process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    with suppress(Exception):
+                        process.kill()
+                    with suppress(Exception):
+                        await process.wait()
+                context.process = None
+                self.process = None
+                self.thread_id = None
+                self.current_turn_id = None
+                self._read_buffer.clear()
+            self._active_context = None
+        finally:
+            if self._turn_lock.locked():
+                self._turn_lock.release()
+
     async def close(self) -> None:
-        if self.process is not None:
-            self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                self.process.kill()
-                await self.process.wait()
+        context = self._legacy_context or self._active_context
+        if context is not None:
+            await self.end_turn(context)
+            if context is self._legacy_context:
+                self._legacy_context = None
+            return
+        if self._turn_lock.locked():
+            self._turn_lock.release()
+
+    async def force_shutdown(self) -> None:
+        context = self._active_context
+        if context is not None:
+            await self.end_turn(context)
+        elif self.process is not None:
+            process = self.process
+            with suppress(Exception):
+                process.terminate()
+            with suppress(Exception):
+                await asyncio.wait_for(process.wait(), timeout=5)
             self.process = None
-            self.thread_id = None
-            self.current_turn_id = None
-            self._read_buffer.clear()
 
     async def _handle_dynamic_tool_call(self, message: dict[str, Any]) -> None:
         request_id = message.get("id")
@@ -512,10 +673,18 @@ class CodexAppServerProvider:
         if not isinstance(arguments, dict):
             arguments = {}
         try:
-            if self.tool_handler is None:
+            handler = self._active_context.mcp_handler if self._active_context is not None else self.tool_handler
+            if handler is None:
                 raise RuntimeError("driver_mcp_unavailable")
-            result = await self.tool_handler(tool_name, arguments)
+            result = await handler(tool_name, arguments)
             content = {"contentItems": [{"type": "inputText", "text": json.dumps(result, ensure_ascii=False)}], "success": True}
+        except DomainError as exc:
+            error_payload = {"code": exc.envelope.code, **exc.envelope.details}
+            content = {
+                "contentItems": [{"type": "inputText", "text": json.dumps({"error": error_payload}, ensure_ascii=False)}],
+                "success": False,
+                "error": error_payload,
+            }
         except Exception as exc:
             content = {
                 "contentItems": [{"type": "inputText", "text": json.dumps({"code": str(exc)}, ensure_ascii=False)}],
@@ -530,8 +699,10 @@ class CodexAppServerProvider:
     async def _send(self, message: dict[str, Any]) -> None:
         if self.process is None or self.process.stdin is None:
             raise RuntimeError("coding_agent_unavailable")
-        self.process.stdin.write((json.dumps(message) + "\n").encode())
-        await self.process.stdin.drain()
+        lock = self._active_context.write_lock if self._active_context is not None else self._write_lock
+        async with lock:
+            self.process.stdin.write((json.dumps(message) + "\n").encode())
+            await self.process.stdin.drain()
 
     async def _read_message(self) -> dict[str, Any]:
         if self.process is None or self.process.stdout is None:
@@ -541,28 +712,30 @@ class CodexAppServerProvider:
         # large tool result or reasoning item raises ``LimitOverrunError``
         # before we can decode it.  Read bounded chunks and apply our own
         # explicit message limit instead.
-        while True:
-            separator = self._read_buffer.find(b"\n")
-            if separator >= 0:
-                if separator > self.message_limit_bytes:
+        lock = self._active_context.read_lock if self._active_context is not None else self._read_lock
+        async with lock:
+            while True:
+                separator = self._read_buffer.find(b"\n")
+                if separator >= 0:
+                    if separator > self.message_limit_bytes:
+                        raise RuntimeError("coding_agent_message_too_large")
+                    line = bytes(self._read_buffer[:separator]).rstrip(b"\r")
+                    del self._read_buffer[: separator + 1]
+                    if not line.strip():
+                        continue
+                    try:
+                        message = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError("coding_agent_protocol_error") from exc
+                    if not isinstance(message, dict):
+                        raise RuntimeError("coding_agent_protocol_error")
+                    return message
+                if len(self._read_buffer) > self.message_limit_bytes:
                     raise RuntimeError("coding_agent_message_too_large")
-                line = bytes(self._read_buffer[:separator]).rstrip(b"\r")
-                del self._read_buffer[: separator + 1]
-                if not line.strip():
-                    continue
-                try:
-                    message = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise RuntimeError("coding_agent_protocol_error") from exc
-                if not isinstance(message, dict):
-                    raise RuntimeError("coding_agent_protocol_error")
-                return message
-            if len(self._read_buffer) > self.message_limit_bytes:
-                raise RuntimeError("coding_agent_message_too_large")
-            chunk = await self.process.stdout.read(64 * 1024)
-            if not chunk:
-                raise RuntimeError("coding_agent_unavailable")
-            self._read_buffer.extend(chunk)
+                chunk = await self.process.stdout.read(64 * 1024)
+                if not chunk:
+                    raise RuntimeError("coding_agent_unavailable")
+                self._read_buffer.extend(chunk)
 
     async def _read_response(self, request_id: int) -> dict[str, Any]:
         while True:

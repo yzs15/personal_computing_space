@@ -28,3 +28,12 @@ def test_runtime_identifies_fake_backend_for_test_profile(monkeypatch):
         "coding_agent_label": "Fake coding agent",
         "model": None,
     }
+
+
+def test_runtime_reports_driver_unavailable_in_split_deployment(monkeypatch):
+    monkeypatch.setenv("LOOM_INTERNAL_API_SECRET", "test-internal-secret")
+
+    response = TestClient(create_app()).get("/api/v1/runtime")
+
+    assert response.status_code == 503
+    assert response.json() == {"code": "driver_unavailable", "retryable": True}

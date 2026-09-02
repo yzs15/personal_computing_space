@@ -73,7 +73,7 @@ def test_duplicate_patch_returns_same_receipt():
 
 
 @pytest.mark.asyncio
-async def test_observer_record_result_projects_schema_failure_to_decision_required():
+async def test_observer_record_result_projects_schema_failure_to_awaiting_decision():
     repo = ObserverRepository()
     schema_ref = await repo.put_content({"type": "object", "required": ["expected"]}, media_type="application/schema+json")
     contract_ref = await repo.put_content(
@@ -95,6 +95,7 @@ async def test_observer_record_result_projects_schema_failure_to_decision_requir
         ),
     )
     record = await repo.open_run("run-record-validation", "conversation-record-validation", "echo", closure_contract=contract)
+    await repo.begin_refinement(record.run_id)
     committed = await repo.commit(record.run_id, record.draft_version, record.draft_digest)
     await repo.start(record.run_id, committed.version_id)
     attempt_id = (await repo.get_run(record.run_id)).attempts[0]["attempt_id"]
@@ -113,7 +114,7 @@ async def test_observer_record_result_projects_schema_failure_to_decision_requir
         },
     )
 
-    assert updated.state == "decision_required"
+    assert updated.state == "awaiting_decision"
     assert updated.outcome["error"]["code"] == "output_schema_mismatch"
     assert updated.outcome["resource_ref"] is None
     assert any(event["phase"] == "io_schema_rejected" for event in updated.events)
@@ -123,6 +124,7 @@ async def test_observer_record_result_projects_schema_failure_to_decision_requir
 async def test_observer_recomputes_output_digest_and_resource_ref_identity():
     repo = ObserverRepository()
     record = await repo.open_run("run-digest-validation", "conversation-digest-validation", "echo")
+    await repo.begin_refinement(record.run_id)
     committed = await repo.commit(record.run_id, record.draft_version, record.draft_digest)
     await repo.start(record.run_id, committed.version_id)
     attempt_id = (await repo.get_run(record.run_id)).attempts[0]["attempt_id"]
@@ -145,6 +147,7 @@ async def test_observer_recomputes_output_digest_and_resource_ref_identity():
 async def test_observer_requires_execution_id_on_terminal_report():
     repo = ObserverRepository()
     record = await repo.open_run("run-execution-id", "conversation-execution-id", "echo")
+    await repo.begin_refinement(record.run_id)
     committed = await repo.commit(record.run_id, record.draft_version, record.draft_digest)
     await repo.start(record.run_id, committed.version_id)
     attempt_id = (await repo.get_run(record.run_id)).attempts[0]["attempt_id"]
@@ -160,6 +163,7 @@ async def test_observer_requires_execution_id_on_terminal_report():
 async def test_observer_rejects_stale_attempt_and_epoch_terminal_reports():
     repo = ObserverRepository()
     record = await repo.open_run("run-stale-terminal", "conversation-stale-terminal", "echo")
+    await repo.begin_refinement(record.run_id)
     committed = await repo.commit(record.run_id, record.draft_version, record.draft_digest)
     await repo.start(record.run_id, committed.version_id)
     attempt_id = (await repo.get_run(record.run_id)).attempts[0]["attempt_id"]
@@ -180,6 +184,7 @@ async def test_observer_rejects_stale_attempt_and_epoch_terminal_reports():
 async def test_observer_reassignment_fences_old_attempt_epoch():
     repo = ObserverRepository()
     record = await repo.open_run("run-reassignment-fencing", "conversation-reassignment-fencing", "echo", allow_reassignment=True)
+    await repo.begin_refinement(record.run_id)
     committed = await repo.commit(record.run_id, record.draft_version, record.draft_digest)
     await repo.start(record.run_id, committed.version_id)
     old_attempt = (await repo.get_run(record.run_id)).attempts[0]["attempt_id"]
@@ -227,6 +232,7 @@ async def test_observer_reexecutes_validator_instead_of_trusting_slave_evidence(
         ),
     )
     record = await repo.open_run("run-validator-authority", "conversation-validator-authority", "echo", closure_contract=contract)
+    await repo.begin_refinement(record.run_id)
     committed = await repo.commit(record.run_id, record.draft_version, record.draft_digest)
     await repo.start(record.run_id, committed.version_id)
     current = await repo.get_run(record.run_id)
@@ -257,6 +263,6 @@ async def test_observer_reexecutes_validator_instead_of_trusting_slave_evidence(
         },
     )
 
-    assert updated.state == "decision_required"
+    assert updated.state == "awaiting_decision"
     assert updated.outcome["terminal_error"]["code"] == "success_validation_failed"
     assert any(item.get("issuer") == "observer" and item.get("result") == "fail" for item in updated.outcome["validation_evidence"])

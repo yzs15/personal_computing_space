@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from loom_v2.content_store import ContentStore, canonical_json_bytes
 from loom_v2.contracts.types import CapabilityHealthReport, CapabilityPackageVersion, CapabilityProvisionCommand, NodeInputBinding, ResourceRef, TaskClosure
-from loom_v2.observer.worker import WorkerSession
+from loom_v2.driver.worker import WorkerSession
 from loom_v2.slave.app import create_app
 
 
@@ -47,6 +47,26 @@ def test_slave_dispatch_endpoint_returns_ack_and_terminal_report():
     assert payload["terminal_report"]["execution_id"] == "execution-worker-api"
     assert payload["terminal_report"]["execution_epoch"] == 1
     assert payload["terminal_report"]["result"]["value"] == {"items": [1, 2, 3]}
+
+
+def test_slave_dispatch_requires_driver_epoch_when_internal_auth_is_enabled(monkeypatch):
+    monkeypatch.setenv("LOOM_INTERNAL_API_SECRET", "secret")
+    app = create_app("slave-a")
+    with TestClient(app) as client:
+        response = client.post(
+            "/worker/v1/dispatch",
+            headers={"X-Loom-Internal-Token": "secret"},
+            json={
+                "attempt_id": "attempt-auth-fencing",
+                "execution_id": "execution-auth-fencing",
+                "execution_epoch": 1,
+                "workspace_id": "workspace-default",
+                "operation": "echo",
+                "payload": {"text": "hello"},
+            },
+        )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "driver_identity_required"
 
 
 @pytest.mark.asyncio

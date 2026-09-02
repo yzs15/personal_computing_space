@@ -19,6 +19,7 @@ dependencies = [
   "boto3>=1.35,<2",
   "jsonschema>=4.23,<5",
   "rfc8785>=0.1,<1",
+  "pyright[nodejs]==1.1.411",
 ]
 
 [project.optional-dependencies]
@@ -30,7 +31,10 @@ test = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-markers = ["integration: requires a running PostgreSQL service"]
+markers = [
+  "integration: requires a running PostgreSQL service",
+  "e2e: requires the deployed Docker Compose stack",
+]
 
 [tool.setuptools.packages.find]
 include = ["loom_v2*"]

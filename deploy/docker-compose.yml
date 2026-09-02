@@ -1,3 +1,7 @@
+secrets:
+  internal_api_secret:
+    file: ${LOOM_INTERNAL_API_SECRET_FILE:-../secrets/internal_api_secret}
+
 services:
   minio:
     image: minio/minio:latest
@@ -6,7 +10,6 @@ services:
       MINIO_ROOT_USER: loom
       MINIO_ROOT_PASSWORD: loom-content-secret
     volumes: [minio-data:/data]
-    ports: ["9000:9000", "9001:9001"]
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
       interval: 2s
@@ -27,22 +30,8 @@ services:
       POSTGRES_PASSWORD: loom
       POSTGRES_DB: loom_observer
     volumes: [observer-db-data:/var/lib/postgresql/data]
-    ports: ["15432:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U loom -d loom_observer"]
-      interval: 2s
-      timeout: 3s
-      retries: 20
-
-  driver-db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: loom
-      POSTGRES_PASSWORD: loom
-      POSTGRES_DB: loom_driver
-    volumes: [driver-db-data:/var/lib/postgresql/data]
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U loom -d loom_driver"]
       interval: 2s
       timeout: 3s
       retries: 20
@@ -74,69 +63,105 @@ services:
       retries: 20
 
   observer:
-    build: ..
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["/bin/sh", "-c", "export LOOM_INTERNAL_API_SECRET=\"$$(cat /run/secrets/internal_api_secret)\" && exec uvicorn loom_v2.observer.app:app --host 0.0.0.0 --port 8080"]
     environment:
       LOOM_SERVICE_NAME: observer
       LOOM_DATABASE_URL: postgresql+asyncpg://loom:loom@observer-db:5432/loom_observer
-      LOOM_CODING_AGENT_BACKEND: codex
-      LOOM_CODEX_MODEL: deepseek-v4-flash
-      LOOM_CODING_AGENT_DEADLINE_SECONDS: 86400
-      LOOM_CODING_AGENT_POLL_INTERVAL_SECONDS: 5
-      LOOM_CODING_AGENT_PROTOCOL_FAILURE_SECONDS: 60
-      LOOM_WORKER_OPERATION_TIMEOUT_SECONDS: 90
-      LOOM_CAPABILITY_OPERATION_TIMEOUT_SECONDS: 30
       LOOM_S3_ENDPOINT_URL: http://minio:9000
       LOOM_S3_BUCKET: loom-content
       LOOM_S3_ACCESS_KEY: loom
       LOOM_S3_SECRET_KEY: loom-content-secret
       LOOM_S3_REGION: us-east-1
-      LOOM_SLAVE_A_URL: http://slave-a:8081
-      LOOM_SLAVE_B_URL: http://slave-b:8082
+    secrets: [internal_api_secret]
     depends_on:
       observer-db: {condition: service_healthy}
-      slave-a: {condition: service_started}
-      slave-b: {condition: service_started}
       minio-init: {condition: service_completed_successfully}
-    # Keep the container port stable; expose Observer on the host at 18080.
     ports: ["18080:8080"]
 
+  driver:
+    build:
+      context: ..
+      dockerfile: Dockerfile.driver
+      args:
+        CODEX_VERSION: ${CODEX_VERSION:-0.151.0}
+    environment:
+      LOOM_SERVICE_NAME: driver
+      LOOM_OBSERVER_URL: http://observer:8080
+      LOOM_WORKSPACE_ID: workspace-default
+      LOOM_WORKSPACE_ROOT: /workspace
+      LOOM_AGENT_ID: driver-default
+      LOOM_CODING_AGENT_BACKEND: codex
+      LOOM_CODEX_MODEL: deepseek-v4-flash
+      LOOM_CODEX_PROVIDER: proxy
+      LOOM_CODEX_BASE_URL: ${LOOM_CODEX_BASE_URL:-http://host.docker.internal:8787}
+      LOOM_CODEX_MODEL_REASONING_EFFORT: xhigh
+      LOOM_CODEX_APPROVALS_REVIEWER: guardian_subagent
+      LOOM_CODEX_SANDBOX_MODE: danger-full-access
+      LOOM_CODEX_MODEL_CATALOG_JSON: /var/lib/loom/codex/model_catalog.json
+      LOOM_CODEX_API_KEY_ENV: OPENAI_API_KEY
+      LOOM_CODEX_WIRE_API: responses
+      LOOM_SLAVE_A_URL: http://slave-a:8081
+      LOOM_SLAVE_B_URL: http://slave-b:8082
+      LOOM_S3_ENDPOINT_URL: http://minio:9000
+      LOOM_S3_BUCKET: loom-content
+      LOOM_S3_ACCESS_KEY: loom
+      LOOM_S3_SECRET_KEY: loom-content-secret
+      LOOM_S3_REGION: us-east-1
+    secrets: [internal_api_secret]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${LOOM_WORKSPACE_PATH:-..}:/workspace
+      - driver-codex-state:/var/lib/loom/codex
+      - ${LOOM_CODEX_MODEL_CATALOG_PATH:-../../.codex/model_catalog.json}:/var/lib/loom/codex/model_catalog.json:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      minio-init: {condition: service_completed_successfully}
+
   slave-a:
-    build: ..
-    command: ["uvicorn", "loom_v2.slave.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8081"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["/bin/sh", "-c", "export LOOM_INTERNAL_API_SECRET=\"$$(cat /run/secrets/internal_api_secret)\" && exec uvicorn loom_v2.slave.app:create_app --factory --host 0.0.0.0 --port 8081"]
     environment:
       LOOM_SERVICE_NAME: slave-a
       LOOM_DATABASE_URL: postgresql+asyncpg://loom:loom@slave-a-db:5432/loom_slave_a
-      LOOM_CAPABILITY_OPERATION_TIMEOUT_SECONDS: 30
+      LOOM_OBSERVER_URL: http://observer:8080
       LOOM_S3_ENDPOINT_URL: http://minio:9000
       LOOM_S3_BUCKET: loom-content
       LOOM_S3_ACCESS_KEY: loom
       LOOM_S3_SECRET_KEY: loom-content-secret
       LOOM_S3_REGION: us-east-1
+    secrets: [internal_api_secret]
     depends_on:
       slave-a-db: {condition: service_healthy}
       minio-init: {condition: service_completed_successfully}
-    ports: ["8081:8081"]
 
   slave-b:
-    build: ..
-    command: ["uvicorn", "loom_v2.slave.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8082"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["/bin/sh", "-c", "export LOOM_INTERNAL_API_SECRET=\"$$(cat /run/secrets/internal_api_secret)\" && exec uvicorn loom_v2.slave.app:create_app --factory --host 0.0.0.0 --port 8082"]
     environment:
       LOOM_SERVICE_NAME: slave-b
       LOOM_DATABASE_URL: postgresql+asyncpg://loom:loom@slave-b-db:5432/loom_slave_b
-      LOOM_CAPABILITY_OPERATION_TIMEOUT_SECONDS: 30
+      LOOM_OBSERVER_URL: http://observer:8080
       LOOM_S3_ENDPOINT_URL: http://minio:9000
       LOOM_S3_BUCKET: loom-content
       LOOM_S3_ACCESS_KEY: loom
       LOOM_S3_SECRET_KEY: loom-content-secret
       LOOM_S3_REGION: us-east-1
+    secrets: [internal_api_secret]
     depends_on:
       slave-b-db: {condition: service_healthy}
       minio-init: {condition: service_completed_successfully}
-    ports: ["8082:8082"]
 
 volumes:
   observer-db-data:
-  driver-db-data:
   slave-a-db-data:
   slave-b-db-data:
   minio-data:
+  driver-codex-state:
