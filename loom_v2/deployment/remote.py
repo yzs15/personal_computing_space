@@ -156,9 +156,10 @@ class RemoteDeployer:
         self._run_checked(machine, "prepare", commands[0], [*self._ssh_args(machine), _mkdir_command(remote_dir)], input_bytes=None)
         self._run_checked(machine, "upload", commands[1], [*self._ssh_args(machine), _extract_command(remote_dir)], input_bytes=archive)
         self._run_checked(machine, "build", commands[2], [*self._ssh_args(machine), compose + " build"], input_bytes=None)
-        self._run_checked(machine, "start", commands[3], [*self._ssh_args(machine), compose + " up -d --remove-orphans"], input_bytes=None)
+        start_command = compose + (" up -d --remove-orphans minio" if machine.role == "minio" else " up -d --remove-orphans")
+        self._run_checked(machine, "start", commands[3], [*self._ssh_args(machine), start_command], input_bytes=None)
         if machine.role == "minio":
-            self._run_checked(machine, "minio-init", commands[4], [*self._ssh_args(machine), compose + " wait minio-init"], input_bytes=None)
+            self._run_checked(machine, "minio-init", commands[4], [*self._ssh_args(machine), compose + " run --rm minio-init"], input_bytes=None)
         try:
             self._wait_for_health(machine)
         except DeploymentFailure as failure:
@@ -172,14 +173,15 @@ class RemoteDeployer:
         mkdir = _mkdir_command(remote_dir)
         extract = _extract_command(remote_dir)
         compose = _compose_command(remote_dir, project.project_name)
+        start = compose + (" up -d --remove-orphans minio" if machine.role == "minio" else " up -d --remove-orphans")
         commands = [
             f"{target} {shlex.quote(mkdir)}",
             f"{target} {shlex.quote(extract)}",
             f"{target} {shlex.quote(compose + ' build')}",
-            f"{target} {shlex.quote(compose + ' up -d --remove-orphans')}",
+            f"{target} {shlex.quote(start)}",
         ]
         if machine.role == "minio":
-            commands.append(f"{target} {shlex.quote(compose + ' wait minio-init')}")
+            commands.append(f"{target} {shlex.quote(compose + ' run --rm minio-init')}")
         return commands
 
     def _ssh_args(self, machine: MachineConfig) -> list[str]:

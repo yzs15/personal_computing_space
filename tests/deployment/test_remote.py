@@ -103,7 +103,7 @@ def test_minio_deployment_waits_for_bucket_initializer(tmp_path: Path):
 
     RemoteDeployer(config, source_root=tmp_path, runner=runner, healthcheck=lambda _: True).deploy("storage")
 
-    assert " wait minio-init" in runner.calls[4].command
+    assert " run --rm minio-init" in runner.calls[4].command
 
 
 class _HealthResponse:
