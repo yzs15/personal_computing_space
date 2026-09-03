@@ -1,0 +1,61 @@
+# Copy this file, create the referenced local secret files, and run:
+#   python scripts/deploy_cluster.py --config deploy/deployment.example.toml
+
+[cluster]
+name = "loom-prod"
+remote_dir = "/opt/loom-v2"
+workspace_id = "workspace-default"
+internal_secret_file = "../secrets/internal_api_secret"
+postgres_password_file = "../secrets/postgres_password"
+minio_access_key = "loom"
+minio_secret_key_file = "../secrets/minio_secret_key"
+
+[driver]
+codex_base_url = "http://host.docker.internal:8787"
+workspace_path = "/srv/loom/workspace"
+# Optional; when set, the file is uploaded to the Driver host read-only.
+# model_catalog_file = "../../.codex/model_catalog.json"
+
+[[machines]]
+name = "storage"
+ssh_host = "10.0.0.10"
+ssh_port = 22
+ssh_user = "ubuntu"
+role = "minio"
+service_port = 9000
+console_port = 9001
+
+[[machines]]
+name = "observer"
+ssh_host = "10.0.0.11"
+ssh_port = 22
+ssh_user = "ubuntu"
+role = "observer"
+service_port = 8080
+
+[[machines]]
+name = "driver"
+ssh_host = "10.0.0.12"
+ssh_port = 22
+ssh_user = "ubuntu"
+role = "driver"
+service_port = 8090
+
+[[machines]]
+name = "slave-a"
+ssh_host = "10.0.0.13"
+ssh_port = 22
+ssh_user = "ubuntu"
+role = "slave"
+service_id = "slave-a"
+service_port = 8081
+
+[[machines]]
+name = "slave-b"
+ssh_host = "10.0.0.14"
+ssh_port = 22
+ssh_user = "ubuntu"
+role = "slave"
+service_id = "slave-b"
+service_port = 8082
+

@@ -1,0 +1,58 @@
+# Single-host smoke topology. Create the three local secret files first.
+
+[cluster]
+name = "loom-test"
+remote_dir = "/opt/loom-v2-test"
+workspace_id = "workspace-default"
+internal_secret_file = "../secrets/internal_api_secret"
+postgres_password_file = "../secrets/postgres_password"
+minio_access_key = "loom"
+minio_secret_key_file = "../secrets/minio_secret_key"
+
+[driver]
+codex_base_url = "http://9.0.3.9:8787"
+workspace_path = "/srv/loom-test/workspace"
+
+[[machines]]
+name = "storage"
+ssh_host = "9.0.3.9"
+ssh_port = 22
+ssh_user = "root"
+role = "minio"
+service_port = 19000
+console_port = 19001
+
+[[machines]]
+name = "observer"
+ssh_host = "9.0.3.9"
+ssh_port = 22
+ssh_user = "root"
+role = "observer"
+service_port = 18080
+
+[[machines]]
+name = "driver"
+ssh_host = "9.0.3.9"
+ssh_port = 22
+ssh_user = "root"
+role = "driver"
+service_port = 18090
+
+[[machines]]
+name = "slave-a"
+ssh_host = "9.0.3.9"
+ssh_port = 22
+ssh_user = "root"
+role = "slave"
+service_id = "slave-a"
+service_port = 18081
+
+[[machines]]
+name = "slave-b"
+ssh_host = "9.0.3.9"
+ssh_port = 22
+ssh_user = "root"
+role = "slave"
+service_id = "slave-b"
+service_port = 18082
+
