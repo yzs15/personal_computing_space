@@ -22,6 +22,8 @@ interface is the supported interface for this feature.
 - Target machines are reachable by SSH and have Docker Engine plus the Docker
   Compose plugin installed. The SSH user can run Docker without interactive
   privilege escalation.
+- Multiple machine entries may intentionally point at the same SSH host for a
+  single-host test deployment; their published ports must be distinct.
 - Target machines can reach one another using the configured advertised host
   addresses and published ports. No overlay network or firewall automation is
   required.
@@ -101,6 +103,11 @@ service_port = 8081
 MinIO, 8080 for Observer, 8090 for Driver, and 8081/8082 for those two Slave
 IDs. `ssh_host` is also the advertised address used in generated URLs; a
 future explicit advertised-address field is outside this feature.
+
+The checked-in test topology places MinIO, Observer, Driver, `slave-a`, and
+`slave-b` on `9.0.3.9` using SSH user `root` and port `22`; it assigns distinct
+published ports so the five Compose projects can run concurrently. Production
+configurations may place each entry on a different host.
 
 The loader validates required cluster fields, readable non-empty secret files,
 unique machine names, unique roles, valid ports, and the one/two-Slave topology

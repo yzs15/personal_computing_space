@@ -111,6 +111,32 @@ def test_rejects_unreadable_or_empty_secret(tmp_path: Path):
 
     with pytest.raises(DeploymentConfigError, match="internal_secret_file"):
         DeploymentConfig.from_file(path)
+
+
+def test_all_test_roles_can_share_one_ssh_host_when_ports_are_distinct(tmp_path: Path):
+    for filename in ("internal.secret", "postgres.secret", "minio.secret"):
+        write_secret(tmp_path / filename, "secret")
+    text = config_text().replace('service_port = 8080', 'service_port = 18080')
+    text += '''
+
+[[machines]]
+name = "worker-b"
+ssh_host = "9.0.3.9"
+ssh_user = "root"
+ssh_port = 22
+role = "slave"
+service_id = "slave-b"
+service_port = 18082
+'''
+    text = text.replace('ssh_host = "10.0.0.10"', 'ssh_host = "9.0.3.9"').replace('ssh_host = "10.0.0.11"', 'ssh_host = "9.0.3.9"').replace('ssh_host = "10.0.0.12"', 'ssh_host = "9.0.3.9"').replace('ssh_host = "10.0.0.13"', 'ssh_host = "9.0.3.9"')
+    path = tmp_path / "deployment.toml"
+    path.write_text(text, encoding="utf-8")
+
+    config = DeploymentConfig.from_file(path)
+
+    assert {machine.ssh_host for machine in config.machines} == {"9.0.3.9"}
+    assert {machine.ssh_port for machine in config.machines} == {22}
+    assert config.urls.slaves["slave-b"] == "http://9.0.3.9:18082"
 ```
 
 - [ ] **Step 2: Run the focused tests to verify they fail for the missing package**
@@ -326,6 +352,7 @@ git commit -m "feat: deploy compose projects over ssh"
 - Create: `scripts/deploy_slave.py`
 - Create: `scripts/deploy_minio.py`
 - Create: `deploy/deployment.example.toml`
+- Create: `deploy/deployment.test.toml`
 - Create: `tests/deployment/test_cli.py`
 
 - [ ] **Step 1: Write failing dry-run CLI tests**
@@ -394,6 +421,8 @@ Implement `loom_v2.deployment.cli.main(argv, forced_target=None)` with `--config
 - [ ] **Step 4: Add the example TOML and CLI help text**
 
 Copy the approved schema into `deploy/deployment.example.toml`, including Observer, Driver, MinIO, and both Slave examples, comments for defaults, and secret-file paths. Add module docstrings/help text that state remote prerequisites (SSH, Docker Engine, Compose plugin, passwordless Docker).
+
+Add `deploy/deployment.test.toml` with all five projects on `9.0.3.9`, SSH user `root`, port `22`, and distinct published ports (`18080` Observer, `18090` Driver, `18081`/`18082` Slaves, `19000`/`19001` MinIO). It must use the same secret-file keys as the example and never contain secret values.
 
 - [ ] **Step 5: Run CLI tests and manual help/dry-run checks**
 
