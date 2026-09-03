@@ -46,6 +46,7 @@ def test_driver_project_wires_all_remote_services_and_docker_socket(tmp_path: Pa
     environment = document["services"]["driver"]["environment"]
 
     assert environment["LOOM_OBSERVER_URL"] == "http://10.0.0.11:8080"
+    assert environment["LOOM_DRIVER_URL"] == "http://10.0.0.12:8090"
     assert environment["LOOM_SLAVE_A_URL"] == "http://10.0.0.13:8081"
     assert document["services"]["driver"]["volumes"][-1] == "/var/run/docker.sock:/var/run/docker.sock"
     assert "pg-password" not in project.redacted_preview

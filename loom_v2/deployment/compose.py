@@ -162,6 +162,7 @@ def _render_driver(config: DeploymentConfig, machine: MachineConfig) -> tuple[di
         "LOOM_CODEX_PROVIDER": config.driver.codex_provider,
         "LOOM_CODEX_SANDBOX_MODE": "danger-full-access",
         "LOOM_CODEX_WIRE_API": config.driver.codex_wire_api,
+        "LOOM_DRIVER_URL": machine.endpoint_url,
         "LOOM_OBSERVER_URL": config.urls.observer,
         "LOOM_S3_ACCESS_KEY": "${MINIO_ACCESS_KEY}",
         "LOOM_S3_BUCKET": "${LOOM_S3_BUCKET}",
