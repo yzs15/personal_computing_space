@@ -1,6 +1,6 @@
 # Remote Role Deployment Design
 
-**Date:** 2026-09-03  
+**Date:** 2026-09-03
 **Status:** Approved for implementation
 
 ## Goal

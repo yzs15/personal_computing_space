@@ -18,7 +18,7 @@
 - Create: `tests/deployment/__init__.py`
 - Create: `tests/deployment/test_config.py`
 
-- [ ] **Step 1: Write the failing tests for TOML loading, defaults, URL derivation, and validation**
+- [x] **Step 1: Write the failing tests for TOML loading, defaults, URL derivation, and validation**
 
 ```python
 from pathlib import Path
@@ -139,23 +139,23 @@ service_port = 18082
     assert config.urls.slaves["slave-b"] == "http://9.0.3.9:18082"
 ```
 
-- [ ] **Step 2: Run the focused tests to verify they fail for the missing package**
+- [x] **Step 2: Run the focused tests to verify they fail for the missing package**
 
 Run: `.venv/bin/pytest -q tests/deployment/test_config.py`
 
 Expected: FAIL with `ModuleNotFoundError: No module named 'loom_v2.deployment'`.
 
-- [ ] **Step 3: Implement the minimal immutable configuration API**
+- [x] **Step 3: Implement the minimal immutable configuration API**
 
 Implement `MachineConfig`, `DriverConfig`, `EndpointMap`, and `DeploymentConfig` as frozen dataclasses. `DeploymentConfig.from_file()` must parse `tomllib`, resolve relative secret paths from the TOML parent, read non-empty single-line secrets, apply ports 9000/9001 (MinIO), 8080 (Observer), 8090 (Driver), and 8081/8082 (Slave IDs), then validate one MinIO, one Observer, one Driver, one or two unique Slave IDs, unique machine names, valid port ranges, and required SSH fields. Expose `machine(name_or_role)`, `slaves`, and `urls` properties. Raise `DeploymentConfigError` with a stable message naming the invalid field.
 
-- [ ] **Step 4: Run the focused tests to verify they pass**
+- [x] **Step 4: Run the focused tests to verify they pass**
 
 Run: `.venv/bin/pytest -q tests/deployment/test_config.py`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the configuration layer**
+- [x] **Step 5: Commit the configuration layer**
 
 ```bash
 git add loom_v2/deployment tests/deployment/test_config.py
@@ -168,7 +168,7 @@ git commit -m "feat: add remote deployment topology config"
 - Create: `loom_v2/deployment/compose.py`
 - Create: `tests/deployment/test_compose.py`
 
-- [ ] **Step 1: Write failing renderer tests for every role and secret redaction**
+- [x] **Step 1: Write failing renderer tests for every role and secret redaction**
 
 ```python
 import json
@@ -234,17 +234,17 @@ def test_minio_project_contains_bucket_initializer(tmp_path: Path):
     assert "mc mb --ignore-existing" in document["services"]["minio-init"]["command"]
 ```
 
-- [ ] **Step 2: Run the renderer tests to verify they fail**
+- [x] **Step 2: Run the renderer tests to verify they fail**
 
 Run: `.venv/bin/pytest -q tests/deployment/test_compose.py`
 
 Expected: FAIL with `ModuleNotFoundError: No module named 'loom_v2.deployment.compose'`.
 
-- [ ] **Step 3: Implement deterministic JSON-as-Compose rendering**
+- [x] **Step 3: Implement deterministic JSON-as-Compose rendering**
 
 Define frozen `RenderedProject` with `compose_text`, `env_text`, `secret_files`, and `redacted_preview`. Build plain dictionaries and serialize `compose_text` with `json.dumps(..., indent=2, sort_keys=True)`, which Docker Compose accepts as YAML/JSON. Render role-specific services with existing image names and Dockerfiles, healthchecks, named volumes, internal secret mounts, and published ports. Use JSON-quoted values in the generated `.env` text, and use environment references only for credentials that must be shared with PostgreSQL/MinIO. Observer and Slave `LOOM_DATABASE_URL` values must use the local `postgres` service; Driver must set Observer/Slave/S3 URLs, Codex settings, and its Docker socket/workspace mounts. Never place secret contents in `compose_text` or `redacted_preview`.
 
-- [ ] **Step 4: Run the renderer tests and a Compose parser check**
+- [x] **Step 4: Run the renderer tests and a Compose parser check**
 
 Run: `.venv/bin/pytest -q tests/deployment/test_compose.py`
 
@@ -252,7 +252,7 @@ Expected: PASS.
 
 Run: `python -c 'import json; from pathlib import Path; json.loads(Path("/tmp/generated-compose.json").read_text())'` after rendering a fixture in the test, or use `docker compose -f <generated-file> config` when Docker is available.
 
-- [ ] **Step 5: Commit the renderer**
+- [x] **Step 5: Commit the renderer**
 
 ```bash
 git add loom_v2/deployment/compose.py tests/deployment/test_compose.py
@@ -265,7 +265,7 @@ git commit -m "feat: render per-role deployment compose projects"
 - Create: `loom_v2/deployment/remote.py`
 - Create: `tests/deployment/test_remote.py`
 
-- [ ] **Step 1: Write failing tests for command order, archive filtering, dry-run, and redacted failures**
+- [x] **Step 1: Write failing tests for command order, archive filtering, dry-run, and redacted failures**
 
 ```python
 from pathlib import Path
@@ -315,27 +315,27 @@ def test_command_failure_contains_phase_without_secret(tmp_path: Path):
     assert "internal-token" not in str(error.value)
 ```
 
-- [ ] **Step 2: Run the remote tests to verify they fail**
+- [x] **Step 2: Run the remote tests to verify they fail**
 
 Run: `.venv/bin/pytest -q tests/deployment/test_remote.py`
 
 Expected: FAIL with `ModuleNotFoundError: No module named 'loom_v2.deployment.remote'`.
 
-- [ ] **Step 3: Implement archive creation and safe command execution**
+- [x] **Step 3: Implement archive creation and safe command execution**
 
 Add `CommandResult`, `CommandRunner`, `SubprocessRunner`, `RecordingRunner`, `DeploymentPlan`, `DeploymentFailure`, and `RemoteDeployer`. Build SSH argument lists with `-p`, optional `-i`, `BatchMode=yes`, and `ConnectTimeout`; run remote shell commands only after quoting paths with `shlex.quote`. Create an in-memory gzip tar containing the source tree (excluding `.git`, `.venv`, `__pycache__`, `.pytest_cache`, `secrets`) plus generated Compose, `.env`, and secret files; set secret member modes to `0600`. Upload it by piping bytes to remote `tar -xzf -`, then run `docker compose -p <stable-project> -f docker-compose.yml build` and `up -d --remove-orphans` from the remote project directory. Apply bounded retries only to SSH failures. Redact configured secret values from diagnostics and dry-run previews.
 
-- [ ] **Step 4: Implement health polling and failure diagnostics**
+- [x] **Step 4: Implement health polling and failure diagnostics**
 
 Poll `http://<advertised-host>:<port>/healthz` for Observer, Driver, and Slave; poll MinIO's `/minio/health/live`. Use an injectable `healthcheck(url)` callable and a deadline/interval on `RemoteDeployer`. On timeout or nonzero command exit, raise `DeploymentFailure(machine, role, phase, command, returncode, stderr)` after collecting `docker compose ps` and `docker compose logs --tail=80` through the runner. Never run `docker compose down -v` or remove named volumes.
 
-- [ ] **Step 5: Run remote tests and refactor while green**
+- [x] **Step 5: Run remote tests and refactor while green**
 
 Run: `.venv/bin/pytest -q tests/deployment/test_remote.py`
 
 Expected: PASS with no warnings or errors from the new tests.
 
-- [ ] **Step 6: Commit the remote executor**
+- [x] **Step 6: Commit the remote executor**
 
 ```bash
 git add loom_v2/deployment/remote.py tests/deployment/test_remote.py
@@ -355,7 +355,7 @@ git commit -m "feat: deploy compose projects over ssh"
 - Create: `deploy/deployment.test.toml`
 - Create: `tests/deployment/test_cli.py`
 
-- [ ] **Step 1: Write failing dry-run CLI tests**
+- [x] **Step 1: Write failing dry-run CLI tests**
 
 ```python
 import subprocess
@@ -408,23 +408,23 @@ def test_slave_script_requires_known_slave_id(tmp_path: Path):
     assert "slave-c" in result.stderr
 ```
 
-- [ ] **Step 2: Run the CLI tests to verify they fail**
+- [x] **Step 2: Run the CLI tests to verify they fail**
 
 Run: `.venv/bin/pytest -q tests/deployment/test_cli.py`
 
 Expected: FAIL because the script entry points do not exist.
 
-- [ ] **Step 3: Implement shared CLI orchestration**
+- [x] **Step 3: Implement shared CLI orchestration**
 
 Implement `loom_v2.deployment.cli.main(argv, forced_target=None)` with `--config`, `--source-root` (default repository root), `--dry-run`, and optional `--id` for the Slave script. In cluster mode deploy machine names in MinIO → Observer → Slaves sorted by service ID → Driver order. In role mode select exactly the requested machine and still load the full topology for URL derivation. Print a redacted plan in dry-run mode; catch `DeploymentConfigError` and `DeploymentFailure`, print their stable diagnostic text to stderr, and return 2. Keep wrappers executable and add a small `sys.path` bootstrap so `python scripts/deploy_*.py` works from a source checkout.
 
-- [ ] **Step 4: Add the example TOML and CLI help text**
+- [x] **Step 4: Add the example TOML and CLI help text**
 
 Copy the approved schema into `deploy/deployment.example.toml`, including Observer, Driver, MinIO, and both Slave examples, comments for defaults, and secret-file paths. Add module docstrings/help text that state remote prerequisites (SSH, Docker Engine, Compose plugin, passwordless Docker).
 
 Add `deploy/deployment.test.toml` with all five projects on `9.0.3.9`, SSH user `root`, port `22`, and distinct published ports (`18080` Observer, `18090` Driver, `18081`/`18082` Slaves, `19000`/`19001` MinIO). It must use the same secret-file keys as the example and never contain secret values.
 
-- [ ] **Step 5: Run CLI tests and manual help/dry-run checks**
+- [x] **Step 5: Run CLI tests and manual help/dry-run checks**
 
 Run: `.venv/bin/pytest -q tests/deployment/test_cli.py`
 
@@ -434,7 +434,7 @@ Run: `python scripts/deploy_cluster.py --help` and confirm it exits 0.
 
 Run: `python scripts/deploy_cluster.py --config deploy/deployment.example.toml --dry-run` only after creating local example secret files; confirm output contains no secret values.
 
-- [ ] **Step 6: Commit the CLI layer and example**
+- [x] **Step 6: Commit the CLI layer and example**
 
 ```bash
 git add loom_v2/deployment/cli.py scripts/deploy_*.py deploy/deployment.example.toml tests/deployment/test_cli.py
@@ -447,7 +447,7 @@ git commit -m "feat: add cluster and role deployment commands"
 - Modify: `README.md`
 - Create: `tests/deployment/test_generated_compose.py`
 
-- [ ] **Step 1: Write a generated Compose validation test**
+- [x] **Step 1: Write a generated Compose validation test**
 
 ```python
 import json
@@ -465,17 +465,17 @@ def test_every_role_renderer_produces_parseable_compose(tmp_path: Path):
         assert all(name.replace("_", "").replace("-", "").isalnum() for name in document["services"])
 ```
 
-- [ ] **Step 2: Run it to confirm the complete renderer path**
+- [x] **Step 2: Run it to confirm the complete renderer path**
 
 Run: `.venv/bin/pytest -q tests/deployment/test_generated_compose.py`
 
 Expected: FAIL only if a renderer role is missing or emits invalid JSON.
 
-- [ ] **Step 3: Add concise README deployment instructions**
+- [x] **Step 3: Add concise README deployment instructions**
 
 Document prerequisites, secret-file creation, the example TOML, full-cluster command, independent role commands, dry-run behavior, expected public ports, and the fact that each Slave/Observer has a private PostgreSQL volume. Explain that the Driver needs the Docker socket and that generated URLs use each machine's `ssh_host`.
 
-- [ ] **Step 4: Run focused and repository verification commands**
+- [x] **Step 4: Run focused and repository verification commands**
 
 Run: `.venv/bin/pytest -q tests/deployment`
 
@@ -491,7 +491,7 @@ Expected: no whitespace errors.
 
 If Docker is available, render one project per role from a temporary fixture and run `docker compose -f <file> config`; otherwise record that this external verification was unavailable.
 
-- [ ] **Step 5: Review requirements against the approved spec and commit documentation**
+- [x] **Step 5: Review requirements against the approved spec and commit documentation**
 
 Check that every spec requirement has a corresponding test or implementation: TOML topology validation, per-Slave PostgreSQL isolation, generated cross-host URLs, source upload, role-specific Dockerfile selection, ordered startup, health diagnostics, idempotent volumes, redaction, dry-run, and independent scripts. Then commit:
 

@@ -55,4 +55,3 @@ ssh_user = "root"
 role = "slave"
 service_id = "slave-b"
 service_port = 18082
-

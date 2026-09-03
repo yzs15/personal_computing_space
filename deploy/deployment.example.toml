@@ -58,4 +58,3 @@ ssh_user = "ubuntu"
 role = "slave"
 service_id = "slave-b"
 service_port = 8082
-

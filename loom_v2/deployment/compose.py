@@ -15,17 +15,21 @@ class RenderedProject:
     """Files and preview text produced for one machine's Compose project."""
 
     machine: str
+    role: str
     project_name: str
     compose_text: str
     env_text: str
     secret_files: dict[str, str]
     model_catalog_file: Path | None
+    redaction_values: tuple[str, ...] = ()
 
     @property
     def redacted_preview(self) -> str:
         preview = f"{self.compose_text}\n{self.env_text}"
         for secret in self.secret_files.values():
             preview = preview.replace(secret, "<redacted>")
+        for value in self.redaction_values:
+            preview = preview.replace(value, "<redacted>")
         return preview
 
 
@@ -44,6 +48,7 @@ def render_project(config: DeploymentConfig, machine_name: str) -> RenderedProje
         raise ValueError(f"unsupported role: {machine.role}")
     return RenderedProject(
         machine=machine.name,
+        role=machine.role,
         project_name=project_name,
         compose_text=json.dumps(document, indent=2, sort_keys=True) + "\n",
         env_text=_env_text(env),
@@ -53,6 +58,7 @@ def render_project(config: DeploymentConfig, machine_name: str) -> RenderedProje
             "minio_secret_key": config.minio_secret_key,
         },
         model_catalog_file=config.driver.model_catalog_file if machine.role == "driver" else None,
+        redaction_values=(quote_password(config.postgres_password),),
     )
 
 
@@ -85,7 +91,7 @@ def _postgres_service(volume_name: str, database: str) -> dict[str, Any]:
 
 def _role_environment(config: DeploymentConfig, machine: MachineConfig, database_url: str) -> dict[str, str]:
     return {
-        "LOOM_DATABASE_URL": database_url.replace(quote_password(config.postgres_password), "${POSTGRES_PASSWORD}"),
+        "LOOM_DATABASE_URL": database_url.replace(quote_password(config.postgres_password), "${POSTGRES_PASSWORD_URLENCODED}"),
         "LOOM_S3_ACCESS_KEY": "${MINIO_ACCESS_KEY}",
         "LOOM_S3_BUCKET": "${LOOM_S3_BUCKET}",
         "LOOM_S3_ENDPOINT_URL": "${LOOM_S3_ENDPOINT_URL}",
@@ -154,6 +160,7 @@ def _render_slave(config: DeploymentConfig, machine: MachineConfig) -> tuple[dic
 
 def _render_driver(config: DeploymentConfig, machine: MachineConfig) -> tuple[dict[str, Any], dict[str, str]]:
     app = _base_service(config, machine, dockerfile="Dockerfile.driver")
+    app["build"]["args"] = {"CODEX_VERSION": config.driver.codex_version}
     environment = {
         "LOOM_AGENT_ID": "driver-default",
         "LOOM_CODEX_API_KEY_ENV": "OPENAI_API_KEY",
@@ -236,7 +243,7 @@ def _render_minio(config: DeploymentConfig, machine: MachineConfig) -> tuple[dic
             "LOOM_S3_BUCKET": "${LOOM_S3_BUCKET}",
         },
         "entrypoint": ["/bin/sh", "-c"],
-        "command": 'mc alias set loom http://minio:9000 "$${MINIO_ACCESS_KEY}" "$${MINIO_SECRET_KEY}" && mc mb --ignore-existing "loom/$${LOOM_S3_BUCKET}"',
+        "command": ['mc alias set loom http://minio:9000 "$${MINIO_ACCESS_KEY}" "$${MINIO_SECRET_KEY}" && mc mb --ignore-existing "loom/$${LOOM_S3_BUCKET}"'],
         "restart": "no",
     }
     document = {
@@ -254,6 +261,8 @@ def _render_minio(config: DeploymentConfig, machine: MachineConfig) -> tuple[dic
 def _common_env(config: DeploymentConfig, *, database_url: str) -> dict[str, str]:
     return {
         "LOOM_DATABASE_URL": database_url,
+        "POSTGRES_PASSWORD": config.postgres_password,
+        "POSTGRES_PASSWORD_URLENCODED": quote_password(config.postgres_password),
         "MINIO_ACCESS_KEY": config.minio_access_key,
         "MINIO_SECRET_KEY": config.minio_secret_key,
         "LOOM_S3_BUCKET": "loom-content",
@@ -278,4 +287,4 @@ def quote_password(password: str) -> str:
 
 
 def _project_name(cluster: str, machine: str) -> str:
-    return f"{cluster}-{machine}".lower().replace("_", "-")
+    return f"{cluster}-{machine}".lower().replace("_", "-").replace(".", "-")

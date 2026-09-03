@@ -77,6 +77,7 @@ class DeploymentConfig:
     minio_secret_key: str
     machines: tuple[MachineConfig, ...]
     driver: DriverConfig
+    secret_paths: tuple[Path, ...]
 
     @classmethod
     def from_file(cls, path: str | Path) -> "DeploymentConfig":
@@ -99,14 +100,19 @@ class DeploymentConfig:
             raise DeploymentConfigError("cluster table is required")
 
         name = _required_string(cluster, "name")
+        if not _NAME_RE.fullmatch(name):
+            raise DeploymentConfigError("cluster.name contains unsupported characters")
         remote_dir = _required_string(cluster, "remote_dir")
         if not remote_dir.startswith("/"):
             raise DeploymentConfigError("cluster.remote_dir must be absolute")
         workspace_id = _required_string(cluster, "workspace_id")
         base_dir = config_path.parent
-        internal_secret = _read_secret(base_dir, cluster.get("internal_secret_file"), "cluster.internal_secret_file")
-        postgres_password = _read_secret(base_dir, cluster.get("postgres_password_file"), "cluster.postgres_password_file")
-        minio_secret = _read_secret(base_dir, cluster.get("minio_secret_key_file"), "cluster.minio_secret_key_file")
+        internal_secret_path = _resolve_secret_path(base_dir, cluster.get("internal_secret_file"), "cluster.internal_secret_file")
+        postgres_password_path = _resolve_secret_path(base_dir, cluster.get("postgres_password_file"), "cluster.postgres_password_file")
+        minio_secret_path = _resolve_secret_path(base_dir, cluster.get("minio_secret_key_file"), "cluster.minio_secret_key_file")
+        internal_secret = _read_secret(internal_secret_path, "cluster.internal_secret_file")
+        postgres_password = _read_secret(postgres_password_path, "cluster.postgres_password_file")
+        minio_secret = _read_secret(minio_secret_path, "cluster.minio_secret_key_file")
         minio_access_key = cluster.get("minio_access_key", "loom")
         if not isinstance(minio_access_key, str) or not minio_access_key.strip():
             raise DeploymentConfigError("cluster.minio_access_key must be non-empty")
@@ -141,6 +147,8 @@ class DeploymentConfig:
             codex_provider=_optional_string(driver_raw, "codex_provider", DriverConfig.codex_provider),
             codex_wire_api=_optional_string(driver_raw, "codex_wire_api", DriverConfig.codex_wire_api),
         )
+        if not driver.workspace_path.startswith("/"):
+            raise DeploymentConfigError("driver.workspace_path must be absolute")
         return cls(
             config_path=config_path,
             name=name,
@@ -152,6 +160,7 @@ class DeploymentConfig:
             minio_secret_key=minio_secret,
             machines=machines,
             driver=driver,
+            secret_paths=(internal_secret_path, postgres_password_path, minio_secret_path),
         )
 
     def machine(self, name_or_role: str) -> MachineConfig:
@@ -174,7 +183,7 @@ class DeploymentConfig:
             driver=driver.endpoint_url,
             minio=minio.endpoint_url,
             minio_console=(
-                f"http://{minio.advertised_host}:{minio.console_port}"
+                f"http://{_url_host(minio.advertised_host)}:{minio.console_port}"
                 if minio.console_port is not None
                 else minio.endpoint_url
             ),
@@ -184,7 +193,13 @@ class DeploymentConfig:
     def database_url(self, machine: MachineConfig) -> str:
         if machine.role not in {"observer", "slave"}:
             raise DeploymentConfigError(f"database is not defined for role: {machine.role}")
-        db_name = "loom_observer" if machine.role == "observer" else f"loom_{machine.service_id.replace('-', '_')}"
+        if machine.role == "observer":
+            db_name = "loom_observer"
+        else:
+            service_id = machine.service_id
+            if service_id is None:  # defensive guard for callers constructing MachineConfig directly
+                raise DeploymentConfigError("slave service_id is required for database URL")
+            db_name = f"loom_{service_id.replace('-', '_')}"
         return f"postgresql+asyncpg://loom:{quote(self.postgres_password, safe='')}@postgres:5432/{db_name}"
 
 
@@ -202,15 +217,19 @@ def _optional_string(table: dict[str, Any], field: str, default: str) -> str:
     return value.strip()
 
 
-def _read_secret(base_dir: Path, raw_path: Any, field: str) -> str:
+def _resolve_secret_path(base_dir: Path, raw_path: Any, field: str) -> Path:
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise DeploymentConfigError(f"{field} is required")
     path = Path(raw_path).expanduser()
     if not path.is_absolute():
         path = base_dir / path
+    return path.resolve()
+
+
+def _read_secret(path: Path, field: str) -> str:
     try:
         value = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise DeploymentConfigError(f"{field} cannot be read: {path}") from exc
     value = value.strip()
     if not value or "\n" in value or "\r" in value:
@@ -226,6 +245,10 @@ def _parse_machine(raw: Any) -> MachineConfig:
         raise DeploymentConfigError(f"machines.{name}.name contains unsupported characters")
     host = _required_string(raw, "ssh_host")
     user = _required_string(raw, "ssh_user")
+    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in host):
+        raise DeploymentConfigError(f"machines.{name}.ssh_host must not contain whitespace or control characters")
+    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in user):
+        raise DeploymentConfigError(f"machines.{name}.ssh_user must not contain whitespace or control characters")
     role = _required_string(raw, "role").lower()
     if role not in _ROLES:
         raise DeploymentConfigError(f"machines.{name}.role must be one of {sorted(_ROLES)}")
@@ -264,10 +287,21 @@ def _port(value: Any, field: str) -> int:
     return value
 
 
+def _url_host(host: str) -> str:
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
+def _compose_component(value: str) -> str:
+    return value.lower().replace("_", "-").replace(".", "-")
+
+
 def _validate_topology(machines: tuple[MachineConfig, ...]) -> None:
     names = [item.name for item in machines]
     if len(names) != len(set(names)):
         raise DeploymentConfigError("machine names must be unique")
+    normalized_names = [_compose_component(name) for name in names]
+    if len(normalized_names) != len(set(normalized_names)):
+        raise DeploymentConfigError("project names must be unique")
     for role in ("minio", "driver", "observer"):
         if sum(item.role == role for item in machines) != 1:
             raise DeploymentConfigError(f"exactly one {role} machine is required")

@@ -28,6 +28,7 @@ def test_observer_project_contains_private_postgres_and_public_port(tmp_path: Pa
         "postgresql+asyncpg://loom:"
     )
     assert document["services"]["postgres"]["volumes"] == ["observer-postgres-data:/var/lib/postgresql/data"]
+    assert "POSTGRES_PASSWORD='pg-password'" in project.env_text
     assert project.secret_files["internal_api_secret"] == "internal-token"
 
 
@@ -49,6 +50,7 @@ def test_driver_project_wires_all_remote_services_and_docker_socket(tmp_path: Pa
     assert environment["LOOM_DRIVER_URL"] == "http://10.0.0.12:8090"
     assert environment["LOOM_SLAVE_A_URL"] == "http://10.0.0.13:8081"
     assert environment["LOOM_S3_ENDPOINT_URL"] == "${LOOM_S3_ENDPOINT_URL}"
+    assert document["services"]["driver"]["build"]["args"] == {"CODEX_VERSION": "0.151.0"}
     assert document["services"]["driver"]["volumes"][-1] == "/var/run/docker.sock:/var/run/docker.sock"
     assert "pg-password" not in project.redacted_preview
     assert "internal-token" not in project.redacted_preview
@@ -60,7 +62,8 @@ def test_minio_project_contains_bucket_initializer(tmp_path: Path):
 
     assert set(document["services"]) == {"minio", "minio-init"}
     assert document["services"]["minio"]["ports"] == ["9000:9000", "9001:9001"]
-    assert "mc mb --ignore-existing" in document["services"]["minio-init"]["command"]
+    assert isinstance(document["services"]["minio-init"]["command"], list)
+    assert "mc mb --ignore-existing" in document["services"]["minio-init"]["command"][0]
 
 
 def test_slave_advertises_cross_host_endpoint_to_observer(tmp_path: Path):
@@ -68,3 +71,20 @@ def test_slave_advertises_cross_host_endpoint_to_observer(tmp_path: Path):
     environment = json.loads(project.compose_text)["services"]["slave"]["environment"]
 
     assert environment["LOOM_SLAVE_ENDPOINT_URL"] == "http://10.0.0.13:8081"
+
+
+def test_database_url_uses_url_encoded_password_variable(tmp_path: Path):
+    for filename, value in {
+        "internal.secret": "internal-token",
+        "postgres.secret": "p@ss/word",
+        "minio.secret": "minio-password",
+    }.items():
+        write_secret(tmp_path / filename, value)
+    path = tmp_path / "deployment.toml"
+    path.write_text(config_text(), encoding="utf-8")
+    project = render_project(DeploymentConfig.from_file(path), "observer")
+    document = json.loads(project.compose_text)
+
+    assert document["services"]["observer"]["environment"]["LOOM_DATABASE_URL"] == "postgresql+asyncpg://loom:${POSTGRES_PASSWORD_URLENCODED}@postgres:5432/loom_observer"
+    assert "POSTGRES_PASSWORD_URLENCODED='p%40ss%2Fword'" in project.env_text
+    assert "p%40ss%2Fword" not in project.redacted_preview

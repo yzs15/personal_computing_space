@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from io import BytesIO
+import json
 import shlex
 from pathlib import Path
 import subprocess
@@ -46,6 +47,8 @@ class SubprocessRunner:
             )
         except subprocess.TimeoutExpired as exc:
             return CommandResult(124, exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else str(exc.stdout or ""), "command timed out")
+        except OSError as exc:
+            return CommandResult(127, stderr=str(exc))
         return CommandResult(
             result.returncode,
             result.stdout.decode(errors="replace"),
@@ -88,6 +91,7 @@ class DeploymentFailure(RuntimeError):
         command: str,
         returncode: int | None = None,
         stderr: str = "",
+        diagnostics: str = "",
     ) -> None:
         self.machine = machine
         self.role = role
@@ -95,9 +99,18 @@ class DeploymentFailure(RuntimeError):
         self.command = command
         self.returncode = returncode
         self.stderr = stderr
-        status = f" (exit {returncode})" if returncode is not None else ""
-        detail = f": {stderr.strip()}" if stderr.strip() else ""
-        super().__init__(f"{machine} ({role}) {phase} failed{status}{detail}")
+        self.diagnostics = diagnostics
+        self.args = (self._message(),)
+
+    def _message(self) -> str:
+        status = f" (exit {self.returncode})" if self.returncode is not None else ""
+        detail = f": {self.stderr.strip()}" if self.stderr.strip() else ""
+        command = f" command={self.command}" if self.command else ""
+        diagnostics = f" diagnostics={self.diagnostics}" if self.diagnostics else ""
+        return f"{self.machine} ({self.role}) {self.phase} failed{status}{command}{detail}{diagnostics}"
+
+    def __str__(self) -> str:
+        return self._message()
 
 
 Healthcheck = Callable[[str], bool]
@@ -138,13 +151,19 @@ class RemoteDeployer:
                 plan.commands,
             )
 
-        archive = _make_archive(self.source_root, project)
+        archive = _make_archive(self.source_root, project, self.config)
         compose = _compose_command(remote_dir, project.project_name)
         self._run_checked(machine, "prepare", commands[0], [*self._ssh_args(machine), _mkdir_command(remote_dir)], input_bytes=None)
         self._run_checked(machine, "upload", commands[1], [*self._ssh_args(machine), _extract_command(remote_dir)], input_bytes=archive)
         self._run_checked(machine, "build", commands[2], [*self._ssh_args(machine), compose + " build"], input_bytes=None)
         self._run_checked(machine, "start", commands[3], [*self._ssh_args(machine), compose + " up -d --remove-orphans"], input_bytes=None)
-        self._wait_for_health(machine)
+        if machine.role == "minio":
+            self._run_checked(machine, "minio-init", commands[4], [*self._ssh_args(machine), compose + " wait minio-init"], input_bytes=None)
+        try:
+            self._wait_for_health(machine)
+        except DeploymentFailure as failure:
+            failure.diagnostics = self._collect_diagnostics(machine, "health")
+            raise
         return plan
 
     def _commands(self, machine: MachineConfig, project: RenderedProject, remote_dir: str) -> list[str]:
@@ -153,12 +172,15 @@ class RemoteDeployer:
         mkdir = _mkdir_command(remote_dir)
         extract = _extract_command(remote_dir)
         compose = _compose_command(remote_dir, project.project_name)
-        return [
+        commands = [
             f"{target} {shlex.quote(mkdir)}",
             f"{target} {shlex.quote(extract)}",
             f"{target} {shlex.quote(compose + ' build')}",
             f"{target} {shlex.quote(compose + ' up -d --remove-orphans')}",
         ]
+        if machine.role == "minio":
+            commands.append(f"{target} {shlex.quote(compose + ' wait minio-init')}")
+        return commands
 
     def _ssh_args(self, machine: MachineConfig) -> list[str]:
         args = ["ssh", "-p", str(machine.ssh_port), "-o", "BatchMode=yes", "-o", f"ConnectTimeout={int(self.command_timeout)}"]
@@ -186,8 +208,7 @@ class RemoteDeployer:
                 break
         if result.returncode != 0:
             stderr = _redact(result.stderr, self.config)
-            if phase in {"build", "start"}:
-                self._collect_diagnostics(machine, phase)
+            diagnostics = self._collect_diagnostics(machine, phase) if phase in {"prepare", "upload", "build", "start", "minio-init"} else ""
             raise DeploymentFailure(
                 machine=machine.name,
                 role=machine.role,
@@ -195,18 +216,25 @@ class RemoteDeployer:
                 command=_redact(display_command, self.config),
                 returncode=result.returncode,
                 stderr=stderr,
+                diagnostics=diagnostics,
             )
         return result
 
-    def _collect_diagnostics(self, machine: MachineConfig, phase: str) -> None:
+    def _collect_diagnostics(self, machine: MachineConfig, phase: str) -> str:
         try:
             remote_dir = f"{self.config.remote_dir.rstrip('/')}/{machine.name}"
             project = render_project(self.config, machine.name)
             compose = _compose_command(remote_dir, project.project_name)
+            records: list[str] = []
             for suffix in (" ps", " logs --tail=80"):
-                self.runner.run([*self._ssh_args(machine), compose + suffix], timeout=self.command_timeout)
+                command = compose + suffix
+                result = self.runner.run([*self._ssh_args(machine), command], timeout=self.command_timeout)
+                output = _redact((result.stdout + "\n" + result.stderr).strip(), self.config)
+                safe_command = _redact(command, self.config)
+                records.append(f"$ {safe_command} (exit {result.returncode}){': ' + output if output else ''}")
+            return "; ".join(records)
         except Exception:
-            return
+            return f"diagnostic collection unavailable during {phase}"
 
     def _wait_for_health(self, machine: MachineConfig) -> None:
         path = "/minio/health/live" if machine.role == "minio" else "/healthz"
@@ -229,29 +257,47 @@ class RemoteDeployer:
             time.sleep(self.health_interval)
 
 
-def _make_archive(source_root: Path, project: RenderedProject) -> bytes:
+def _make_archive(source_root: Path, project: RenderedProject, config: DeploymentConfig) -> bytes:
     payload = BytesIO()
     with tarfile.open(fileobj=payload, mode="w:gz") as archive:
         if source_root.exists():
             for path in sorted(source_root.rglob("*")):
                 relative = path.relative_to(source_root)
-                if _excluded(relative, path):
+                if _excluded(relative, path, config):
                     continue
                 if path.is_file():
                     archive.add(path, arcname=Path("source") / relative, recursive=False)
         _add_bytes(archive, "docker-compose.yml", project.compose_text.encode("utf-8"), 0o644)
         _add_bytes(archive, ".env", project.env_text.encode("utf-8"), 0o600)
+        allowed = {
+            "minio": {"minio_secret_key"},
+            "driver": {"internal_api_secret", "minio_secret_key"},
+            "observer": {"internal_api_secret", "postgres_password", "minio_secret_key"},
+            "slave": {"internal_api_secret", "postgres_password", "minio_secret_key"},
+        }[project.role]
         for filename, content in project.secret_files.items():
+            if filename not in allowed:
+                continue
             _add_bytes(archive, Path("secrets") / filename, content.encode("utf-8"), 0o600)
         if project.model_catalog_file is not None:
             _add_bytes(archive, "model_catalog.json", project.model_catalog_file.read_bytes(), 0o644)
     return payload.getvalue()
 
 
-def _excluded(relative: Path, path: Path) -> bool:
+def _excluded(relative: Path, path: Path, config: DeploymentConfig) -> bool:
     if any(part in {".git", ".venv", "__pycache__", ".pytest_cache", "secrets"} for part in relative.parts):
         return True
-    return path.name == "deployment.toml" or path.name.endswith((".secret", ".key", ".pem"))
+    try:
+        if path.resolve() in config.secret_paths or path.resolve() == config.config_path:
+            return True
+    except OSError:
+        return True
+    return (
+        path.name == ".env"
+        or path.name.startswith(".env.")
+        or path.name == "deployment.toml"
+        or path.name.endswith((".secret", ".key", ".pem"))
+    )
 
 
 def _add_bytes(archive: tarfile.TarFile, name: str | Path, content: bytes, mode: int) -> None:
@@ -267,7 +313,8 @@ def _mkdir_command(remote_dir: str) -> str:
 
 
 def _extract_command(remote_dir: str) -> str:
-    return f"tar -xzf - -C {shlex.quote(remote_dir)}"
+    quoted = shlex.quote(remote_dir)
+    return f"tar -xzf - -C {quoted} && chmod 600 {quoted}/.env {quoted}/secrets/*"
 
 
 def _compose_command(remote_dir: str, project_name: str) -> str:
@@ -276,11 +323,33 @@ def _compose_command(remote_dir: str, project_name: str) -> str:
 
 def _http_healthcheck(url: str) -> bool:
     with urlopen(url, timeout=5) as response:
-        return 200 <= response.status < 300
+        if not 200 <= response.status < 300:
+            return False
+        # Loom role health endpoints return {"ok": bool}.  A successful HTTP
+        # status alone is insufficient while Driver/Slave are still waiting
+        # for their Observer lease or registration.  Keep status-only checks
+        # for MinIO's plain-text health endpoint.
+        body = response.read()
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            return True
+        if isinstance(payload, dict) and isinstance(payload.get("ok"), bool):
+            return payload["ok"]
+        return True
 
 
 def _redact(value: str, config: DeploymentConfig) -> str:
-    for secret in (config.internal_api_secret, config.postgres_password, config.minio_secret_key):
+    from urllib.parse import quote
+
+    secrets = (
+        config.internal_api_secret,
+        config.postgres_password,
+        config.minio_secret_key,
+        quote(config.postgres_password, safe=""),
+        quote(config.minio_secret_key, safe=""),
+    )
+    for secret in secrets:
         if secret:
             value = value.replace(secret, "<redacted>")
     return value
