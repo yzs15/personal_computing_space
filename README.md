@@ -37,6 +37,40 @@ chmod 600 secrets/internal_api_secret
 ./scripts/dev-up.sh
 ```
 
+For a multi-host deployment, copy `deploy/deployment.example.toml` and create
+the three local secret files it references (`internal_api_secret`,
+`postgres_password`, and `minio_secret_key`). Each `[[machines]]` entry names
+one SSH target and one role. The control machine uploads the repository,
+builds the existing Dockerfile remotely, and starts a Compose project on that
+host:
+
+```bash
+python scripts/deploy_cluster.py --config deploy/deployment.example.toml --dry-run
+python scripts/deploy_cluster.py --config deploy/deployment.example.toml
+```
+
+The target host must have Docker Engine, the Docker Compose plugin, and
+passwordless Docker access for the configured SSH user. Observer and each
+Slave are deployed together with their own private PostgreSQL container and
+persistent volume. MinIO has its own data volume; Driver has no database and
+requires access to the Docker socket for orchestration sandboxes. Generated
+URLs use each machine's `ssh_host` and published service port, so machines
+must be mutually reachable.
+
+Roles can be upgraded independently without editing generated endpoints:
+
+```bash
+python scripts/deploy_observer.py --config deploy/deployment.example.toml
+python scripts/deploy_slave.py --config deploy/deployment.example.toml --id slave-a
+python scripts/deploy_driver.py --config deploy/deployment.example.toml
+python scripts/deploy_minio.py --config deploy/deployment.example.toml
+```
+
+`deploy/deployment.test.toml` is a single-host smoke topology for the two
+Slaves, Observer, Driver, and MinIO. It uses SSH `root@9.0.3.9:22` and distinct
+published ports (`18080`/`18090`/`18081`/`18082` for the application roles and
+`19000`/`19001` for MinIO), allowing all projects to run on that test host.
+
 Observer is the only public API entry point at `http://localhost:18080`; Driver
 and both Slaves stay on the private Compose network. Driver owns the Codex CLI, Docker CLI and Docker socket. Codex state is
 kept in the `driver-codex-state` named volume. The default Codex base URL is
