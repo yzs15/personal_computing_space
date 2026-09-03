@@ -46,3 +46,23 @@ def test_slave_script_requires_known_slave_id(tmp_path: Path):
 
     assert result.returncode != 0
     assert "slave-c" in result.stderr
+
+
+def test_cli_rejects_non_finite_timeout(tmp_path: Path):
+    for filename, value in {
+        "internal.secret": "internal-token",
+        "postgres.secret": "pg-password",
+        "minio.secret": "minio-password",
+    }.items():
+        write_secret(tmp_path / filename, value)
+    config = tmp_path / "deployment.toml"
+    config.write_text(config_text(), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, "scripts/deploy_cluster.py", "--config", str(config), "--health-timeout", "nan", "--dry-run"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "greater than zero" in result.stderr

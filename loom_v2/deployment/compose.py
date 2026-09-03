@@ -64,9 +64,7 @@ def render_project(config: DeploymentConfig, machine_name: str) -> RenderedProje
 
 def _base_service(config: DeploymentConfig, machine: MachineConfig, *, dockerfile: str) -> dict[str, Any]:
     return {
-        # The test host's Docker bridge DNS cannot resolve package mirrors;
-        # host networking is needed only while apt/pip/npm build dependencies.
-        "build": {"context": "./source", "dockerfile": dockerfile, "network": "host"},
+        "build": {"context": "./source", "dockerfile": dockerfile, "network": config.build_network},
         "image": f"{_project_name(config.name, machine.name)}-{machine.role}",
         "restart": "unless-stopped",
     }

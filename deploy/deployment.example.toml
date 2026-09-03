@@ -5,6 +5,9 @@
 name = "loom-prod"
 remote_dir = "/opt/loom-v2"
 workspace_id = "workspace-default"
+# Optional Dockerfile build network: default, host, or none. Use host only
+# when the target Docker bridge cannot resolve package mirrors.
+build_network = "default"
 internal_secret_file = "../secrets/internal_api_secret"
 postgres_password_file = "../secrets/postgres_password"
 minio_access_key = "loom"

@@ -78,6 +78,7 @@ class DeploymentConfig:
     machines: tuple[MachineConfig, ...]
     driver: DriverConfig
     secret_paths: tuple[Path, ...]
+    build_network: str = "default"
 
     @classmethod
     def from_file(cls, path: str | Path) -> "DeploymentConfig":
@@ -106,6 +107,9 @@ class DeploymentConfig:
         if not remote_dir.startswith("/"):
             raise DeploymentConfigError("cluster.remote_dir must be absolute")
         workspace_id = _required_string(cluster, "workspace_id")
+        build_network = cluster.get("build_network", "default")
+        if not isinstance(build_network, str) or build_network not in {"default", "host", "none"}:
+            raise DeploymentConfigError("cluster.build_network must be one of default, host, none")
         base_dir = config_path.parent
         internal_secret_path = _resolve_secret_path(base_dir, cluster.get("internal_secret_file"), "cluster.internal_secret_file")
         postgres_password_path = _resolve_secret_path(base_dir, cluster.get("postgres_password_file"), "cluster.postgres_password_file")
@@ -161,6 +165,7 @@ class DeploymentConfig:
             machines=machines,
             driver=driver,
             secret_paths=(internal_secret_path, postgres_password_path, minio_secret_path),
+            build_network=build_network,
         )
 
     def machine(self, name_or_role: str) -> MachineConfig:

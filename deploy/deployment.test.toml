@@ -4,6 +4,7 @@
 name = "loom-test"
 remote_dir = "/opt/loom-v2-test"
 workspace_id = "workspace-default"
+build_network = "host"
 internal_secret_file = "../secrets/internal_api_secret"
 postgres_password_file = "../secrets/postgres_password"
 minio_access_key = "loom"

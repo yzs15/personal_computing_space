@@ -52,6 +52,7 @@ The supported file format is TOML:
 name = "loom-prod"
 remote_dir = "/opt/loom-v2"
 workspace_id = "workspace-default"
+build_network = "default" # optional: default, host, or none for Dockerfile build steps; host only when bridge DNS is unavailable
 internal_secret_file = "secrets/internal_api_secret"
 postgres_password_file = "secrets/postgres_password"
 minio_access_key = "loom"

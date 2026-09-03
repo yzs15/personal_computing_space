@@ -164,6 +164,7 @@ class RemoteDeployer:
             self._wait_for_health(machine)
         except DeploymentFailure as failure:
             failure.diagnostics = self._collect_diagnostics(machine, "health")
+            failure.args = (failure._message(),)
             raise
         return plan
 

@@ -181,3 +181,13 @@ def test_rejects_invalid_secret_encoding_and_ssh_control_characters(tmp_path: Pa
     path.write_text(config_text().replace('ssh_host = "10.0.0.10"', 'ssh_host = "10.0.0.10\\nmalicious"'), encoding="utf-8")
     with pytest.raises(DeploymentConfigError, match="ssh_host must not contain"):
         DeploymentConfig.from_file(path)
+
+
+def test_rejects_unknown_build_network(tmp_path: Path):
+    for filename in ("internal.secret", "postgres.secret", "minio.secret"):
+        write_secret(tmp_path / filename, "secret")
+    path = tmp_path / "deployment.toml"
+    path.write_text(config_text().replace('[cluster]', '[cluster]\nbuild_network = "bridge"'), encoding="utf-8")
+
+    with pytest.raises(DeploymentConfigError, match="cluster.build_network"):
+        DeploymentConfig.from_file(path)
