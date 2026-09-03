@@ -135,6 +135,7 @@ def _render_slave(config: DeploymentConfig, machine: MachineConfig) -> tuple[dic
             "environment": {
                 **_role_environment(config, machine, config.database_url(machine)),
                 "LOOM_OBSERVER_URL": config.urls.observer,
+                "LOOM_SLAVE_ENDPOINT_URL": machine.endpoint_url,
             },
             "ports": [f"{machine.service_port}:8080"],
             "secrets": ["internal_api_secret"],
@@ -202,6 +203,7 @@ def _render_driver(config: DeploymentConfig, machine: MachineConfig) -> tuple[di
         "MINIO_ACCESS_KEY": config.minio_access_key,
         "MINIO_SECRET_KEY": config.minio_secret_key,
         "LOOM_S3_BUCKET": "loom-content",
+        "LOOM_S3_ENDPOINT_URL": config.urls.minio,
     }
     return document, env
 

@@ -48,6 +48,7 @@ def test_driver_project_wires_all_remote_services_and_docker_socket(tmp_path: Pa
     assert environment["LOOM_OBSERVER_URL"] == "http://10.0.0.11:8080"
     assert environment["LOOM_DRIVER_URL"] == "http://10.0.0.12:8090"
     assert environment["LOOM_SLAVE_A_URL"] == "http://10.0.0.13:8081"
+    assert environment["LOOM_S3_ENDPOINT_URL"] == "${LOOM_S3_ENDPOINT_URL}"
     assert document["services"]["driver"]["volumes"][-1] == "/var/run/docker.sock:/var/run/docker.sock"
     assert "pg-password" not in project.redacted_preview
     assert "internal-token" not in project.redacted_preview
@@ -60,3 +61,10 @@ def test_minio_project_contains_bucket_initializer(tmp_path: Path):
     assert set(document["services"]) == {"minio", "minio-init"}
     assert document["services"]["minio"]["ports"] == ["9000:9000", "9001:9001"]
     assert "mc mb --ignore-existing" in document["services"]["minio-init"]["command"]
+
+
+def test_slave_advertises_cross_host_endpoint_to_observer(tmp_path: Path):
+    project = render_project(make_config(tmp_path), "worker-a")
+    environment = json.loads(project.compose_text)["services"]["slave"]["environment"]
+
+    assert environment["LOOM_SLAVE_ENDPOINT_URL"] == "http://10.0.0.13:8081"
