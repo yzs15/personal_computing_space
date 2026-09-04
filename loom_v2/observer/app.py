@@ -81,7 +81,13 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         app.state.repo.orchestrator_runtime_available = True
     if not legacy_embedded:
         app.state.repo.slave_capabilities.clear()
-        app.state.repo.slave_availability.clear()
+        app.state.repo.slave_agents.clear()
+        app.state.repo.slave_instances.clear()
+        app.state.repo.agents = {
+            key: value
+            for key, value in app.state.repo.agents.items()
+            if not str(value.get("instance_id") or "").startswith("embedded-")
+        }
     if legacy_embedded:
         from loom_v2.coding_agents.codex import CodexAppServerProvider
         from loom_v2.coding_agents.fake import FakeCodingAgentProvider
@@ -520,7 +526,8 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
 
     @app.get("/api/v1/capabilities")
     async def capabilities() -> list[dict[str, Any]]:
-        registered = await app.state.repo.list_agents(settings.workspace_id, role="slave")
+        await app.state.repo.refresh_slaves(settings.workspace_id)
+        registered = list(app.state.repo.slave_agents.values())
         if registered:
             records = await app.state.repo._all_records()
             result: list[dict[str, Any]] = []
@@ -644,18 +651,6 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="capability_package_not_found") from exc
         return package.model_dump(mode="json")
-
-    @app.post("/api/v1/slaves/{slave_id}/availability")
-    async def set_slave_availability(slave_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        available = bool(payload.get("available", True))
-        await app.state.repo.set_slave_availability(slave_id, available)
-        if slave_id in app.state.slaves:
-            app.state.slaves[slave_id].available = available
-        return {"slave_id": slave_id, "available": available}
-
-    @app.post("/api/v1/runs/{run_id}/reconcile")
-    async def reconcile(run_id: str) -> dict[str, Any]:
-        return _run_view(await app.state.repo.reconcile(run_id))
 
     @app.get("/")
     async def home() -> FileResponse:

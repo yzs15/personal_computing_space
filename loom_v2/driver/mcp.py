@@ -153,12 +153,13 @@ class DriverMCP:
         if self.control is not None:
             result = await self.control.command("capability.list", {})
             return {"workspace_id": self.workspace_id, "capabilities": result.get("capabilities", []), "packages": result.get("packages", [])}
+        await self.repository.refresh_slaves(self.workspace_id)
         return {
             "workspace_id": self.workspace_id,
             "capabilities": [
                 {
                     "resource_id": resource_id,
-                    "available": self.repository.slave_availability.get(resource_id, False),
+                    "available": self.repository._slave_is_active(resource_id),
                     "operations": sorted(details.get("operations", set())),
                 }
                 for resource_id, details in sorted(self.repository.slave_capabilities.items())

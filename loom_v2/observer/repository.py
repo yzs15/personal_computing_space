@@ -115,6 +115,21 @@ RUN_TRANSITIONS: dict[str, dict[str, str]] = {
 }
 
 
+def _select_slave_agents(agents: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    selected: dict[str, dict[str, Any]] = {}
+    for agent in agents:
+        slave_id = str(agent.get("agent_id") or "")
+        if not slave_id:
+            continue
+        current = selected.get(slave_id)
+        if current is None or (
+            agent.get("lease_state") == "active"
+            and current.get("lease_state") != "active"
+        ):
+            selected[slave_id] = dict(agent)
+    return selected
+
+
 def _transition(record: RunRecord, event: str, *, reason: Any | None = None) -> str:
     current = record.state
     target = RUN_TRANSITIONS.get(current, {}).get(event)
@@ -177,11 +192,9 @@ class ObserverRepository:
     ) -> None:
         self.runs: dict[str, RunRecord] = {}
         self.idempotency: dict[str, PatchReceipt] = {}
-        self.slave_availability: dict[str, bool] = {"slave-a": True, "slave-b": True}
-        self.slave_capabilities: dict[str, dict[str, Any]] = {
-            "slave-a": {"operations": {"echo", "hash", "sort", "run_code"}},
-            "slave-b": {"operations": {"echo", "hash", "sort", "run_code"}},
-        }
+        self.slave_agents: dict[str, dict[str, Any]] = {}
+        self.slave_instances: dict[tuple[str, str], dict[str, Any]] = {}
+        self.slave_capabilities: dict[str, dict[str, Any]] = {}
         self.engine = engine
         self.sessions = make_session_factory(engine) if engine is not None else None
         if content_store is None:
@@ -201,6 +214,36 @@ class ObserverRepository:
         # (the hermetic test profile) and mirrored to Observer PostgreSQL when
         # one is available. Lease ids are never persisted in plaintext.
         self.agents: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        if engine is None:
+            from loom_v2.slave.service import SlaveService
+
+            now = datetime.now(timezone.utc)
+            for slave_id in ("slave-a", "slave-b"):
+                embedded_slave = SlaveService(slave_id, content_store=self.content_store)
+                instance_id = f"embedded-{slave_id}"
+                self.agents[("workspace-default", "slave", slave_id, instance_id)] = {
+                    "workspace_id": "workspace-default",
+                    "role": "slave",
+                    "agent_id": slave_id,
+                    "instance_id": instance_id,
+                    "endpoint_url": f"http://{slave_id}",
+                    "protocol_version": "loom.v1",
+                    "capabilities": {
+                        "operations": sorted(embedded_slave.supported_operations),
+                        "executor_descriptors": [
+                            descriptor.kind for descriptor in embedded_slave.executor_registry.descriptors()
+                        ],
+                        "term_support": [item.model_dump(mode="json") for item in embedded_slave.term_support()],
+                    },
+                    "epoch": 1,
+                    "lease_id_hash": "",
+                    "lease_state": "active",
+                    "last_seen_at": now,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            seeded = [dict(item) for item in self.agents.values()]
+            self._store_slave_snapshot(seeded)
         self.driver_threads: dict[tuple[str, str], DriverThreadBinding] = {}
         self._driver_requests: dict[tuple[str, str], dict[str, Any]] = {}
         self._driver_request_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -943,27 +986,32 @@ class ObserverRepository:
                     })
                 if expired:
                     await session.commit()
-        if role == "slave":
-            selected: dict[str, dict[str, Any]] = {}
-            for row in rows:
-                agent_id = str(row["agent_id"])
-                current = selected.get(agent_id)
-                if current is None or (
-                    row.get("lease_state") == "active"
-                    and current.get("lease_state") != "active"
-                ):
-                    selected[agent_id] = row
-            for agent_id, row in selected.items():
-                capabilities = row.get("capabilities") or {}
-                self.slave_capabilities[agent_id] = {
-                    **capabilities,
-                    "operations": set(capabilities.get("operations", [])),
-                }
-                self.slave_availability[agent_id] = row.get("lease_state") == "active"
         for row in rows:
             if hasattr(row.get("last_seen_at"), "isoformat"):
                 row["last_seen_at"] = row["last_seen_at"].isoformat()
         return rows
+
+    def _store_slave_snapshot(self, agents: list[dict[str, Any]]) -> None:
+        self.slave_instances = {
+            (str(agent.get("agent_id") or ""), str(agent.get("instance_id") or "")): dict(agent)
+            for agent in agents
+            if agent.get("agent_id")
+        }
+        self.slave_agents = _select_slave_agents(agents)
+        self.slave_capabilities = {}
+        for slave_id, agent in self.slave_agents.items():
+            if agent.get("lease_state") != "active":
+                continue
+            capabilities = dict(agent.get("capabilities") or {})
+            self.slave_capabilities[slave_id] = {
+                **capabilities,
+                "operations": set(capabilities.get("operations", [])),
+            }
+
+    async def refresh_slaves(self, workspace_id: str | None = None) -> list[dict[str, Any]]:
+        agents = await self.list_agents(workspace_id or "workspace-default", role="slave")
+        self._store_slave_snapshot(agents)
+        return agents
 
     async def bind_thread(self, binding: DriverThreadBinding) -> dict[str, Any]:
         existing_thread = next(
@@ -1069,7 +1117,7 @@ class ObserverRepository:
             "run.readiness", "run.recovery.list", "run.recovery.mark", "message.append", "message.claim", "message.update", "message.release", "agent_signal.record",
             "run.result",
             "thread.bind", "thread.get", "turn.state", "capability.list", "capability.get", "capability.health",
-            "node.accept", "node.dispatch", "node.result", "node.fail",
+            "node.accept", "node.dispatch", "node.reassign", "node.result", "node.fail",
         }
         if command.command not in allowed:
             raise ValueError("driver_command_not_allowed")
@@ -1109,7 +1157,7 @@ class ObserverRepository:
         run_scoped_commands = {
             "run.get", "run.begin", "run.patch", "run.commit", "run.start", "run.close", "run.cancel", "run.fail", "run.resolve",
             "run.readiness", "message.append", "agent_signal.record", "capability.health",
-            "node.accept", "node.dispatch", "node.result", "node.fail",
+            "node.accept", "node.dispatch", "node.reassign", "node.result", "node.fail",
         }
         if command.command in run_scoped_commands and args.get("run_id") is not None:
             try:
@@ -1223,7 +1271,8 @@ class ObserverRepository:
         elif command.command == "capability.list":
             if args.get("run_id") is not None:
                 await self._assert_run_workspace(str(args["run_id"]), workspace_id)
-            slave_agents = await self.list_agents(workspace_id, role="slave")
+            await self.refresh_slaves(workspace_id)
+            slave_agents = list(self.slave_agents.values())
             capabilities = [
                 {
                     "resource_id": agent["agent_id"],
@@ -1247,8 +1296,22 @@ class ObserverRepository:
             node = await self.accept_node_intent(str(args["run_id"]), NodeIntent.model_validate(args["intent"]), selected_target=str(args["selected_target"]))
             result = node.model_dump(mode="json")
         elif command.command == "node.dispatch":
-            attempt_id = await self.dispatch_dynamic_node(str(args["run_id"]), str(args["node_id"]), target=str(args["target"]))
-            result = {"attempt_id": attempt_id}
+            attempt = await self.dispatch_dynamic_node(str(args["run_id"]), str(args["node_id"]), target=str(args["target"]))
+            result = {"attempt": attempt}
+        elif command.command == "node.reassign":
+            attempt = await self.reassign_dynamic_node(
+                str(args["run_id"]),
+                str(args["node_id"]),
+                lost_attempt_id=str(args["lost_attempt_id"]),
+                expected_execution_id=str(args["expected_execution_id"]),
+                expected_execution_epoch=int(args["expected_execution_epoch"]),
+                target=str(args["target"]),
+                reason=str(args.get("reason") or "worker_lease_expired"),
+            )
+            result = {
+                "node": {"node_id": str(args["node_id"]), "state": "dispatched"},
+                "attempt": attempt,
+            }
         elif command.command == "node.result":
             node = await self.record_dynamic_node_result(str(args["run_id"]), str(args["node_id"]), dict(args["result"]))
             result = node.model_dump(mode="json")
@@ -1469,7 +1532,7 @@ class ObserverRepository:
                 except (TypeError, ValueError):
                     continue
             elif node_id and phase in {"node_reassigned", "node_dispatched"} and node_id in nodes:
-                nodes[node_id].state = "accepted" if phase == "node_reassigned" else "dispatched"
+                nodes[node_id].state = "dispatched"
             elif node_id and phase == "node_completed" and node_id in nodes:
                 state = str(event.get("terminal_state") or "completed")
                 if state in {"completed", "failed", "decision_required"}:
@@ -1625,18 +1688,31 @@ class ObserverRepository:
 
     def _slave_supports_package(self, slave_id: str, package: CapabilityPackageVersion) -> bool:
         details = self.slave_capabilities.get(slave_id)
-        if details is None or not self.slave_availability.get(slave_id, False):
+        agent = self.slave_agents.get(slave_id)
+        if details is None or agent is None or agent.get("lease_state") != "active":
             return False
         declared_operations = details.get("operations", set())
         operations = {declared_operations} if isinstance(declared_operations, str) else set(declared_operations)
         operation = package.executor_operation or "run_code"
         if operation not in operations:
             return False
-        declared_executors = details.get("executor_kinds") or details.get("executors")
+        declared_executors = (
+            details.get("executor_kinds")
+            or details.get("executors")
+            or details.get("executor_descriptors")
+        )
         if declared_executors:
-            executor_kinds = {declared_executors} if isinstance(declared_executors, str) else set(declared_executors)
+            raw_executors = [declared_executors] if isinstance(declared_executors, str) else declared_executors
+            executor_kinds = {
+                str(item.get("kind")) if isinstance(item, dict) else str(item)
+                for item in raw_executors
+            }
             return package.executor_kind in executor_kinds
         return True
+
+    def _slave_is_active(self, slave_id: str) -> bool:
+        agent = self.slave_agents.get(slave_id)
+        return agent is not None and agent.get("lease_state") == "active"
 
     @staticmethod
     def _package_ref(package: CapabilityPackageVersion) -> str:
@@ -2124,7 +2200,7 @@ class ObserverRepository:
             record = self.runs.get(run_id)
             if record is not None:
                 workspace_id = record.closure_contract.workspace_id if record.closure_contract is not None else "workspace-default"
-                await self.list_agents(workspace_id, role="slave")
+                await self.refresh_slaves(workspace_id)
         operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
         operation = self._operation_name(operation_ref)
         blockers: list[dict[str, Any]] = []
@@ -2159,7 +2235,7 @@ class ObserverRepository:
             if capability is None:
                 blockers.append({"code": "capability_unavailable", "hole_id": hole.hole_id, "target_resource_ref": target})
                 continue
-            if not self.slave_availability.get(target, False):
+            if not self._slave_is_active(target):
                 blockers.append({"code": "slave_unavailable", "hole_id": hole.hole_id, "target_resource_ref": target})
             package = self._find_package(binding.capability_package_ref, run_id=run_id) if binding.capability_package_ref else None
             if binding.capability_package_ref and package is None:
@@ -2214,7 +2290,7 @@ class ObserverRepository:
         if operation and not snapshot.compute.typed_holes and not is_orchestration:
             default_target = "slave-a"
             capability = self.slave_capabilities.get(default_target, {})
-            if not self.slave_availability.get(default_target, False):
+            if not self._slave_is_active(default_target):
                 blockers.append({"code": "slave_unavailable", "target_resource_ref": default_target})
             if operation not in capability.get("operations", set()):
                 blockers.append({"code": "capability_unavailable", "operation": operation, "target_resource_ref": default_target})
@@ -3176,68 +3252,8 @@ class ObserverRepository:
         await self._persist(record)
         return record
 
-    async def set_slave_availability(self, slave_id: str, available: bool) -> None:
-        self.slave_availability[slave_id] = available
-
     async def set_slave_capabilities(self, slave_id: str, operations: set[str]) -> None:
         self.slave_capabilities.setdefault(slave_id, {})["operations"] = set(operations)
-
-    async def reconcile(self, run_id: str) -> RunRecord:
-        record = await self._load(run_id)
-        if record.allow_reassignment and record.execution_id and record.dynamic_nodes and not self.slave_availability.get("slave-a", True):
-            pending_nodes = [
-                node
-                for node in record.dynamic_nodes
-                if node.state in {"accepted", "dispatched"}
-                and any(
-                    attempt.get("node_id") == node.node_id
-                    and attempt.get("target") == "slave-a"
-                    and attempt.get("state") in {"created", "running"}
-                    for attempt in record.attempts
-                )
-            ]
-            if pending_nodes and self.slave_availability.get("slave-b", False):
-                record.execution_epoch += 1
-                for attempt in record.attempts:
-                    if attempt.get("node_id") in {node.node_id for node in pending_nodes} and attempt.get("state") in {"created", "running"}:
-                        attempt["state"] = "reassigned"
-                for node in pending_nodes:
-                    node.state = "accepted"
-                    record.events.append(
-                        {
-                            "phase": "node_reassigned",
-                            "run_id": run_id,
-                            "execution_id": record.execution_id,
-                            "node_id": node.node_id,
-                            "target": "slave-b",
-                            "selected_target": "slave-b",
-                            "reason": "slave_unavailable",
-                            "execution_epoch": record.execution_epoch,
-                            "package_ref": node.package_ref.model_dump(mode="json"),
-                            "package_digest": node.package_digest,
-                            "provenance": {
-                                **self._orchestration_provenance(record),
-                                "node_package_ref": node.package_ref.model_dump(mode="json"),
-                                "node_package_digest": node.package_digest,
-                                "from_target": "slave-a",
-                                "to_target": "slave-b",
-                            },
-                            "created_at": datetime.now(timezone.utc).isoformat(),
-                        }
-                    )
-                await self._persist(record)
-                return record
-        if record.allow_reassignment and record.execution_id and record.attempts and not record.dynamic_nodes and not self.slave_availability.get("slave-a", True):
-            if not any(attempt["target"] == "slave-b" for attempt in record.attempts):
-                self._check_attempt_budget(record)
-                record.execution_epoch += 1
-                for attempt in record.attempts:
-                    if attempt.get("state") in {"created", "running"}:
-                        attempt["state"] = "reassigned"
-                record.attempts.append({"attempt_id": f"attempt-{uuid4().hex[:12]}", "target": "slave-b", "state": "created", "execution_epoch": record.execution_epoch, "reason": "slave_a_unavailable", "provenance": {"from": "slave-a", "to": "slave-b"}})
-                record.events.append({"phase": "reassigned", "execution_id": record.execution_id, "from": "slave-a", "to": "slave-b"})
-                await self._persist(record)
-        return record
 
     def _orchestration_provenance(
         self,
@@ -3352,6 +3368,9 @@ class ObserverRepository:
             raise ValueError("capability_package_abandoned")
         if node_package.executor_kind != "subprocess_json_v1" or node_package.executor_operation != "run_code":
             raise ValueError("node_package_invalid")
+
+        workspace_id = record.closure_contract.workspace_id if record.closure_contract is not None else "workspace-default"
+        await self.refresh_slaves(workspace_id)
 
         if node_package.io_contract_ref is None:
             raise ValueError("node_io_contract_unavailable")
@@ -3471,7 +3490,7 @@ class ObserverRepository:
         await self._persist(record)
         return node
 
-    async def dispatch_dynamic_node(self, run_id: str, node_id: str, *, target: str) -> str:
+    async def dispatch_dynamic_node(self, run_id: str, node_id: str, *, target: str) -> dict[str, Any]:
         record = await self._load(run_id)
         if record.state != "running" or record.execution_id is None:
             raise ValueError("execution_not_running")
@@ -3482,6 +3501,8 @@ class ObserverRepository:
             raise ValueError("dynamic_node_not_dispatchable")
         if not isinstance(target, str) or not target:
             raise ValueError("node_target_unavailable")
+        workspace_id = record.closure_contract.workspace_id if record.closure_contract is not None else "workspace-default"
+        await self.refresh_slaves(workspace_id)
         normalized_target = self._canonical_target_resource_id(target)
         accepted_event = next(
             (
@@ -3499,17 +3520,20 @@ class ObserverRepository:
         node_package = self._find_package(node.package_ref, run_id=run_id)
         if node_package is None or not self._slave_supports_package(normalized_target, node_package):
             raise ValueError("node_target_unavailable")
+        target_agent = self.slave_agents[normalized_target]
         self._check_attempt_budget(record)
-        attempt_id = f"attempt-{uuid4().hex[:12]}"
-        record.attempts.append(
-            {
-                "attempt_id": attempt_id,
-                "node_id": node_id,
-                "target": normalized_target,
-                "state": "created",
-                "execution_epoch": record.execution_epoch,
-            }
-        )
+        attempt = {
+            "attempt_id": f"attempt-{uuid4().hex[:12]}",
+            "node_id": node_id,
+            "target": normalized_target,
+            "target_instance_id": target_agent["instance_id"],
+            "target_agent_epoch": int(target_agent["epoch"]),
+            "state": "created",
+            "execution_epoch": record.execution_epoch,
+            "replaces_attempt_id": None,
+            "replaced_by_attempt_id": None,
+        }
+        record.attempts.append(attempt)
         node.state = "dispatched"
         record.events.append(
             {
@@ -3518,8 +3542,10 @@ class ObserverRepository:
                 "execution_id": record.execution_id,
                 "execution_epoch": record.execution_epoch,
                 "node_id": node_id,
-                "attempt_id": attempt_id,
+                "attempt_id": attempt["attempt_id"],
                 "target": normalized_target,
+                "target_instance_id": attempt["target_instance_id"],
+                "target_agent_epoch": attempt["target_agent_epoch"],
                 "package_ref": node.package_ref.model_dump(mode="json"),
                 "package_digest": node.package_digest,
                 "input_refs": [item.model_dump(mode="json") for item in node.input_refs],
@@ -3532,7 +3558,168 @@ class ObserverRepository:
             }
         )
         await self._persist(record)
-        return attempt_id
+        return deepcopy(attempt)
+
+    async def reassign_dynamic_node(
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        lost_attempt_id: str,
+        expected_execution_id: str,
+        expected_execution_epoch: int,
+        target: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        lock = self._dynamic_intent_locks.setdefault(run_id, asyncio.Lock())
+        async with lock:
+            record = await self._load(run_id)
+            if record.state != "running" or record.execution_id is None:
+                raise ValueError("execution_not_running")
+            if expected_execution_id != record.execution_id:
+                raise ValueError("stale_execution_id")
+            if int(expected_execution_epoch) != record.execution_epoch:
+                raise ValueError("stale_execution_epoch")
+            node = next((item for item in record.dynamic_nodes if item.node_id == node_id), None)
+            if node is None:
+                raise ValueError("dynamic_node_not_found")
+            old_attempt = next(
+                (
+                    item
+                    for item in record.attempts
+                    if item.get("attempt_id") == lost_attempt_id and item.get("node_id") == node_id
+                ),
+                None,
+            )
+            if old_attempt is None:
+                raise ValueError("stale_attempt")
+            replacement_id = old_attempt.get("replaced_by_attempt_id")
+            if replacement_id:
+                replacement = next(
+                    (item for item in record.attempts if item.get("attempt_id") == replacement_id),
+                    None,
+                )
+                if replacement is None:
+                    raise ValueError("stale_attempt")
+                return deepcopy(replacement)
+            if node.state != "dispatched":
+                raise ValueError("dynamic_node_not_dispatchable")
+            active_attempts = [
+                item
+                for item in record.attempts
+                if item.get("node_id") == node_id and item.get("state") in {"created", "running"}
+            ]
+            if active_attempts != [old_attempt]:
+                raise ValueError("stale_attempt")
+            if old_attempt.get("execution_epoch") != record.execution_epoch:
+                raise ValueError("stale_attempt")
+            policy = record.closure_contract.recovery_policy if record.closure_contract is not None else {}
+            if not bool(policy.get("allow_reassignment", False)):
+                raise ValueError("reassignment_not_allowed")
+
+            package = self._find_package(node.package_ref, run_id=run_id)
+            if package is None:
+                raise ValueError("node_target_unavailable")
+            if record.closure_contract is not None and package.permissions:
+                if not set(package.permissions).issubset(set(record.closure_contract.allowed_effects)):
+                    raise ValueError("node_permission_denied")
+            for input_ref in node.input_refs:
+                try:
+                    self._require_content_ref(input_ref)
+                    await self._load_json_content(input_ref)
+                except (FileNotFoundError, TypeError, ValueError) as exc:
+                    raise ValueError("node_input_unavailable") from exc
+            self._check_attempt_budget(record)
+
+            workspace_id = record.closure_contract.workspace_id if record.closure_contract is not None else "workspace-default"
+            await self.refresh_slaves(workspace_id)
+            source_key = (
+                str(old_attempt.get("target") or ""),
+                str(old_attempt.get("target_instance_id") or ""),
+            )
+            source_agent = self.slave_instances.get(source_key)
+            if source_agent is None or int(source_agent.get("epoch") or 0) != int(old_attempt.get("target_agent_epoch") or 0):
+                raise ValueError("worker_lease_not_lost")
+            if source_agent.get("lease_state") not in {"expired", "released"}:
+                raise ValueError("worker_lease_active")
+            normalized_target = self._canonical_target_resource_id(target)
+            if (
+                not normalized_target
+                or normalized_target == old_attempt.get("target")
+                or not self._slave_supports_package(normalized_target, package)
+            ):
+                raise ValueError("node_target_unavailable")
+            snapshot = record.committed.snapshot if record.committed is not None else record.draft.snapshot
+            locality = next(
+                (
+                    requirement.value
+                    for requirement in snapshot.compute.requirements
+                    if requirement.key == "loom.data.locality.v1"
+                ),
+                None,
+            )
+            if locality is not None and self._canonical_target_resource_id(str(locality)) != normalized_target:
+                raise ValueError("node_target_unavailable")
+            target_agent = self.slave_agents[normalized_target]
+            updated = deepcopy(record)
+            updated_old_attempt = next(
+                item for item in updated.attempts if item.get("attempt_id") == lost_attempt_id
+            )
+            updated_node = next(item for item in updated.dynamic_nodes if item.node_id == node_id)
+            replacement = {
+                "attempt_id": f"attempt-{uuid4().hex[:12]}",
+                "node_id": node_id,
+                "target": normalized_target,
+                "target_instance_id": target_agent["instance_id"],
+                "target_agent_epoch": int(target_agent["epoch"]),
+                "state": "created",
+                "execution_epoch": record.execution_epoch,
+                "replaces_attempt_id": old_attempt["attempt_id"],
+                "replaced_by_attempt_id": None,
+            }
+            updated_old_attempt["state"] = "lost"
+            updated_old_attempt["terminal_error"] = {
+                "code": "worker_lost",
+                "lease_state": source_agent["lease_state"],
+            }
+            updated_old_attempt["replaced_by_attempt_id"] = replacement["attempt_id"]
+            updated.attempts.append(replacement)
+            updated_node.state = "dispatched"
+            contract = updated.closure_contract
+            updated.events.append(
+                {
+                    "phase": "node_reassigned",
+                    "run_id": run_id,
+                    "execution_id": updated.execution_id,
+                    "execution_epoch": updated.execution_epoch,
+                    "node_id": node_id,
+                    "lost_attempt_id": updated_old_attempt["attempt_id"],
+                    "replacement_attempt_id": replacement["attempt_id"],
+                    "from_target": updated_old_attempt["target"],
+                    "from_instance_id": updated_old_attempt["target_instance_id"],
+                    "from_agent_epoch": updated_old_attempt["target_agent_epoch"],
+                    "to_target": replacement["target"],
+                    "to_instance_id": replacement["target_instance_id"],
+                    "to_agent_epoch": replacement["target_agent_epoch"],
+                    "reason": reason,
+                    "source_lease_state": source_agent["lease_state"],
+                    "reassignment_authorization": {
+                        "policy": "allow_reassignment",
+                        "value": True,
+                        "closure_version_ref": updated.committed.version_id if updated.committed is not None else updated.draft.version_id,
+                        "user_id": contract.user_id if contract is not None else "user-default",
+                        "origin_conversation_ref": contract.origin_conversation_ref if contract is not None else updated.task_ref,
+                    },
+                    "package_ref": updated_node.package_ref.model_dump(mode="json"),
+                    "package_digest": updated_node.package_digest,
+                    "package_replay_safety": package.replay_safety,
+                    "input_refs": [item.model_dump(mode="json") for item in updated_node.input_refs],
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            await self._persist(updated)
+            self.runs[run_id] = updated
+            return deepcopy(replacement)
 
     async def record_dynamic_node_result(self, run_id: str, node_id: str, result: dict[str, Any]) -> DynamicNode:
         record = await self._load(run_id)

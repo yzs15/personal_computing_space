@@ -8,8 +8,50 @@ from fastapi.testclient import TestClient
 
 from loom_v2.content_store import ContentStore, canonical_json_bytes
 from loom_v2.contracts.types import CapabilityHealthReport, CapabilityPackageVersion, CapabilityProvisionCommand, NodeInputBinding, ResourceRef, TaskClosure
-from loom_v2.driver.worker import WorkerSession
+from loom_v2.driver.worker import WorkerSession, WorkerUnavailableError
 from loom_v2.slave.app import create_app
+
+
+def dispatch_arguments() -> dict[str, object]:
+    return {
+        "attempt_id": "attempt-worker-unavailable",
+        "execution_id": "execution-worker-unavailable",
+        "execution_epoch": 1,
+        "workspace_id": "workspace-default",
+        "operation": "echo",
+        "payload": {},
+        "closure": TaskClosure.minimal(),
+        "binding": None,
+    }
+
+
+def application_failure_transport() -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"detail": "capability_exec_error"}, request=request)
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_worker_session_classifies_transport_failure_as_unavailable():
+    session = WorkerSession(
+        "slave-a",
+        "http://slave-a",
+        transport=httpx.MockTransport(
+            lambda request: (_ for _ in ()).throw(httpx.ConnectError("down", request=request))
+        ),
+    )
+
+    with pytest.raises(WorkerUnavailableError):
+        await session.dispatch(**dispatch_arguments())
+
+
+@pytest.mark.asyncio
+async def test_worker_session_does_not_classify_application_failure_as_unavailable():
+    session = WorkerSession("slave-a", "http://slave-a", transport=application_failure_transport())
+
+    with pytest.raises(RuntimeError, match="capability_exec_error"):
+        await session.dispatch(**dispatch_arguments())
 
 
 def test_slave_capabilities_endpoint_reports_worker_contract():

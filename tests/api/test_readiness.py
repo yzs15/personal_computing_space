@@ -55,7 +55,12 @@ def test_unbound_typed_hole_blocks_commit_and_reports_readiness():
 
 def test_binding_requires_target_capability_and_then_allows_start():
     repository = ObserverRepository()
-    repository.slave_capabilities["slave-a"]["operations"] = {"echo", "hash"}
+    slave_a = next(
+        item
+        for key, item in repository.agents.items()
+        if key[1:3] == ("slave", "slave-a") and item.get("lease_state") == "active"
+    )
+    slave_a["capabilities"]["operations"] = ["echo", "hash"]
     client = TestClient(create_app(repository))
     run, patch = _add_sort_hole(client, "blocked")
     blocked = client.post(
@@ -77,7 +82,7 @@ def test_binding_requires_target_capability_and_then_allows_start():
     assert detail["code"] == "readiness_blocked"
     assert detail["details"]["blockers"][0]["code"] == "capability_unavailable"
 
-    repository.slave_capabilities["slave-a"]["operations"] = {"echo", "hash", "sort"}
+    slave_a["capabilities"]["operations"] = ["echo", "hash", "sort"]
     run2, patch2 = _add_sort_hole(client, "valid")
     bound = client.post(
         f"/api/v1/runs/{run2['run_id']}/patches",

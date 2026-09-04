@@ -20,6 +20,32 @@ async def test_observer_repository_persists_run_snapshot():
     assert restored.draft.snapshot.metadata["goal"] == "echo"
 
 
+async def test_observer_repository_persists_attempt_instance_binding():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    repo = ObserverRepository(engine)
+    await repo.init_db()
+    created = await repo.open_run("attempt-binding", "task-attempt-binding", "echo")
+    created.attempts.append(
+        {
+            "attempt_id": "attempt-1",
+            "node_id": "node-1",
+            "target": "slave-a",
+            "target_instance_id": "slave-a-instance",
+            "target_agent_epoch": 3,
+            "state": "created",
+            "execution_epoch": 1,
+            "replaces_attempt_id": None,
+            "replaced_by_attempt_id": None,
+        }
+    )
+    await repo._persist(created)
+
+    restored_repo = ObserverRepository(engine)
+    restored = await restored_repo.get_run(created.run_id)
+
+    assert restored.attempts == created.attempts
+
+
 async def test_observer_repository_persists_closure_contract():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     repo = ObserverRepository(engine)

@@ -27,18 +27,74 @@ import argparse
 import json
 import math
 import random
+import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urljoin
 
 
 DEFAULT_OBSERVER = "http://localhost:18080"
 WORKSPACE_ID = "workspace-default"
 FAMILIES = ["perovskite", "rutile", "zincblende", "wurtzite", "rocksalt"]
+
+
+class SlaveFailureController:
+    def __init__(
+        self,
+        *,
+        docker_bin: str,
+        compose_file: str,
+        run_command: Callable[[list[str]], Any] | None = None,
+    ) -> None:
+        self.docker_bin = docker_bin
+        self.compose_file = compose_file
+        self.run_command = run_command or self._run_command
+        self.injected = False
+        self.stopped = False
+        self.execution_id: str | None = None
+        self.execution_epoch: int | None = None
+
+    @staticmethod
+    def _run_command(command: list[str]) -> None:
+        subprocess.run(command, check=True)
+
+    def observe(self, run: dict[str, Any]) -> None:
+        if self.execution_id is None and run.get("execution_id"):
+            self.execution_id = str(run["execution_id"])
+            self.execution_epoch = int(run.get("execution_epoch", 1))
+        if self.injected:
+            return
+        completed_node_ids = {
+            str(node.get("node_id"))
+            for node in run.get("dynamic_nodes") or []
+            if node.get("state") == "completed"
+        }
+        active_slave_a = any(
+            attempt.get("target") == "slave-a"
+            and attempt.get("state") in {"created", "running"}
+            and str(attempt.get("node_id")) not in completed_node_ids
+            for attempt in run.get("attempts") or []
+        )
+        if not completed_node_ids or not active_slave_a:
+            return
+        self.run_command(
+            [self.docker_bin, "compose", "-f", self.compose_file, "stop", "slave-a"]
+        )
+        self.injected = True
+        self.stopped = True
+
+    def restore(self) -> None:
+        if not self.stopped:
+            return
+        self.run_command(
+            [self.docker_bin, "compose", "-f", self.compose_file, "start", "slave-a"]
+        )
+        self.stopped = False
 
 
 # --------------------------------------------------------------------------- helpers
@@ -170,9 +226,11 @@ def ground_truth(items: list[dict]) -> dict:
 # --------------------------------------------------------------------------- programs (mcp mode)
 
 SUMMARIZE_PROGRAM = (
-    "import json,sys\n"
+    "import json,sys,time\n"
     "d=json.load(sys.stdin)\n"
     "items=d[\"items\"]\n"
+    "first_index=int(items[0][\"sample\"].rsplit(\"-\",1)[-1]) if items else 0\n"
+    "time.sleep(3.0 if first_index % 2 == 0 else 0.5)\n"
     "def st(xs):\n"
     "  n=len(xs); s=sum(xs); sq=sum(x*x for x in xs); m=s/n\n"
     "  return {\"count\":n,\"sum\":round(s,6),\"min\":round(min(xs),6),\"max\":round(max(xs),6),\"mean\":round(m,6),\"stddev\":round(max(0.0,sq/n-m*m)**0.5,6)}\n"
@@ -224,7 +282,13 @@ def orchestration_source(summarize_ref: dict, merge_ref: dict) -> str:
 
 # --------------------------------------------------------------------------- mcp mode
 
-def run_mcp_mode(observer: str, corpus: list[dict], partitions: int) -> tuple[dict, list[str]]:
+def run_mcp_mode(
+    observer: str,
+    corpus: list[dict],
+    partitions: int,
+    *,
+    failure_controller: SlaveFailureController | None = None,
+) -> tuple[dict, list[str]]:
     passed: list[str] = []
     conversation_ref = f"accept-bandgap-mcp-{uuid.uuid4().hex[:10]}"
 
@@ -263,6 +327,7 @@ def run_mcp_mode(observer: str, corpus: list[dict], partitions: int) -> tuple[di
         "closure_id": "closure-bandgap-mcp",
         "goal": "per-family band-gap statistics",
         "resource_budget": {"max_nodes": 8, "max_live_nodes": 2},
+        "recovery_policy": {"allow_reassignment": failure_controller is not None},
         "body": {
             "closure_id": "closure-bandgap-mcp",
             "program": {"operation_ref": "loom://orchestrate", "io_contract_ref": parent_contract},
@@ -337,21 +402,50 @@ def run_mcp_mode(observer: str, corpus: list[dict], partitions: int) -> tuple[di
     passed.append("G2(part): materialized run_bound candidate packages")
 
     committed = mcp_call(observer, conversation_ref, "loom_commit_plan", {})
+    monitor_stop = threading.Event()
+    monitor_errors: list[BaseException] = []
+    monitor_thread: threading.Thread | None = None
+    if failure_controller is not None:
+        def monitor() -> None:
+            while not monitor_stop.wait(0.1):
+                try:
+                    current = get_run(observer, run_id)
+                except Exception:
+                    continue
+                try:
+                    failure_controller.observe(current)
+                except BaseException as exc:
+                    monitor_errors.append(exc)
+                    return
+
+        monitor_thread = threading.Thread(target=monitor, name="slave-failure-monitor", daemon=True)
+        monitor_thread.start()
     try:
-        mcp_call(observer, conversation_ref, "loom_start_run", {"closure_version": committed["closure_version"]}, timeout=120.0)
-    except Exception:
-        pass  # observer->driver forward may time out; keep polling persisted state
+        try:
+            mcp_call(observer, conversation_ref, "loom_start_run", {"closure_version": committed["closure_version"]}, timeout=120.0)
+        except Exception:
+            pass  # observer->driver forward may time out; keep polling persisted state
 
-    run = _poll_run(observer, run_id, timeout=300.0)
-    if run["state"] not in {"completed", "closed"}:
-        raise RuntimeError(f"run did not complete: state={run['state']} outcome={run.get('outcome')}")
-    passed.append("G1(infra): closure committed and executed to completion via MCP")
+        run = _poll_run(observer, run_id, timeout=300.0)
+        if monitor_errors:
+            raise RuntimeError(f"failure injection failed: {monitor_errors[0]}")
+        if run["state"] not in {"completed", "closed"}:
+            raise RuntimeError(f"run did not complete: state={run['state']} outcome={run.get('outcome')}")
+        passed.append("G1(infra): closure committed and executed to completion via MCP")
 
-    report = _extract_report(observer, run)
-    gt = ground_truth(corpus)
-    _check_report(report, gt, passed)
-    _check_provenance(run, passed)
-    return run, passed
+        report = _extract_report(observer, run)
+        gt = ground_truth(corpus)
+        _check_report(report, gt, passed)
+        _check_provenance(run, passed)
+        if failure_controller is not None:
+            _check_failure_reassignment(run, failure_controller, passed)
+        return run, passed
+    finally:
+        monitor_stop.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=5.0)
+        if failure_controller is not None:
+            failure_controller.restore()
 
 
 def _extract_report(observer: str, run: dict) -> Any:
@@ -421,6 +515,54 @@ def _check_provenance(run: dict, passed: list[str]) -> None:
         if n.get("state") != "completed":
             raise RuntimeError(f"node not completed: {n.get('node_id')} state={n.get('state')}")
     passed.append(f"G5: provenance ok ({len(node_ids)} nodes, all completed, outcome content-addressed)")
+
+
+def _check_failure_reassignment(
+    run: dict[str, Any],
+    controller: SlaveFailureController,
+    passed: list[str],
+) -> None:
+    if not controller.injected:
+        raise RuntimeError("G4 failure was not injected after partial progress")
+    if run.get("execution_id") != controller.execution_id or int(run.get("execution_epoch", 0)) != controller.execution_epoch:
+        raise RuntimeError("G4 reassignment changed the Run execution identity")
+    attempts = run.get("attempts") or []
+    events = [event for event in run.get("events") or [] if event.get("phase") == "node_reassigned"]
+    for event in events:
+        old_attempt = next(
+            (item for item in attempts if item.get("attempt_id") == event.get("lost_attempt_id")),
+            None,
+        )
+        replacement = next(
+            (item for item in attempts if item.get("attempt_id") == event.get("replacement_attempt_id")),
+            None,
+        )
+        authorization = event.get("reassignment_authorization") or {}
+        if (
+            old_attempt is not None
+            and replacement is not None
+            and old_attempt.get("state") == "lost"
+            and replacement.get("state") == "completed"
+            and old_attempt.get("node_id") == replacement.get("node_id")
+            and old_attempt.get("target") == "slave-a"
+            and replacement.get("target") != "slave-a"
+            and authorization.get("policy") == "allow_reassignment"
+            and authorization.get("value") is True
+            and event.get("package_ref")
+            and event.get("input_refs")
+        ):
+            healthy_sibling = any(
+                item.get("node_id") != old_attempt.get("node_id") and item.get("state") == "completed"
+                for item in attempts
+            )
+            if not healthy_sibling:
+                raise RuntimeError("G4 has no healthy sibling completion")
+            passed.append(
+                "G4: slave-a loss was reassigned with audit and unchanged Run epoch; "
+                "ground-truth equality validates this workload, not generic cross-target semantic equivalence"
+            )
+            return
+    raise RuntimeError("G4 reassignment audit chain is incomplete")
 
 
 def _now() -> str:
@@ -518,7 +660,12 @@ def main() -> int:
     parser.add_argument("--partitions", type=int, default=2)
     parser.add_argument("--timeout", type=float, default=1200.0, help="agent-mode poll timeout (seconds)")
     parser.add_argument("--inject-failure", action="store_true", help="G4: take slave-a down mid-run (mcp mode)")
+    parser.add_argument("--docker-bin", default="docker", help="Docker CLI used for G4 failure injection")
+    parser.add_argument("--compose-file", default="deploy/docker-compose.yml", help="Compose file used for G4 failure injection")
     args = parser.parse_args()
+
+    if args.inject_failure and args.mode != "mcp":
+        raise RuntimeError("--inject-failure is supported only in mcp mode")
 
     health = _json("GET", urljoin(args.observer, "/healthz"), timeout=10.0)
     if not health.get("ok"):
@@ -526,7 +673,17 @@ def main() -> int:
 
     corpus = make_corpus(args.seed, args.files)
     if args.mode == "mcp":
-        run, passed = run_mcp_mode(args.observer, corpus, args.partitions)
+        failure_controller = (
+            SlaveFailureController(docker_bin=args.docker_bin, compose_file=args.compose_file)
+            if args.inject_failure
+            else None
+        )
+        run, passed = run_mcp_mode(
+            args.observer,
+            corpus,
+            args.partitions,
+            failure_controller=failure_controller,
+        )
     else:
         run, passed = run_agent_mode(args.observer, corpus, args.partitions, args.timeout)
 

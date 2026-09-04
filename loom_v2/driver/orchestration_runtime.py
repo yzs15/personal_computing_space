@@ -15,7 +15,7 @@ from loom_v2.contracts.types import (
     TaskClosure,
 )
 from loom_v2.observer.repository import ObserverRepository
-from loom_v2.driver.worker import WorkerSession
+from loom_v2.driver.worker import WorkerSession, WorkerUnavailableError
 from loom_v2.slave.executor import ExecutionResult, default_registry
 from loom_v2.slave.service import SlaveService
 
@@ -138,14 +138,20 @@ class DynamicOrchestrationRuntime:
                 None,
             ) if existing is not None else None
             previous_target = (
-                (previous_event.get("selected_target") or previous_event.get("target"))
+                (
+                    previous_event.get("selected_target")
+                    or previous_event.get("to_target")
+                    or previous_event.get("target")
+                )
                 if previous_event is not None
                 else None
             )
+            await self.repository.refresh_slaves()
+            current_record = await self.repository.get_run(run_id)
             target = (
                 previous_target
                 if existing is not None and previous_target and not record.allow_reassignment
-                else self._select_target(node_package, record)
+                else self._select_target(node_package, current_record)
             )
             intent = NodeIntent(
                 intent_id=intent_id,
@@ -219,6 +225,8 @@ class DynamicOrchestrationRuntime:
         self,
         package: CapabilityPackageVersion,
         record: Any,
+        *,
+        exclude_targets: set[str] | None = None,
     ) -> str:
         closure = record.committed.snapshot if getattr(record, "committed", None) is not None else record.draft.snapshot
         allowed_effects = set(record.closure_contract.allowed_effects) if record.closure_contract is not None else set()
@@ -229,6 +237,7 @@ class DynamicOrchestrationRuntime:
             for slave_id in self.repository.slave_capabilities
             if self.repository._slave_supports_package(slave_id, package)
             and (slave_id in self.workers or slave_id in self.slaves)
+            and slave_id not in (exclude_targets or set())
         )
         if not available:
             raise RuntimeError("node_target_unavailable")
@@ -264,7 +273,32 @@ class DynamicOrchestrationRuntime:
 
     async def _execute_node(self, run_id: str, node: DynamicNode, target: str) -> ResourceRef:
         try:
-            return await self._execute_node_inner(run_id, node, target)
+            current = await self.repository.get_run(run_id)
+            active_attempt = next(
+                (
+                    item
+                    for item in reversed(current.attempts)
+                    if item.get("node_id") == node.node_id and item.get("state") in {"created", "running"}
+                ),
+                None,
+            )
+            if node.state == "accepted":
+                attempt = await self.repository.dispatch_dynamic_node(run_id, node.node_id, target=target)
+            elif node.state == "dispatched" and active_attempt is not None:
+                attempt = active_attempt
+                await self.repository.refresh_slaves()
+                source = self.repository.slave_instances.get(
+                    (str(attempt["target"]), str(attempt["target_instance_id"]))
+                )
+                if source is not None and source.get("lease_state") in {"expired", "released"}:
+                    attempt = await self._recover_attempt(run_id, node, attempt)
+            else:
+                raise RuntimeError("dynamic_node_not_dispatchable")
+            while True:
+                try:
+                    return await self._execute_attempt(run_id, node, attempt)
+                except WorkerUnavailableError:
+                    attempt = await self._recover_attempt(run_id, node, attempt)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -281,9 +315,61 @@ class DynamicOrchestrationRuntime:
                 pass
             raise RuntimeError("dynamic_node_failed") from exc
 
-    async def _execute_node_inner(self, run_id: str, node: DynamicNode, target: str) -> ResourceRef:
+    async def _recover_attempt(
+        self,
+        run_id: str,
+        node: DynamicNode,
+        attempt: dict[str, Any],
+    ) -> dict[str, Any]:
+        source_target = str(attempt["target"])
+        source_instance_id = str(attempt["target_instance_id"])
+        source_worker = self.workers.get(source_target)
+        recovery_timeout = float(getattr(source_worker, "operation_timeout", 90.0))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + recovery_timeout
+        while True:
+            await self.repository.refresh_slaves()
+            source = self.repository.slave_instances.get((source_target, source_instance_id))
+            if source is not None and source.get("lease_state") in {"expired", "released"}:
+                break
+            if loop.time() >= deadline:
+                raise RuntimeError("node_recovery_exhausted")
+            await asyncio.sleep(min(0.1, max(0.0, deadline - loop.time())))
+
         package = await self.repository.get_capability_package(node.package_ref, run_id=run_id)
-        attempt_id = await self.repository.dispatch_dynamic_node(run_id, node.node_id, target=target)
+        while loop.time() < deadline:
+            await self.repository.refresh_slaves()
+            record = await self.repository.get_run(run_id)
+            try:
+                replacement_target = self._select_target(
+                    package,
+                    record,
+                    exclude_targets={source_target},
+                )
+                return await self.repository.reassign_dynamic_node(
+                    run_id,
+                    node.node_id,
+                    lost_attempt_id=str(attempt["attempt_id"]),
+                    expected_execution_id=str(record.execution_id),
+                    expected_execution_epoch=int(record.execution_epoch),
+                    target=replacement_target,
+                    reason="worker_lease_expired",
+                )
+            except (RuntimeError, ValueError) as exc:
+                if str(exc) != "node_target_unavailable":
+                    raise
+            await asyncio.sleep(min(0.1, max(0.0, deadline - loop.time())))
+        raise RuntimeError("node_recovery_exhausted")
+
+    async def _execute_attempt(
+        self,
+        run_id: str,
+        node: DynamicNode,
+        attempt: dict[str, Any],
+    ) -> ResourceRef:
+        package = await self.repository.get_capability_package(node.package_ref, run_id=run_id)
+        attempt_id = str(attempt["attempt_id"])
+        target = str(attempt["target"])
         record = await self.repository.get_run(run_id)
         operation_ref = package.operation_descriptor_ref
         operation_ref = operation_ref.resource_id if isinstance(operation_ref, ResourceRef) else str(operation_ref)

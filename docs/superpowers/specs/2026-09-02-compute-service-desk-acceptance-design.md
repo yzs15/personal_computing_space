@@ -1,7 +1,7 @@
 # 真实负载验收设计：材料带隙统计报告（算力服务台场景）
 
 **日期：** 2026-09-02
-**状态：** 设计（待评审）
+**状态：** 设计已部分验证（G1/G3/G5 两轮真实后端通过；G2 promote/abandon 闭环、G4 掉线改派、G6 确定性变体待实现）
 **对应文档：** `docs/superpowers/specs/2026-08-26-distributed-analysis-e2e-design.md`；`docs/superpowers/specs/2026-09-01-run-lifecycle-redesign.md`
 
 ## 1. 背景与问题
@@ -17,6 +17,10 @@
 - 验收核心是 **G1（真实 agent 细化）**：一次自然语言消息驱动整套 MCP 工具面，不允许在测试里手工调用 `loom_*` 工具。
 - 场景采用与现有动态 map-reduce 相同的 `partition → summarize → merge` 模式，但增加两层此前未覆盖的内容：**领域解析能力缺口**（`df_xml_parse` 不预装）与 **运行中掉线改派**。
 - 验收断言对行为、统计正确性与 provenance 可走通负责，不对 agent 生成的程序文本负责（真实 agent 存在非确定性）。
+
+### 2.1 执行优先级
+
+第一轮验收以"真实 agent 能完成 Run"为目标：G1、G3、G5 作为稳定通过的必测 Gate；预算和 deadline 不进入任务意图或验收断言。G2 的 promote/abandon 闭环、G4 掉线改派和 G6 确定性变体分阶段补齐，不阻塞第一轮完成。验收 timeout 只用于判定会话或 Run 卡死，不建模业务 deadline；运行中的节点数上限只作为安全边界，不作为用户预算约束。
 
 ## 3. 目标
 
@@ -42,24 +46,26 @@
 
 ### 5.2 总体流程
 
-用户向 `POST /api/v1/messages` 发送一句自然语言目标（材料带隙统计报告需求，含预算与 deadline）→ Observer 持久化 receipt 并异步转发 Driver → 真实 Codex turn 运行 → agent 经 MCP 工具面完成 `loom_put_content`（schema/IoContract/程序）、`loom_open_run`、`loom_apply_plan_patch`、`loom_commit_plan`、`loom_start_run` → Driver 执行 `orchestrator_python_v1` 编排程序，运行时 emit `summarize` NodeIntent，Observer 物化 DynamicNode → Slaves 执行 → 最终报告写入 ContentStore。
+用户向 `POST /api/v1/messages` 发送一句自然语言目标（材料带隙统计报告需求）→ Observer 持久化 receipt 并异步转发 Driver → 真实 Codex turn 运行 → agent 经 MCP 工具面完成 `loom_put_content`（schema/IoContract/程序）、`loom_open_run`、`loom_apply_plan_patch`、`loom_commit_plan`、`loom_start_run` → Driver 执行 `orchestrator_python_v1` 编排程序，运行时 emit `summarize` NodeIntent，Observer 物化 DynamicNode → Slaves 执行 → 最终报告写入 ContentStore。
 
 ### 5.3 Agent 细化路径（G1，判别性核心）
 
 - Driver 使用默认真实后端（`CodexAppServerProvider`，模型 `deepseek-v4-flash`），**不注入 Fake provider**。
 - 验收脚本只发送一条自然语言消息，随后轮询 `GET /api/v1/conversations/{ref}` 观察 `idle → thinking → executing → completed` 状态迁移。
+- **任务意图必须显式要求**：`df_xml_parse` 作为独立能力包单独物化（run_bound 候选），不得将解析逻辑折叠进 summarize；自然语言消息中需明确说明"解析 DFT 输出需要先以独立能力包形式补齐 `df_xml_parse`"。该约束是能力缺口闭环（G2）的验收前提，缺此要求时 agent 可能把解析内联到 summarize，导致 G2 前置条件失效。
 - 通过条件：agent 自主完成上传、开闭包、物化三个包（`df_xml_parse`/`summarize_bandgap`/`merge_bandgap_report`）与编排包、补 `set_execution_payload`、使 readiness 达到 `ready`、commit、start。证据 = 持久化对话 turn + Run 事件中的工具调用序列。
 
 ### 5.4 能力缺口闭环（G2）
 
 - 前置：两个 Slave 的能力快照中**不含** `df_xml_parse`（只含基础 `subprocess_json_v1`/`run_code` 执行器与既有包）；不补该包时，闭包 readiness 必须报 `capability_unavailable`。
-- Agent 在细化期间物化 `df_xml_parse` 为 `run_bound` 候选包并被 Run 引用执行。
+- Agent 在细化期间物化 `df_xml_parse` 为**独立**的 `run_bound` 候选包（与 `summarize_bandgap` 分开），并被 Run 引用执行；summarize/merge 节点的编排程序通过 `df_xml_parse` 包的输出引用解析结果，而非内联解析逻辑。
 - Run 终态后，验收脚本以用户身份 `GET /api/v1/capability-packages` 列出候选，`POST /api/v1/capability-packages/{ref}/promote` 提升，随后断言该包进入能力快照、目标 Slave 激活并返回健康/激活证据。
 - 对照路径：同一候选走 `.../abandon` 时不得进入能力快照（验证"提升是用户决策、非自动发布"）。
 
 ### 5.5 动态编排与能力包
 
 - 编排包使用 `executor_kind="orchestrator_python_v1"`，`allowed_node_package_refs` 仅含 `summarize_bandgap` 与 `merge_bandgap_report`，`max_nodes`/`max_live_nodes` 设上限。
+- 编排程序必须通过 orchestration-early-validation 的 Pyright 静态预检：`orchestrate(ctx, input_ref)` 的参数与返回值必须使用 `"OrchestrationContext"`/`"ResourceRef"` 类型标注；未通过预检时 readiness 返回 `orchestration_program_type_error`，Run 不得提交。
 - 编排程序读取父输入，对每个 partition emit summarize 节点，等待结果后 emit merge 节点，返回报告 ref；中间与最终结果均写入 ContentStore（`content://sha256/<digest>`）。
 - 非法输入（缺字段/类型错）被 readiness/admission 拒绝，父 Run 不伪造 `completed`（复用现有 admission 语义）。
 
@@ -104,5 +110,6 @@
 ## 9. 风险与演进
 
 - **真实 agent 非确定性**：每次细化产出的程序文本/包结构可能不同。Gate 只断言行为（统计正确、provenance 可走通、包可提升），不断言程序文本；如必要，可在验收脚本中对比两次运行的稳定性。
-- **长时运行**：受 24h Codex deadline 约束，验收用小语料（500 文件、2 partition）以分钟级完成；语料规模与 deadline 走既有 `LOOM_*` 环境配置，不新增配置。
+- **长时运行**：验收用小语料（500 文件、2 partition）以分钟级完成。实测 agent 从收到消息到首次调用 `loom_open_run` 有约 3 分钟静默推理（xhigh 档正常行为，非系统延迟），验收 timeout 需覆盖该阶段。
+- **偶发慢请求**：两轮实测中出现一次 `GET /api/v1/runs/{run_id}` 服务端耗时约 3 分钟（疑似 run 事件持久化期间 DB 争用）。若复现频率升高，需单独排查 Observer 持久化路径的锁竞争。
 - **演进**：本设计是一份可复用的"真实负载验收模板"；后续其他真实负载（合规批处理、跨站点数据）复用同一套 Gate 结构与组件边界，不需要新的执行模型。

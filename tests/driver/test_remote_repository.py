@@ -1,4 +1,5 @@
 import pytest
+from types import SimpleNamespace
 
 from loom_v2.contracts.types import ResourceRef
 from loom_v2.driver.remote_repository import RemoteObserverRepository
@@ -67,7 +68,15 @@ class MixedControl:
             {"agent_id": "slave-a", "instance_id": "slave-a-old", "lease_state": "active", "capabilities": {"operations": ["echo"]}},
             {"agent_id": "slave-a", "instance_id": "slave-a-expired", "lease_state": "expired", "capabilities": {"operations": ["echo"]}},
             {"agent_id": "slave-b", "instance_id": "slave-b-expired", "lease_state": "expired", "capabilities": {"operations": ["echo"]}},
-            {"agent_id": "slave-b", "instance_id": "slave-b-new", "lease_state": "active", "capabilities": {"operations": ["run_code"]}},
+            {
+                "agent_id": "slave-b",
+                "instance_id": "slave-b-new",
+                "lease_state": "active",
+                "capabilities": {
+                    "operations": ["run_code"],
+                    "executor_descriptors": ["subprocess_json_v1"],
+                },
+            },
         ]
 
 
@@ -75,5 +84,39 @@ class MixedControl:
 async def test_refresh_slaves_prefers_active_lease_over_stale_registration():
     repository = RemoteObserverRepository(MixedControl(), content_store=None)
     await repository.refresh_slaves()
-    assert repository.slave_availability == {"slave-a": True, "slave-b": True}
+    assert repository.slave_agents["slave-a"]["instance_id"] == "slave-a-old"
+    assert repository.slave_agents["slave-b"]["instance_id"] == "slave-b-new"
+    assert repository.slave_instances[("slave-b", "slave-b-expired")]["lease_state"] == "expired"
     assert repository.slave_capabilities["slave-b"]["operations"] == {"run_code"}
+    supported = SimpleNamespace(executor_operation="run_code", executor_kind="subprocess_json_v1")
+    unsupported = SimpleNamespace(executor_operation="run_code", executor_kind="unknown_v1")
+    assert repository._slave_supports_package("slave-b", supported) is True
+    assert repository._slave_supports_package("slave-b", unsupported) is False
+
+
+@pytest.mark.asyncio
+async def test_remote_repository_reassigns_with_idempotent_request_id():
+    control = Control()
+    repository = RemoteObserverRepository(control, content_store=None)
+    replacement = {"attempt_id": "attempt-new", "target": "slave-b"}
+
+    async def command(name, arguments=None, **kwargs):
+        control.calls.append((name, arguments or {}, kwargs))
+        return {"attempt": replacement}
+
+    control.command = command
+    result = await repository.reassign_dynamic_node(
+        "run-1",
+        "node-1",
+        lost_attempt_id="attempt-old",
+        expected_execution_id="execution-1",
+        expected_execution_epoch=1,
+        target="slave-b",
+        reason="worker_lease_expired",
+    )
+
+    assert result == replacement
+    name, arguments, kwargs = control.calls[-1]
+    assert name == "node.reassign"
+    assert arguments["lost_attempt_id"] == "attempt-old"
+    assert kwargs["request_id"] == "node-reassign:attempt-old:slave-b"

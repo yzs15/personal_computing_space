@@ -7,6 +7,20 @@ from loom_v2.observer.repository import ObserverRepository
 from loom_v2.contracts.agents import AgentRegistration, DriverCommand
 
 
+async def _register_slave(repo: ObserverRepository, slave_id: str, instance_id: str):
+    return await repo.register_agent(
+        AgentRegistration(
+            role="slave",
+            agent_id=slave_id,
+            instance_id=instance_id,
+            workspace_id="workspace-default",
+            endpoint_url=f"http://{slave_id}",
+            protocol_version="loom.v1",
+            capabilities={"operations": ["run_code"]},
+        )
+    )
+
+
 def registration(instance_id: str, role: str = "driver") -> dict:
     return {"role": role, "agent_id": "driver-default" if role == "driver" else instance_id, "instance_id": instance_id, "workspace_id": "workspace-default", "endpoint_url": "http://driver:8090", "protocol_version": "loom.v1", "capabilities": {"model": "deepseek-v4-flash"}}
 
@@ -63,6 +77,62 @@ async def test_node_fail_command_passes_attempt_and_error_as_keywords():
 
 
 @pytest.mark.asyncio
+async def test_node_reassign_command_passes_fencing_arguments():
+    repo = ObserverRepository()
+    lease = await repo.register_agent(
+        AgentRegistration(
+            role="driver",
+            agent_id="driver-default",
+            instance_id="instance-1",
+            workspace_id="workspace-default",
+            endpoint_url="http://driver:8090",
+            protocol_version="loom.v1",
+        )
+    )
+    run = await repo.open_run("run-reassign", "conversation-reassign", "reassign")
+    calls = {}
+
+    async def fake_reassign(run_id, node_id, **arguments):
+        calls.update(run_id=run_id, node_id=node_id, **arguments)
+        return {"attempt_id": "attempt-replacement"}
+
+    repo.reassign_dynamic_node = fake_reassign
+    result = await repo.execute_driver_command(
+        DriverCommand(
+            request_id="node-reassign:attempt-old:slave-b",
+            driver_id="driver-default",
+            instance_id="instance-1",
+            lease_id=lease.lease_id,
+            driver_epoch=lease.epoch,
+            command="node.reassign",
+            arguments={
+                "run_id": run.run_id,
+                "node_id": "node-1",
+                "lost_attempt_id": "attempt-old",
+                "expected_execution_id": "execution-1",
+                "expected_execution_epoch": 1,
+                "target": "slave-b",
+                "reason": "worker_lease_expired",
+            },
+        )
+    )
+
+    assert result == {
+        "node": {"node_id": "node-1", "state": "dispatched"},
+        "attempt": {"attempt_id": "attempt-replacement"},
+    }
+    assert calls == {
+        "run_id": run.run_id,
+        "node_id": "node-1",
+        "lost_attempt_id": "attempt-old",
+        "expected_execution_id": "execution-1",
+        "expected_execution_epoch": 1,
+        "target": "slave-b",
+        "reason": "worker_lease_expired",
+    }
+
+
+@pytest.mark.asyncio
 async def test_slave_runtime_view_prefers_active_instance_over_expired_history():
     repo = ObserverRepository()
     await repo.register_agent(
@@ -92,10 +162,23 @@ async def test_slave_runtime_view_prefers_active_instance_over_expired_history()
     repo.agents[old_key]["last_seen_at"] = datetime.now(timezone.utc) - timedelta(seconds=60)
     repo.agents = {active_key: repo.agents[active_key], old_key: repo.agents[old_key]}
 
-    await repo.list_agents("workspace-default", role="slave")
+    await repo.refresh_slaves("workspace-default")
 
-    assert repo.slave_availability["slave-a"] is True
+    assert repo.slave_agents["slave-a"]["instance_id"] == "active"
+    assert repo.slave_agents["slave-a"]["lease_state"] == "active"
     assert repo.slave_capabilities["slave-a"]["operations"] == {"echo", "sort"}
+
+
+@pytest.mark.asyncio
+async def test_slave_runtime_snapshot_excludes_expired_instance():
+    repo = ObserverRepository()
+    await _register_slave(repo, "slave-a", "instance-a")
+    key = ("workspace-default", "slave", "slave-a", "instance-a")
+    repo.agents[key]["last_seen_at"] = datetime.now(timezone.utc) - timedelta(seconds=60)
+
+    await repo.refresh_slaves("workspace-default")
+
+    assert repo.slave_agents["slave-a"]["lease_state"] == "expired"
 
 
 @pytest.mark.asyncio
@@ -135,7 +218,8 @@ async def test_registry_keeps_only_one_active_slave_instance_per_agent_id():
     )
 
     agents = await repo.list_agents("workspace-default", role="slave")
-    assert {item["instance_id"] for item in agents} == {"one", "two"}
+    registered = [item for item in agents if item["instance_id"] in {"one", "two"}]
+    assert {item["instance_id"] for item in registered} == {"one", "two"}
     assert next(item for item in agents if item["instance_id"] == "one")["lease_state"] == "expired"
     assert next(item for item in agents if item["instance_id"] == "two")["lease_state"] == "active"
     with pytest.raises(ValueError, match="stale_agent_lease"):

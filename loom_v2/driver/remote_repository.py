@@ -22,6 +22,21 @@ from loom_v2.contracts.types import (
 from .control_client import ObserverControlClient
 
 
+def _select_slave_agents(agents: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    selected: dict[str, dict[str, Any]] = {}
+    for agent in agents:
+        slave_id = str(agent.get("agent_id") or "")
+        if not slave_id:
+            continue
+        current = selected.get(slave_id)
+        if current is None or (
+            agent.get("lease_state") == "active"
+            and current.get("lease_state") != "active"
+        ):
+            selected[slave_id] = dict(agent)
+    return selected
+
+
 @dataclass
 class RemoteRunRecord:
     """The small read model the Driver needs from Observer.
@@ -87,7 +102,8 @@ class RemoteObserverRepository:
         self.content_store = content_store or ContentStore.from_settings(Settings())
         self.workspace_id = control.workspace_id
         self.slave_capabilities: dict[str, dict[str, Any]] = {}
-        self.slave_availability: dict[str, bool] = {}
+        self.slave_agents: dict[str, dict[str, Any]] = {}
+        self.slave_instances: dict[tuple[str, str], dict[str, Any]] = {}
 
     async def get_run(self, run_id: str) -> RemoteRunRecord:
         return _decode_run(await self.control.command("run.get", {"run_id": run_id}))
@@ -124,36 +140,47 @@ class RemoteObserverRepository:
         payload = await self.control.command("capability.get", {"package_ref": ref, "run_id": run_id})
         return CapabilityPackageVersion.model_validate(payload)
 
-    async def refresh_slaves(self) -> list[dict[str, Any]]:
+    async def refresh_slaves(self, workspace_id: str | None = None) -> list[dict[str, Any]]:
         agents = await self.control.list_slaves()
+        self.slave_instances = {
+            (str(agent.get("agent_id") or ""), str(agent.get("instance_id") or "")): dict(agent)
+            for agent in agents
+            if agent.get("agent_id")
+        }
+        self.slave_agents = _select_slave_agents(agents)
         self.slave_capabilities = {}
-        self.slave_availability = {}
-        # A Slave may have several registrations (a restarted container leaves
-        # an expired one behind).  Prefer the active lease for each Slave so a
-        # stale row can never mask a healthy node.
-        best: dict[str, dict[str, Any]] = {}
-        for agent in agents:
-            slave_id = str(agent.get("agent_id") or "")
-            if not slave_id:
+        for slave_id, agent in self.slave_agents.items():
+            if agent.get("lease_state") != "active":
                 continue
-            current = best.get(slave_id)
-            if current is None or (agent.get("lease_state") == "active" and current.get("lease_state") != "active"):
-                best[slave_id] = agent
-        for slave_id, agent in best.items():
             capabilities = dict(agent.get("capabilities") or {})
             operations = capabilities.get("operations", [])
             self.slave_capabilities[slave_id] = {
                 **capabilities,
                 "operations": set(operations),
             }
-            self.slave_availability[slave_id] = agent.get("lease_state") == "active"
         return agents
 
     def _slave_supports_package(self, slave_id: str, package: CapabilityPackageVersion) -> bool:
-        if not self.slave_availability.get(slave_id, False):
+        agent = self.slave_agents.get(slave_id)
+        if agent is None or agent.get("lease_state") != "active":
             return False
         operation = package.executor_operation or "run_code"
-        return operation in self.slave_capabilities.get(slave_id, {}).get("operations", set())
+        details = self.slave_capabilities.get(slave_id, {})
+        if operation not in details.get("operations", set()):
+            return False
+        declared_executors = (
+            details.get("executor_kinds")
+            or details.get("executors")
+            or details.get("executor_descriptors")
+        )
+        if declared_executors:
+            raw_executors = [declared_executors] if isinstance(declared_executors, str) else declared_executors
+            executor_kinds = {
+                str(item.get("kind")) if isinstance(item, dict) else str(item)
+                for item in raw_executors
+            }
+            return package.executor_kind in executor_kinds
+        return True
 
     async def accept_node_intent(self, run_id: str, intent: NodeIntent, *, selected_target: str) -> DynamicNode:
         payload = await self.control.command(
@@ -162,9 +189,17 @@ class RemoteObserverRepository:
         )
         return DynamicNode.model_validate(payload)
 
-    async def dispatch_dynamic_node(self, run_id: str, node_id: str, *, target: str) -> str:
+    async def dispatch_dynamic_node(self, run_id: str, node_id: str, *, target: str) -> dict[str, Any]:
         payload = await self.control.command("node.dispatch", {"run_id": run_id, "node_id": node_id, "target": target})
-        return str(payload["attempt_id"])
+        return dict(payload["attempt"])
+
+    async def reassign_dynamic_node(self, run_id: str, node_id: str, **arguments: Any) -> dict[str, Any]:
+        payload = await self.control.command(
+            "node.reassign",
+            {"run_id": run_id, "node_id": node_id, **arguments},
+            request_id=f"node-reassign:{arguments['lost_attempt_id']}:{arguments['target']}",
+        )
+        return dict(payload["attempt"])
 
     async def record_dynamic_node_result(self, run_id: str, node_id: str, result: dict[str, Any]) -> DynamicNode:
         payload = await self.control.command("node.result", {"run_id": run_id, "node_id": node_id, "result": result})

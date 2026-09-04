@@ -21,7 +21,7 @@ class ObserverControlClient:
             "run.readiness", "run.recovery.list", "run.recovery.mark", "message.append", "message.claim", "message.update", "message.release", "agent_signal.record",
             "run.result",
             "thread.bind", "thread.get", "turn.state", "capability.list", "capability.get", "capability.health",
-            "node.accept", "node.dispatch", "node.result", "node.fail",
+            "node.accept", "node.dispatch", "node.reassign", "node.result", "node.fail",
         }
     )
 

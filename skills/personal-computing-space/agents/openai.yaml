@@ -1,0 +1,4 @@
+interface:
+  display_name: "Personal Computing Space"
+  short_description: "Submit and monitor distributed tasks through Loom Observer"
+  default_prompt: "Use $personal-computing-space to submit this distributed task through the Observer and monitor it to a terminal outcome."

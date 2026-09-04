@@ -8,6 +8,7 @@ both WorkspaceReplica Slaves (slave-a and slave-b) with a correct aggregate.
 import json
 import math
 import time
+import importlib.util
 from pathlib import Path
 from uuid import uuid4
 
@@ -16,6 +17,63 @@ import pytest
 
 OBSERVER_URL = "http://localhost:18080"
 APP_DIR = Path(__file__).resolve().parents[2] / "examples" / "distributed-statistics"
+SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "accept-bandgap.py"
+SCRIPT_SPEC = importlib.util.spec_from_file_location("accept_bandgap", SCRIPT_PATH)
+assert SCRIPT_SPEC is not None and SCRIPT_SPEC.loader is not None
+SCRIPT_MODULE = importlib.util.module_from_spec(SCRIPT_SPEC)
+SCRIPT_SPEC.loader.exec_module(SCRIPT_MODULE)
+SlaveFailureController = SCRIPT_MODULE.SlaveFailureController
+
+
+def test_failure_controller_stops_after_completed_and_running_nodes():
+    commands: list[list[str]] = []
+    controller = SlaveFailureController(
+        docker_bin="docker",
+        compose_file="deploy/docker-compose.yml",
+        run_command=lambda command: commands.append(command),
+    )
+
+    controller.observe(
+        {
+            "execution_id": "execution-1",
+            "execution_epoch": 1,
+            "dynamic_nodes": [
+                {"node_id": "node-complete", "state": "completed"},
+                {"node_id": "node-running", "state": "dispatched"},
+            ],
+            "attempts": [
+                {"node_id": "node-complete", "target": "slave-b", "state": "completed"},
+                {"node_id": "node-running", "target": "slave-a", "state": "running"},
+            ],
+        }
+    )
+    controller.restore()
+
+    assert commands == [
+        ["docker", "compose", "-f", "deploy/docker-compose.yml", "stop", "slave-a"],
+        ["docker", "compose", "-f", "deploy/docker-compose.yml", "start", "slave-a"],
+    ]
+    assert controller.execution_id == "execution-1"
+    assert controller.execution_epoch == 1
+
+
+def test_failure_controller_does_not_stop_before_partial_progress():
+    commands: list[list[str]] = []
+    controller = SlaveFailureController(
+        docker_bin="docker",
+        compose_file="deploy/docker-compose.yml",
+        run_command=lambda command: commands.append(command),
+    )
+
+    controller.observe(
+        {
+            "dynamic_nodes": [{"node_id": "node-running", "state": "dispatched"}],
+            "attempts": [{"node_id": "node-running", "target": "slave-a", "state": "created"}],
+        }
+    )
+    controller.restore()
+
+    assert commands == []
 
 
 def _read(name: str) -> str:
@@ -185,7 +243,10 @@ def test_live_distributed_statistics_across_both_slaves():
 
         # 8. Verify multi-node distribution across both Slaves.
         accepted = [event for event in run["events"] if event.get("phase") in {"node_accepted", "node_reassigned"}]
-        targets = {event.get("selected_target") or event.get("target") for event in accepted}
+        targets = {
+            event.get("selected_target") or event.get("to_target") or event.get("target")
+            for event in accepted
+        }
         assert {"slave-a", "slave-b"} <= targets, f"expected both slaves, got {targets}"
         assert len(run["dynamic_nodes"]) == 5, len(run["dynamic_nodes"])
 
@@ -220,4 +281,3 @@ def _poll_run(client: httpx.Client, run_id: str, *, timeout: float) -> dict:
             return run
         time.sleep(2.0)
     raise TimeoutError(f"run {run_id} did not reach a terminal state")
-

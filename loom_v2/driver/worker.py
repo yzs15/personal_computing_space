@@ -17,6 +17,10 @@ from loom_v2.contracts.types import (
 from loom_v2.slave.executor import ExecutionResult
 
 
+class WorkerUnavailableError(RuntimeError):
+    pass
+
+
 class WorkerSession:
     """Authenticated HTTP client for one directly-connected Slave."""
 
@@ -123,6 +127,6 @@ class WorkerSession:
                 async with httpx.AsyncClient(timeout=self.operation_timeout, transport=self.transport) as client:
                     return await client.post(f"{self.base_url}{path}", json=payload, headers=self._headers())
         except (TimeoutError, httpx.TimeoutException) as exc:
-            raise RuntimeError("worker_operation_timeout") from exc
+            raise WorkerUnavailableError("worker_operation_timeout") from exc
         except httpx.TransportError as exc:
-            raise RuntimeError("worker_unavailable") from exc
+            raise WorkerUnavailableError("worker_unavailable") from exc

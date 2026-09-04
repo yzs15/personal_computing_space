@@ -181,32 +181,6 @@ async def test_observer_rejects_stale_attempt_and_epoch_terminal_reports():
 
 
 @pytest.mark.asyncio
-async def test_observer_reassignment_fences_old_attempt_epoch():
-    repo = ObserverRepository()
-    record = await repo.open_run("run-reassignment-fencing", "conversation-reassignment-fencing", "echo", allow_reassignment=True)
-    await repo.begin_refinement(record.run_id)
-    committed = await repo.commit(record.run_id, record.draft_version, record.draft_digest)
-    await repo.start(record.run_id, committed.version_id)
-    old_attempt = (await repo.get_run(record.run_id)).attempts[0]["attempt_id"]
-    await repo.set_slave_availability("slave-a", False)
-    updated = await repo.reconcile(record.run_id)
-
-    assert updated.execution_epoch == 2
-    assert updated.attempts[-1]["execution_epoch"] == 2
-    with pytest.raises(ValueError, match="stale_execution_epoch"):
-        await repo.record_result(
-            record.run_id,
-            {
-                "attempt_id": old_attempt,
-                "execution_id": record.execution_id,
-                "execution_epoch": 1,
-                "value": {"text": "hello"},
-                "digest": "d",
-            },
-        )
-
-
-@pytest.mark.asyncio
 async def test_observer_reexecutes_validator_instead_of_trusting_slave_evidence():
     repo = ObserverRepository()
     validator_ref = await repo.put_content(

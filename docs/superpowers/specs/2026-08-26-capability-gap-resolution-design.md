@@ -1,7 +1,8 @@
 # 能力缺口闭环设计（Capability Gap Resolution）
 
 **日期：** 2026-08-26
-**状态：** 设计（待评审）
+**修订日期：** 2026-09-04
+**状态：** 设计（补充可复用高层闭包与能力洞语义）
 
 ## 1. 背景与目标
 
@@ -77,6 +78,29 @@ ComputeRequirement = {
 TypedHole = ?h_matmul : ComputeRealization
 ```
 
+### 2.3 可复用高层闭包与能力洞
+
+可复用的不是某一次 Run 的完整执行快照，而是一个可以继续实例化的高层闭包模板。模板固定业务语义和可验证约束，但允许实现仍处于能力洞状态：
+
+```text
+ReusableClosureTemplate = {
+  closure_contract,          # goal、success criteria、effects、policy、budget bounds
+  logical_input_contract,    # 输入/输出 schema 与 provenance 要求
+  execution_graph,           # 节点及其依赖关系，不固化目标 Slave
+  capability_holes           # operation、IoContract、effect、permission、replay 约束
+}
+```
+
+模板中的 `capability_hole` 只描述所需 operation 及其约束，不要求预先存在 `package_ref` 或程序实现。实例化新 Run 时，对每个洞按以下顺序处理：
+
+1. 在 Workspace 可见的 `workspace_reusable/published` 能力中，确定性匹配满足约束且 activation=`ready` 的包，并绑定精确 `package_ref` 与 digest；
+2. 若不存在可匹配包，将该洞交给 coding-agent 细化为本 Run 的 `run_bound` candidate；
+3. 所有必需洞完成绑定后，才生成带精确包引用的可执行闭包版本并进行 readiness、commit 和 start。
+
+因此，模板本身可以不可执行；只有实例化后的闭包要求所有面向所选目标的必需洞都绑定。能力包内部声明的 `provider_fillable` 洞仍由 Slave activation 阶段填写，不能被误当成模板已经完成了实现绑定。
+
+模板复用只复用高层语义、约束、IoContract 和逻辑执行图，不复用旧 Run 的 execution、Attempt、节点状态或结果。模板实例化必须产生新的 Run 和新的 committed closure version；内容寻址的输入、程序和契约可以按 digest 复用。
+
 针对当前 Run 所选目标 Slave 的执行/activation 闭包 `C'_target` 保留上述 Application 语义，并增加下列目标相关系统实现。它不是可复用能力包定义本身；可复用包仍可保留声明过的 provider hole：
 
 ```text
@@ -113,7 +137,7 @@ ComputeBinding = {
 - 子结果的 schema、精度、预算、权限和本地性约束必须按传播规则进入子闭包，并由父级 validator 验证聚合结果；
 - 当前版本不引入动态 DAG fan-out。若采用分解，必须在闭包版本中显式表达有限、可校验的子节点和聚合关系；需要动态 fan-out 时另行扩展设计。
 
-### 2.3 一个聚合、两个正交状态面
+### 2.4 一个聚合、两个正交状态面
 
 为避免把“包已发布”和“某个 Slave 已可执行”混为一谈，`CapabilityPackage` 对外保持一个概念，内部保留两个正交状态面：
 
