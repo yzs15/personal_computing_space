@@ -3,27 +3,55 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
+from dataclasses import dataclass
+from typing import Any
 
 from loom_v2.coding_agents.fake import FakeCodingAgentProvider
+from loom_v2.contracts.types import ResourceRef
 from loom_v2.driver.service import DriverService
 from loom_v2.observer.repository import ObserverRepository
-from loom_v2.content_store import ContentStore
+from loom_v2.content_store import ContentStat, ContentStore, canonical_json_bytes
+from loom_v2.slave.service import SlaveService
+
+
+@dataclass
+class _SelfTestContentStore:
+    """Small process-local store used by ``--self-test``.
+
+    The production services use the S3-backed ``ContentStore``.  The CLI
+    self-test must remain standalone, so it supplies the same async contract
+    without requiring MinIO or another external service.
+    """
+
+    values: dict[str, tuple[bytes, str]]
+
+    async def put(self, content: Any, *, media_type: str) -> ResourceRef:
+        body = content if isinstance(content, bytes) else content.encode("utf-8") if isinstance(content, str) else canonical_json_bytes(content)
+        digest = ContentStore.digest(body)
+        self.values.setdefault(digest, (body, media_type))
+        return ResourceRef(resource_id=f"content://sha256/{digest}", version_or_digest=digest, identity_criterion="content_digest")
+
+    async def get(self, ref: ResourceRef, *, expected_digest: str | None = None) -> bytes:
+        digest = (expected_digest or ref.version_or_digest or ref.resource_id.rsplit("/", 1)[-1]).lower()
+        body = self.values[digest][0]
+        if expected_digest is not None and ContentStore.digest(body) != expected_digest.lower():
+            raise ValueError("content_digest_mismatch")
+        return body
+
+    async def stat(self, ref: ResourceRef) -> ContentStat | None:
+        digest = (ref.version_or_digest or ref.resource_id.rsplit("/", 1)[-1]).lower()
+        value = self.values.get(digest)
+        if value is None:
+            return None
+        body, media_type = value
+        return ContentStat(size=len(body), declared_digest=digest, media_type=media_type, integrity_verified=ContentStore.digest(body) == digest)
 
 
 async def _self_test() -> None:
-    # The self-test is a deterministic control-plane check and does not touch
-    # content.  Give its repository an explicit local S3 configuration so it
-    # remains runnable without starting the Compose stack first.
-    store = ContentStore(
-        endpoint_url=os.getenv("LOOM_S3_ENDPOINT_URL", "http://127.0.0.1:9000"),
-        bucket=os.getenv("LOOM_S3_BUCKET", "loom-content"),
-        access_key=os.getenv("LOOM_S3_ACCESS_KEY", "loom"),
-        secret_key=os.getenv("LOOM_S3_SECRET_KEY", "loom-content-secret"),
-        region=os.getenv("LOOM_S3_REGION", "us-east-1"),
-        prefix=os.getenv("LOOM_S3_PREFIX", ""),
-    )
-    result = await DriverService(ObserverRepository(content_store=store), FakeCodingAgentProvider()).run_prompt("cli-self-test", "echo hello")
+    store = _SelfTestContentStore({})
+    repository = ObserverRepository(content_store=store)
+    slave = SlaveService("slave-a", content_store=store)
+    result = await DriverService(repository, FakeCodingAgentProvider(), slaves={"slave-a": slave}).run_prompt("cli-self-test", "run the packaged test program")
     print(json.dumps(result, sort_keys=True))
 
 

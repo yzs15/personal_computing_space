@@ -12,19 +12,19 @@ async def test_observer_repository_persists_run_snapshot():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     repo = ObserverRepository(engine)
     await repo.init_db()
-    created = await repo.open_run("persisted-run", "task-1", "echo")
+    created = await repo.open_run("persisted-run", "task-1", "persist snapshot")
     restored_repo = ObserverRepository(engine)
     await restored_repo.init_db()
     restored = await restored_repo.get_run(created.run_id)
     assert restored.task_ref == "task-1"
-    assert restored.draft.snapshot.metadata["goal"] == "echo"
+    assert restored.draft.snapshot.metadata["goal"] == "persist snapshot"
 
 
 async def test_observer_repository_persists_attempt_instance_binding():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     repo = ObserverRepository(engine)
     await repo.init_db()
-    created = await repo.open_run("attempt-binding", "task-attempt-binding", "echo")
+    created = await repo.open_run("attempt-binding", "task-attempt-binding", "record attempt binding")
     created.attempts.append(
         {
             "attempt_id": "attempt-1",
@@ -52,10 +52,10 @@ async def test_observer_repository_persists_closure_contract():
     await repo.init_db()
     contract = ClosureContract(
         closure_id="closure-1",
-        goal="sort numbers",
-        required_success_criteria=[{"criterion_id": "sorted"}],
+        goal="transform numbers",
+        required_success_criteria=[{"criterion_id": "transformed"}],
         resource_budget={"max_attempts": 2},
-        body=TaskClosure(program={"operation_ref": "loom://sort"}),
+        body=TaskClosure(program={"operation_ref": "loom://test_transform"}),
     )
     created = await repo.open_run("contract-run", "conversation-contract", contract.goal, closure_contract=contract)
     restored_repo = ObserverRepository(engine)
@@ -69,24 +69,24 @@ async def test_observer_repository_normalizes_legacy_structured_operation_ref():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     repo = ObserverRepository(engine)
     await repo.init_db()
-    created = await repo.open_run("legacy-op-run", "legacy-op-conversation", "echo")
+    created = await repo.open_run("structured-op-run", "structured-op-conversation", "normalize operation ref")
     sessions = make_session_factory(engine)
     async with sessions() as session:
         row = await session.get(RunRow, created.run_id)
         draft = deepcopy(row.draft)
-        draft["snapshot"]["program"]["operation_ref"] = {"program_ref": "loom://echo"}
+        draft["snapshot"]["program"]["operation_ref"] = {"program_ref": "loom://test_transform"}
         row.draft = draft
         await session.commit()
 
     restored = await ObserverRepository(engine).get_run(created.run_id)
-    assert restored.draft.snapshot.program.operation_ref == "loom://echo"
+    assert restored.draft.snapshot.program.operation_ref == "loom://test_transform"
 
 
 async def test_repository_recovers_orphaned_refinement_after_restart():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     repo = ObserverRepository(engine)
     await repo.init_db()
-    created = await repo.open_run("orphan-refinement", "conversation-recovery", "echo")
+    created = await repo.open_run("orphan-refinement", "conversation-recovery", "recover refinement")
     await repo.begin_refinement(created.run_id)
 
     restored = ObserverRepository(engine)
@@ -106,7 +106,7 @@ async def test_repository_recovers_orphaned_execution_and_fences_attempt():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     repo = ObserverRepository(engine)
     await repo.init_db()
-    created = await repo.open_run("orphan-execution", "conversation-recovery-exec", "echo")
+    created = await repo.open_run("orphan-execution", "conversation-recovery-exec", "recover execution")
     await repo.begin_refinement(created.run_id)
     committed = await repo.commit(created.run_id, created.draft.version_id, created.draft.snapshot_digest)
     await repo.start(created.run_id, committed.version_id)
@@ -147,7 +147,7 @@ async def test_sql_registry_keeps_only_one_active_slave_instance_per_agent_id():
 
 async def test_default_run_budget_does_not_limit_attempts():
     repo = ObserverRepository()
-    run = await repo.open_run("default-budget", "conversation-default-budget", "echo")
+    run = await repo.open_run("default-budget", "conversation-default-budget", "default budget")
     assert "max_attempts" not in run.closure_contract.resource_budget
 
 
@@ -155,7 +155,7 @@ async def test_repository_recovery_does_not_change_terminal_runs():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     repo = ObserverRepository(engine)
     await repo.init_db()
-    created = await repo.open_run("completed-run", "conversation-recovery-terminal", "echo")
+    created = await repo.open_run("completed-run", "conversation-recovery-terminal", "terminal recovery")
     created.state = "completed"
     created.outcome = {"value": "ok"}
     await repo._persist(created)

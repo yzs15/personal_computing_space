@@ -100,6 +100,7 @@ class WorkerSession:
             terminal_state=terminal_state,
             terminal_error=report.get("error") or report.get("terminal_error"),
             validation_evidence=report.get("validation_evidence") or [],
+            provenance=result.get("provenance") or report.get("provenance"),
         )
 
     async def provision(

@@ -163,11 +163,13 @@ def create_app(slave_id: str | None = None, *, observer_transport: httpx.AsyncBa
                 "state": result.terminal_state,
                 "error": result.terminal_error,
                 "validation_evidence": result.validation_evidence,
+                "provenance": result.provenance,
                 "result": {
                     "resource_ref": result.resource_ref.model_dump(mode="json"),
                     "value": result.value,
                     "replay_safety": result.replay_safety,
                     "digest": result.digest,
+                    "provenance": result.provenance,
                 },
             },
         }

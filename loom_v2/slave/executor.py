@@ -22,6 +22,7 @@ class ExecutionResult:
     terminal_state: str = "completed"
     terminal_error: dict[str, Any] | None = None
     validation_evidence: list[dict[str, Any]] = field(default_factory=list)
+    provenance: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -56,21 +57,6 @@ def _result(value: Any, replay_safety: str = "Idempotent") -> ExecutionResult:
         replay_safety=replay_safety,
         digest=digest,
     )
-
-
-class BuiltinV1Adapter:
-    descriptor = ExecutorDescriptor(kind="builtin_v1", operations=frozenset({"echo", "hash", "sort", "run_code"}))
-
-    async def execute(self, operation: str, payload: dict[str, Any], *, program: bytes | None = None) -> ExecutionResult:
-        if operation == "echo":
-            return _result(payload)
-        if operation == "hash":
-            return _result({"sha256": hashlib.sha256(str(payload.get("text", "")).encode()).hexdigest()})
-        if operation == "sort":
-            return _result({"items": sorted(payload.get("items", []))})
-        if operation == "run_code":
-            raise ValueError("run_code_requires_subprocess_adapter")
-        raise ValueError(f"unsupported_operation:{operation}")
 
 
 class SubprocessJSONV1Adapter:
@@ -121,7 +107,7 @@ class SubprocessJSONV1Adapter:
 class ExecutorRegistry:
     def __init__(self, adapters: list[ExecutorAdapter] | None = None, *, capability_timeout_seconds: float | None = None) -> None:
         self._adapters: dict[str, ExecutorAdapter] = {}
-        for adapter in adapters or [BuiltinV1Adapter(), SubprocessJSONV1Adapter(capability_timeout_seconds)]:
+        for adapter in adapters or [SubprocessJSONV1Adapter(capability_timeout_seconds)]:
             self.register(adapter)
 
     def register(self, adapter: ExecutorAdapter | str, implementation: ExecutorAdapter | None = None) -> None:
@@ -154,10 +140,5 @@ default_registry = ExecutorRegistry()
 
 FUTURE_EXECUTOR_KINDS = frozenset({"http_service_v1", "grpc_service_v1", "mcp_v1"})
 
-# Public aliases mirror the wire-level adapter kinds used in the design.
-builtin_v1 = BuiltinV1Adapter
+# Public alias mirrors the wire-level adapter kind used in the design.
 subprocess_json_v1 = SubprocessJSONV1Adapter
-
-
-async def execute_operation(operation: str, payload: dict[str, Any]) -> ExecutionResult:
-    return await default_registry.execute("builtin_v1", operation, payload)

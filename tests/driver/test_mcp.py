@@ -22,13 +22,13 @@ async def test_open_run_is_agent_decision_and_contract_is_scoped_by_driver():
         {
             "closure_contract": {
                 "closure_id": "closure-mcp",
-                "goal": "sort numbers",
-                "required_success_criteria": [{"criterion_id": "sorted"}],
+                "goal": "transform numbers",
+                "required_success_criteria": [{"criterion_id": "transformed"}],
                 "allowed_effects": ["read_workspace"],
                 "resource_budget": {"max_attempts": 2},
                 "recovery_policy": {"allow_reassignment": False},
                 "result_expectations": [{"kind": "content"}],
-                "body": TaskClosure(program={"operation_ref": "loom://sort"}).model_dump(mode="json"),
+                "body": TaskClosure(program={"operation_ref": "loom://test_transform"}).model_dump(mode="json"),
             }
         },
     )
@@ -73,30 +73,68 @@ async def test_apply_plan_patch_accepts_explicit_operation_alias_from_json_tool_
     mcp = DriverMCP(repo, "conversation-mcp-alias")
     await mcp.call(
         "loom_open_run",
-        {"closure_contract": {"closure_id": "closure-alias", "goal": "echo", "body": {"closure_id": "closure-alias"}}},
+        {"closure_contract": {"closure_id": "closure-alias", "goal": "run test code", "body": {"closure_id": "closure-alias"}}},
     )
 
     result = await mcp.call(
         "loom_apply_plan_patch",
-        {"ops": [{"op": "set_program_ref", "value": {"program_ref": "loom://echo"}}]},
+        {"ops": [{"op": "set_program_ref", "value": {"program_ref": "loom://test_alias"}}]},
     )
 
     assert result["draft_version"].startswith("draft-")
     run = await repo.get_run(mcp.run_id)
-    assert run.draft.snapshot.program.operation_ref == "loom://echo"
+    assert run.draft.snapshot.program.operation_ref == "loom://test_alias"
 
 
 @pytest.mark.asyncio
 async def test_bind_compute_hole_accepts_capability_uri_target_for_registered_slave():
     repo = ObserverRepository()
     mcp = DriverMCP(repo, "conversation-mcp-binding-uri")
+    program = await mcp.call(
+        "loom_put_content",
+        {"media_type": "text/x-python", "content": "import json,sys; print(json.dumps(json.load(sys.stdin)))"},
+    )
+    contract = await mcp.call(
+        "loom_put_content",
+        {
+            "media_type": "application/vnd.loom.io-contract+json",
+            "content": {
+                "schema_version": "io.v1",
+                "input_schema_ref": None,
+                "output_schema_ref": None,
+                "success_semantics": None,
+                "success_validator_ref": None,
+            },
+        },
+    )
     await mcp.call(
-        "loom_open_run",
-        {"closure_contract": {"closure_id": "closure-binding-uri", "goal": "sort", "body": {"closure_id": "closure-binding-uri"}}},
+        "loom_open_run", {"closure_contract": {"closure_id": "closure-binding-uri", "goal": "run package", "body": {"closure_id": "closure-binding-uri"}}},
     )
     await mcp.call(
         "loom_apply_plan_patch",
-        {"ops": [{"kind": "set_program_ref", "value": "loom://sort"}, {"kind": "add_typed_hole", "value": {"hole_id": "h_sort"}}]},
+        {"ops": [
+            {"kind": "set_program_ref", "value": "loom://test_binding"},
+            {"kind": "set_io_contract_ref", "value": contract["resource_ref"]},
+            {"kind": "set_compute_spec", "value": {"operation_ref": "loom://test_binding"}},
+            {"kind": "add_typed_hole", "value": {"hole_id": "h_binding"}},
+        ]},
+    )
+    await mcp.call(
+        "loom_apply_plan_patch",
+        {
+            "ops": [{
+                "kind": "materialize_capability_package_candidate",
+                "value": {
+                    "package_id": "mcp-binding-package",
+                    "package_version": "v1",
+                    "operation_descriptor_ref": "loom://test_binding",
+                    "program_content_ref": program["resource_ref"],
+                    "io_contract_ref": contract["resource_ref"],
+                    "executor_kind": "subprocess_json_v1",
+                    "executor_operation": "run_code",
+                },
+            }],
+        },
     )
 
     await mcp.call(
@@ -106,11 +144,12 @@ async def test_bind_compute_hole_accepts_capability_uri_target_for_registered_sl
                 {
                     "kind": "bind_compute_hole",
                     "value": {
-                        "binding_id": "binding-sort",
-                        "hole_id": "h_sort",
-                        "capability_descriptor_ref": {"resource_id": "loom://capability/slave-a"},
+                        "binding_id": "binding-test",
+                        "hole_id": "h_binding",
+                        "capability_descriptor_ref": {"resource_id": "executor://subprocess_json_v1/1"},
+                        "capability_package_ref": {"resource_id": "capability-package://mcp-binding-package/v1"},
                         "target_resource_ref": {"resource_id": "loom://compute/slave-a"},
-                        "realization_digest": "sort-binding",
+                        "realization_digest": program["resource_ref"]["version_or_digest"],
                     },
                 }
             ]
@@ -131,14 +170,14 @@ async def test_open_run_coerces_natural_language_body_to_task_closure_metadata()
         {
             "closure_contract": {
                 "closure_id": "closure-body-text",
-                "goal": "sort numbers",
-                "body": "Invoke the sort program and return the sorted result.",
+                "goal": "transform numbers",
+                "body": "Invoke the transform program and return the result.",
             }
         },
     )
 
     run = await repo.get_run(opened["run_id"])
-    assert run.closure_contract.body.metadata["description"].startswith("Invoke the sort")
+    assert run.closure_contract.body.metadata["description"].startswith("Invoke the transform")
 
 
 @pytest.mark.asyncio
@@ -150,13 +189,13 @@ async def test_open_run_uses_goal_as_execution_prompt_when_transport_has_no_prom
         {
             "closure_contract": {
                 "closure_id": "closure-no-prompt",
-                "goal": "echo the run goal",
+                "goal": "run the goal",
                 "body": {"closure_id": "closure-no-prompt"},
             }
         },
     )
 
-    assert mcp.prompt == "echo the run goal"
+    assert mcp.prompt == "run the goal"
 
 
 @pytest.mark.asyncio
@@ -182,7 +221,7 @@ async def test_start_run_returns_repair_outcome_as_successful_tool_call():
     mcp = DriverMCP(
         repo,
         "conversation-mcp-repair",
-        prompt="echo failure",
+        prompt="run failure",
         run_executor=service._execute_and_wait_local,
     )
     await mcp.call(
@@ -190,10 +229,10 @@ async def test_start_run_returns_repair_outcome_as_successful_tool_call():
         {
             "closure_contract": {
                 "closure_id": "closure-mcp-repair",
-                "goal": "echo failure",
+                "goal": "run failure",
                 "body": {
                     "closure_id": "closure-mcp-repair",
-                    "program": {"operation_ref": "loom://echo"},
+                    "program": {"operation_ref": ""},
                 },
             }
         },
@@ -240,7 +279,7 @@ async def test_start_run_wakes_when_run_is_cancelled():
                 "goal": "wait",
                 "body": {
                     "closure_id": "closure-mcp-cancelled",
-                    "program": {"operation_ref": "loom://echo"},
+                    "program": {"operation_ref": ""},
                 },
             }
         },

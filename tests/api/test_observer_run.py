@@ -12,7 +12,7 @@ from loom_v2.observer.repository import ObserverRepository
 
 def test_draft_patch_commit_and_start_are_explicit():
     client = TestClient(create_app())
-    run = client.post("/api/v1/runs", json={"task_ref": "task-1", "goal": "echo"}).json()
+    run = client.post("/api/v1/runs", json={"task_ref": "task-1", "goal": "validate result"}).json()
     patch = client.post(
         f"/api/v1/runs/{run['run_id']}/patches",
         json={
@@ -33,18 +33,18 @@ def test_draft_patch_commit_and_start_are_explicit():
 def test_open_run_persists_complete_closure_contract():
     client = TestClient(create_app())
     contract = {
-        "closure_id": "closure-sort",
-        "goal": "sort numbers",
-        "required_success_criteria": [{"criterion_id": "sorted", "kind": "deterministic"}],
+        "closure_id": "closure-transform",
+        "goal": "transform numbers",
+        "required_success_criteria": [{"criterion_id": "ordered", "kind": "deterministic"}],
         "allowed_effects": ["read_workspace"],
         "resource_budget": {"max_node_concurrency": 1, "max_attempts": 2},
         "recovery_policy": {"allow_reassignment": True, "retry_on": ["timeout"]},
         "result_expectations": [{"kind": "content", "identity_criterion": "content_digest"}],
         "declared_constraints": [],
         "body": {
-            "closure_id": "closure-sort",
-            "program": {"operation_ref": "loom://sort"},
-            "compute": {"operation_ref": "loom://sort"},
+            "closure_id": "closure-transform",
+            "program": {"operation_ref": "loom://test_transform"},
+            "compute": {"operation_ref": "loom://test_transform"},
         },
     }
     response = client.post(
@@ -53,14 +53,14 @@ def test_open_run_persists_complete_closure_contract():
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["goal"] == "sort numbers"
-    assert payload["closure_contract"]["required_success_criteria"][0]["criterion_id"] == "sorted"
+    assert payload["goal"] == "transform numbers"
+    assert payload["closure_contract"]["required_success_criteria"][0]["criterion_id"] == "ordered"
     assert payload["closure_contract"]["resource_budget"]["max_attempts"] == 2
 
 
 def test_duplicate_patch_returns_same_receipt():
     client = TestClient(create_app())
-    run = client.post("/api/v1/runs", json={"task_ref": "task-2", "goal": "echo"}).json()
+    run = client.post("/api/v1/runs", json={"task_ref": "task-2", "goal": "validate result"}).json()
     body = {
         "operation_id": "same-op",
         "base_draft_version": run["draft_version"],
@@ -88,13 +88,13 @@ async def test_observer_record_result_projects_schema_failure_to_awaiting_decisi
     )
     contract = ClosureContract(
         closure_id="closure-record-validation",
-        goal="echo",
+        goal="validate output",
         body=TaskClosure(
             closure_id="closure-record-validation",
-            program={"operation_ref": "loom://echo", "io_contract_ref": contract_ref.model_dump(mode="json")},
+            program={"io_contract_ref": contract_ref.model_dump(mode="json")},
         ),
     )
-    record = await repo.open_run("run-record-validation", "conversation-record-validation", "echo", closure_contract=contract)
+    record = await repo.open_run("run-record-validation", "conversation-record-validation", "validate output", closure_contract=contract)
     await repo.begin_refinement(record.run_id)
     committed = await repo.commit(record.run_id, record.draft_version, record.draft_digest)
     await repo.start(record.run_id, committed.version_id)
@@ -123,7 +123,7 @@ async def test_observer_record_result_projects_schema_failure_to_awaiting_decisi
 @pytest.mark.asyncio
 async def test_observer_recomputes_output_digest_and_resource_ref_identity():
     repo = ObserverRepository()
-    record = await repo.open_run("run-digest-validation", "conversation-digest-validation", "echo")
+    record = await repo.open_run("run-digest-validation", "conversation-digest-validation", "validate digest")
     await repo.begin_refinement(record.run_id)
     committed = await repo.commit(record.run_id, record.draft_version, record.draft_digest)
     await repo.start(record.run_id, committed.version_id)
@@ -146,7 +146,7 @@ async def test_observer_recomputes_output_digest_and_resource_ref_identity():
 @pytest.mark.asyncio
 async def test_observer_requires_execution_id_on_terminal_report():
     repo = ObserverRepository()
-    record = await repo.open_run("run-execution-id", "conversation-execution-id", "echo")
+    record = await repo.open_run("run-execution-id", "conversation-execution-id", "validate execution id")
     await repo.begin_refinement(record.run_id)
     committed = await repo.commit(record.run_id, record.draft_version, record.draft_digest)
     await repo.start(record.run_id, committed.version_id)
@@ -162,7 +162,7 @@ async def test_observer_requires_execution_id_on_terminal_report():
 @pytest.mark.asyncio
 async def test_observer_rejects_stale_attempt_and_epoch_terminal_reports():
     repo = ObserverRepository()
-    record = await repo.open_run("run-stale-terminal", "conversation-stale-terminal", "echo")
+    record = await repo.open_run("run-stale-terminal", "conversation-stale-terminal", "validate terminal fencing")
     await repo.begin_refinement(record.run_id)
     committed = await repo.commit(record.run_id, record.draft_version, record.draft_digest)
     await repo.start(record.run_id, committed.version_id)
@@ -199,13 +199,13 @@ async def test_observer_reexecutes_validator_instead_of_trusting_slave_evidence(
     )
     contract = ClosureContract(
         closure_id="closure-validator-authority",
-        goal="echo",
+        goal="validate result",
         body=TaskClosure(
             closure_id="closure-validator-authority",
-            program={"operation_ref": "loom://echo", "io_contract_ref": contract_ref.model_dump(mode="json")},
+            program={"io_contract_ref": contract_ref.model_dump(mode="json")},
         ),
     )
-    record = await repo.open_run("run-validator-authority", "conversation-validator-authority", "echo", closure_contract=contract)
+    record = await repo.open_run("run-validator-authority", "conversation-validator-authority", "validate result", closure_contract=contract)
     await repo.begin_refinement(record.run_id)
     committed = await repo.commit(record.run_id, record.draft_version, record.draft_digest)
     await repo.start(record.run_id, committed.version_id)

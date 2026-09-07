@@ -92,7 +92,7 @@ Interrupt(session, expected_turn_ref)
 Close(session)
 ```
 
-`FakeCodingAgentProvider` 固定生成可执行的 echo/hash/sort 单 Node 闭包，用于单元测试、PostgreSQL 集成测试、故障注入和无外部网络的 M0 验收。
+`FakeCodingAgentProvider` 固定生成一个通过 `subprocess_json_v1/run_code` package 执行的单 Node 闭包，用于单元测试、PostgreSQL 集成测试、故障注入和无外部网络的 M0 验收。
 
 `CodexAppServerProvider`：
 
@@ -126,9 +126,9 @@ Close(session)
 
 ```python
 @task_closure(
-    goal="hash the supplied dataset",
+    goal="aggregate the supplied dataset",
     data=DataApplication(...),
-    program=ProgramApplication(operation_ref="grip://loom/operation/hash"),
+    program=ProgramApplication(operation_ref="loom://test_aggregate"),
     compute=ComputeSpec(capability_intent="cpu", typed_holes=[compute_hole("h_compute")]),
 )
 @attach_constraint(
@@ -140,13 +140,13 @@ Close(session)
         propagation={"detail": "keep_or_tighten", "retry": "cumulative"},
     )
 )
-def hash_task():
+def aggregate_task():
     ...
 
-closure_contract = hash_task.materialize_contract()
+closure_contract = aggregate_task.materialize_contract()
 ```
 
-`materialize_contract()` 只读取装饰器生成的显式 metadata，输出 canonical `TaskClosure`/`Constraint` JSON；Runtime 不执行 `hash_task` 来推断语义，不扫描函数体，不运行装饰器传入的代码。所有 patch、CAS、commit、provenance 和 `A(C') ⊨ A(C)` 校验仍走 `apply_plan_patch`/`commit_plan`，装饰器不能绕过 Driver/Observer。
+`materialize_contract()` 只读取装饰器生成的显式 metadata，输出 canonical `TaskClosure`/`Constraint` JSON；Runtime 不执行 `aggregate_task` 来推断语义，不扫描函数体，不运行装饰器传入的代码。所有 patch、CAS、commit、provenance 和 `A(C') ⊨ A(C)` 校验仍走 `apply_plan_patch`/`commit_plan`，装饰器不能绕过 Driver/Observer。
 
 推荐项目边界：`loom_v2/contracts/`（Layer 0）、`loom_v2/observer/`、`loom_v2/driver/`、`loom_v2/slave/`、`loom_v2/coding_agents/`、`loom_v2/web/`、`migrations/`、`tests/`。运行时包之间只依赖 `contracts` 和版本化 HTTP/JSON Schema，不互相导入内部实现。
 
@@ -685,7 +685,7 @@ Docker Compose 测试 profile 启动四个 PostgreSQL 实例；各服务只使�
 
 ### 9.3 E2E
 
-- M0：创建/激活 Conversation，发送 prompt，Codex 或 Fake 跨多个 turn 连续调用 `apply_plan_patch`（先补 Data/Program，再补 ComputeSpec/typed hole，再绑定 ComputeBinding），读取 readiness，提交 v1，执行 echo/hash/sort，获取 ResourceRef，通过 SSE 收到 assistant 回复，显式 close。
+- M0：创建/激活 Conversation，发送 prompt，Codex 或 Fake 跨多个 turn 连续调用 `apply_plan_patch`（先补 Data/Program，再补 ComputeSpec/typed hole，再绑定 ComputeBinding），读取 readiness，提交 v1，通过 provisioned `subprocess_json_v1/run_code` package 执行测试程序，获取 ResourceRef，通过 SSE 收到 assistant 回复，显式 close。
 - M1 A′：暂停/下线 A，验证旧 epoch 拒绝、同 execution 切换 B、Node 的 `RefinedConstraint` 与 provenance 保留。
 - M1 C′：coding-agent 在 patch 中显式提交只读/预算 `RefinedConstraint`，Runtime 校验其单调收紧；放宽 patch 返回结构化 conflict 且旧版本不污染。
 - M1 B′：policy deny 在 commit/admission 阻止；deterministic validator/pass、semantic attestation 和 readiness evidence 可查询。

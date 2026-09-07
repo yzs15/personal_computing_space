@@ -7,29 +7,30 @@ from loom_v2.observer.app import create_app
 from loom_v2.observer.repository import ObserverRepository
 
 
-def _binding(operation: str = "sort", target: str = "slave-a") -> dict:
+def _binding(operation: str = "run_code", target: str = "slave-a", *, package_ref: dict | None = None) -> dict:
     return {
         "binding_id": f"binding-{operation}",
-        "hole_id": "h_sort",
-        "capability_descriptor_ref": {"resource_id": f"capability://{target}/{operation}"},
+        "hole_id": "h_run_code",
+        "capability_descriptor_ref": {"resource_id": "executor://subprocess_json_v1/1"},
+        "capability_package_ref": package_ref,
         "target_resource_ref": {"resource_id": target},
         "realization_digest": f"realization-{target}-{operation}",
         "bound_by": "test-driver",
     }
 
 
-def _add_sort_hole(client: TestClient, suffix: str = "default") -> tuple[dict, dict]:
-    run = client.post("/api/v1/runs", json={"task_ref": "task-readiness", "goal": "sort"}).json()
+def _add_run_code_hole(client: TestClient, suffix: str = "default") -> tuple[dict, dict]:
+    run = client.post("/api/v1/runs", json={"task_ref": "task-readiness", "goal": "run test code"}).json()
     patch = client.post(
         f"/api/v1/runs/{run['run_id']}/patches",
         json={
-            "operation_id": f"sort-plan-{suffix}",
+            "operation_id": f"run-code-plan-{suffix}",
             "base_draft_version": run["draft_version"],
             "base_snapshot_digest": run["draft_digest"],
             "ops": [
-                {"kind": "set_program_ref", "value": "loom://sort"},
-                {"kind": "set_compute_spec", "value": {"operation_ref": "loom://sort"}},
-                {"kind": "add_typed_hole", "value": {"hole_id": "h_sort"}},
+                {"kind": "set_program_ref", "value": "loom://run_code"},
+                {"kind": "set_compute_spec", "value": {"operation_ref": "loom://run_code"}},
+                {"kind": "add_typed_hole", "value": {"hole_id": "h_run_code"}},
             ],
         },
     ).json()
@@ -38,10 +39,10 @@ def _add_sort_hole(client: TestClient, suffix: str = "default") -> tuple[dict, d
 
 def test_unbound_typed_hole_blocks_commit_and_reports_readiness():
     client = TestClient(create_app())
-    run, patch = _add_sort_hole(client, "unbound")
+    run, patch = _add_run_code_hole(client, "unbound")
 
     assert patch["readiness"]["ready"] is False
-    assert patch["readiness"]["blockers"] == [{"code": "typed_hole_unbound", "hole_id": "h_sort"}]
+    assert patch["readiness"]["blockers"] == [{"code": "typed_hole_unbound", "hole_id": "h_run_code"}]
     response = client.post(
         f"/api/v1/runs/{run['run_id']}/commit",
         json={"draft_version": patch["draft_version"], "draft_digest": patch["draft_digest"]},
@@ -53,20 +54,14 @@ def test_unbound_typed_hole_blocks_commit_and_reports_readiness():
     assert detail["details"]["blockers"][0]["code"] == "typed_hole_unbound"
 
 
-def test_binding_requires_target_capability_and_then_allows_start():
+def test_run_code_binding_requires_package_and_then_allows_start():
     repository = ObserverRepository()
-    slave_a = next(
-        item
-        for key, item in repository.agents.items()
-        if key[1:3] == ("slave", "slave-a") and item.get("lease_state") == "active"
-    )
-    slave_a["capabilities"]["operations"] = ["echo", "hash"]
     client = TestClient(create_app(repository))
-    run, patch = _add_sort_hole(client, "blocked")
+    run, patch = _add_run_code_hole(client, "blocked")
     blocked = client.post(
         f"/api/v1/runs/{run['run_id']}/patches",
         json={
-            "operation_id": "sort-binding",
+            "operation_id": "run-code-binding-without-package",
             "base_draft_version": patch["draft_version"],
             "base_snapshot_digest": patch["draft_digest"],
             "ops": [{"kind": "bind_compute_hole", "value": _binding()}],
@@ -80,17 +75,68 @@ def test_binding_requires_target_capability_and_then_allows_start():
     assert commit.status_code == 409
     detail = commit.json()["detail"]
     assert detail["code"] == "readiness_blocked"
-    assert detail["details"]["blockers"][0]["code"] == "capability_unavailable"
+    assert detail["details"]["blockers"][0]["code"] == "capability_package_required"
 
-    slave_a["capabilities"]["operations"] = ["echo", "hash", "sort"]
-    run2, patch2 = _add_sort_hole(client, "valid")
+    program_ref = client.post(
+        "/api/v1/content",
+        json={"media_type": "text/x-python", "content": "import json,sys; print(json.dumps(json.load(sys.stdin)))"},
+    ).json()
+    contract_ref = client.post(
+        "/api/v1/content",
+        json={
+            "media_type": "application/vnd.loom.io-contract+json",
+            "content": {
+                "schema_version": "io.v1",
+                "input_schema_ref": None,
+                "output_schema_ref": None,
+                "success_semantics": None,
+                "success_validator_ref": None,
+            },
+        },
+    ).json()
+    run2, patch2 = _add_run_code_hole(client, "valid")
+    packaged = client.post(
+        f"/api/v1/runs/{run2['run_id']}/patches",
+        json={
+            "operation_id": "run-code-package",
+            "base_draft_version": patch2["draft_version"],
+            "base_snapshot_digest": patch2["draft_digest"],
+            "ops": [
+                {"kind": "set_io_contract_ref", "value": contract_ref},
+                {
+                    "kind": "materialize_capability_package_candidate",
+                    "value": {
+                        "package_id": "readiness-run-code",
+                        "package_version": "v1",
+                        "operation_descriptor_ref": "loom://run_code",
+                        "program_content_ref": program_ref,
+                        "io_contract_ref": contract_ref,
+                        "executor_kind": "subprocess_json_v1",
+                        "executor_operation": "run_code",
+                    },
+                },
+            ],
+        },
+    ).json()
     bound = client.post(
         f"/api/v1/runs/{run2['run_id']}/patches",
         json={
-            "operation_id": "sort-binding-valid",
-            "base_draft_version": patch2["draft_version"],
-            "base_snapshot_digest": patch2["draft_digest"],
-            "ops": [{"kind": "bind_compute_hole", "value": _binding("sort")}],
+            "operation_id": "run-code-binding-valid",
+            "base_draft_version": packaged["draft_version"],
+            "base_snapshot_digest": packaged["draft_digest"],
+            "ops": [
+                {
+                    "kind": "bind_compute_hole",
+                    "value": {
+                        **_binding(
+                            package_ref={
+                                "resource_id": "capability-package://readiness-run-code/v1",
+                            }
+                        ),
+                        "realization_digest": program_ref["version_or_digest"],
+                    },
+                }
+            ],
         },
     ).json()
     commit2 = client.post(
@@ -123,13 +169,13 @@ async def test_input_schema_requires_bound_ref_and_rejects_wrapped_payload() -> 
     )
     contract = ClosureContract(
         closure_id="closure-input-schema",
-        goal="echo scores",
+        goal="validate scores",
         body=TaskClosure(
             closure_id="closure-input-schema",
-            program={"operation_ref": "loom://echo", "io_contract_ref": contract_ref.model_dump(mode="json")},
+            program={"operation_ref": "loom://test_input_validation", "io_contract_ref": contract_ref.model_dump(mode="json")},
         ),
     )
-    record = await repo.open_run("run-input-schema", "task-input-schema", "echo scores", closure_contract=contract)
+    record = await repo.open_run("run-input-schema", "task-input-schema", "validate scores", closure_contract=contract)
 
     missing = await repo.inspect_readiness(record.run_id)
     assert missing["ready"] is False
@@ -141,7 +187,7 @@ async def test_input_schema_requires_bound_ref_and_rejects_wrapped_payload() -> 
         record.draft_version,
         record.draft_digest,
         "input-wrapped",
-        [{"kind": "set_execution_payload", "value": {"node_id": "loom://echo", "input_ref": wrapped_ref.model_dump(mode="json")}}],
+        [{"kind": "set_execution_payload", "value": {"node_id": "loom://test_input_validation", "input_ref": wrapped_ref.model_dump(mode="json")}}],
     )
     mismatch = next(item for item in wrapped.readiness["blockers"] if item["code"] == "payload_schema_mismatch")
     assert mismatch["schema_digest"] == schema_ref.version_or_digest
@@ -153,9 +199,9 @@ async def test_input_schema_requires_bound_ref_and_rejects_wrapped_payload() -> 
         wrapped.draft_version,
         wrapped.draft_digest,
         "input-valid",
-        [{"kind": "set_execution_payload", "value": {"node_id": "loom://echo", "input_ref": input_ref.model_dump(mode="json")}}],
+        [{"kind": "set_execution_payload", "value": {"node_id": "loom://test_input_validation", "input_ref": input_ref.model_dump(mode="json")}}],
     )
-    assert valid.readiness["ready"] is True
+    assert not any(item["code"].startswith("payload_") for item in valid.readiness["blockers"])
 
 
 @pytest.mark.asyncio
@@ -174,13 +220,13 @@ async def test_commit_and_start_reuse_input_readiness_blockers() -> None:
     )
     contract = ClosureContract(
         closure_id="closure-commit-input",
-        goal="echo input",
+        goal="validate input",
         body=TaskClosure(
             closure_id="closure-commit-input",
-            program={"operation_ref": "loom://echo", "io_contract_ref": contract_ref.model_dump(mode="json")},
+            program={"operation_ref": "loom://test_input_validation", "io_contract_ref": contract_ref.model_dump(mode="json")},
         ),
     )
-    record = await repo.open_run("run-commit-input", "task-commit-input", "echo input", closure_contract=contract)
+    record = await repo.open_run("run-commit-input", "task-commit-input", "validate input", closure_contract=contract)
     await repo.begin_refinement(record.run_id)
 
     with pytest.raises(DomainError) as caught:
@@ -204,19 +250,19 @@ async def test_program_inline_io_fields_are_not_an_executable_contract() -> None
     )
     contract = ClosureContract(
         closure_id="closure-inline-schema",
-        goal="echo input",
+        goal="validate input",
         body=TaskClosure(
             closure_id="closure-inline-schema",
             program={
-                "operation_ref": "loom://echo",
+                "operation_ref": "loom://test_input_validation",
                 "io_contract_ref": contract_ref.model_dump(mode="json"),
                 "input_schema": {"type": "object"},
                 "output_schema": {"type": "object"},
-                "success_semantics": {"criterion": "echoed"},
+                "success_semantics": {"criterion": "validated"},
             },
         ),
     )
-    record = await repo.open_run("run-inline-schema", "task-inline-schema", "echo input", closure_contract=contract)
+    record = await repo.open_run("run-inline-schema", "task-inline-schema", "validate input", closure_contract=contract)
 
     readiness = await repo.inspect_readiness(record.run_id)
 

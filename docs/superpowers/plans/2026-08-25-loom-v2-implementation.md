@@ -179,13 +179,13 @@ from loom_v2.contracts.constraints import ConstraintSpec
 def test_decorators_materialize_explicit_metadata_without_calling_function():
     calls = []
 
-    @task_closure(goal="echo", operation_ref="loom://echo")
+    @task_closure(goal="run test code", operation_ref="loom://test_double")
     @attach_constraint(ConstraintSpec(subject=["ComputeSpec"], predicate={"op": "le", "field": "cpu_seconds", "value": 1}, source="Requester", fate="preserve"))
     def task():
         calls.append("executed")
 
     contract = task.materialize_contract()
-    assert contract.goal == "echo"
+    assert contract.goal == "run test code"
     assert calls == []
     assert len(contract.declared_constraints) == 1
 ```
@@ -298,7 +298,7 @@ from loom_v2.observer.app import create_app
 
 def test_draft_patch_commit_and_start_are_explicit():
     client = TestClient(create_app())
-    run = client.post("/api/v1/runs", json={"task_ref": "task-1", "goal": "echo"}).json()
+    run = client.post("/api/v1/runs", json={"task_ref": "task-1", "goal": "run test code"}).json()
     patch = client.post(f"/api/v1/runs/{run['run_id']}/patches", json={"operation_id": "op-1", "base_draft_version": run["draft_version"], "base_snapshot_digest": run["draft_digest"], "ops": [{"kind": "set_result_expectation", "value": {"kind": "content"}}]}).json()
     assert patch["kind"] == "draft"
     assert client.post(f"/api/v1/runs/{run['run_id']}/start", json={"closure_version": "draft"}).status_code == 409
@@ -359,7 +359,7 @@ from loom_v2.coding_agents.fake import FakeCodingAgentProvider
 @pytest.mark.asyncio
 async def test_fake_provider_emits_multiple_patches_then_commit():
     provider = FakeCodingAgentProvider()
-    events = [event async for event in provider.send_turn("echo")]
+    events = [event async for event in provider.send_turn("run test code")]
     assert [event.kind for event in events].count("apply_plan_patch") >= 2
     assert events[-1].kind == "commit_plan"
 ```
@@ -410,14 +410,16 @@ git commit -m "feat: add fake and codex driver providers"
 ```python
 # tests/slave/test_execution.py
 import pytest
-from loom_v2.slave.executor import execute_operation
+from loom_v2.slave.executor import SubprocessJSONV1Adapter
 
 
 @pytest.mark.asyncio
-async def test_echo_execution_returns_resource_ref():
-    result = await execute_operation("echo", {"text": "hello"})
+async def test_run_code_execution_returns_resource_ref():
+    result = await SubprocessJSONV1Adapter().execute(
+        "run_code", {"value": 3}, program=b'import json,sys; print(json.dumps({"value": 6}))'
+    )
     assert result.resource_ref.resource_id
-    assert result.value == {"text": "hello"}
+    assert result.value == {"value": 6}
 ```
 
 ```python
@@ -428,7 +430,7 @@ from loom_v2.observer.app import create_app
 
 def test_slave_a_loss_creates_new_attempt_without_new_execution():
     client = TestClient(create_app())
-    run = client.post("/api/v1/runs", json={"task_ref": "task-1", "goal": "echo", "allow_reassignment": True}).json()
+    run = client.post("/api/v1/runs", json={"task_ref": "task-1", "goal": "run test code", "allow_reassignment": True}).json()
     committed = client.post(f"/api/v1/runs/{run['run_id']}/commit", json={"draft_version": run["draft_version"], "draft_digest": run["draft_digest"]}).json()
     started = client.post(f"/api/v1/runs/{run['run_id']}/start", json={"closure_version": committed["closure_version"]}).json()
     client.post("/api/v1/slaves/slave-a/availability", json={"available": False})
@@ -446,7 +448,7 @@ Expected: missing slave executor/service.
 
 - [ ] **Step 3: Implement executor and local ledger**
 
-`executor.py` supports deterministic `echo`, `hash`, and `sort`; it writes result bytes only to a managed staging directory, returns a `ResourceRef` and digest, and records cleanup evidence. `service.py` polls Observer, fences stale execution epochs, ACKs exactly once, emits progress/terminal/resource events, and reports static built-in `TermSupport` for current demo terms. `WorkspaceReplica` states are `ready|dirty|unavailable`; raw paths never leave the Slave.
+`executor.py` runs provisioned `subprocess_json_v1/run_code` packages; it writes result bytes only to a managed staging directory, returns a `ResourceRef` and digest, and records cleanup evidence. `service.py` polls Observer, fences stale execution epochs, ACKs exactly once, emits progress/terminal/resource events, and reports static `TermSupport` for current terms. `WorkspaceReplica` states are `ready|dirty|unavailable`; raw paths never leave the Slave.
 
 - [ ] **Step 4: Implement reassignment policy**
 

@@ -143,7 +143,7 @@ async def test_slave_runtime_view_prefers_active_instance_over_expired_history()
             workspace_id="workspace-default",
             endpoint_url="http://slave-a:8081",
             protocol_version="loom.v1",
-            capabilities={"operations": ["echo"]},
+            capabilities={"operations": ["run_code"]},
         )
     )
     await repo.register_agent(
@@ -154,7 +154,7 @@ async def test_slave_runtime_view_prefers_active_instance_over_expired_history()
             workspace_id="workspace-default",
             endpoint_url="http://slave-a:8081",
             protocol_version="loom.v1",
-            capabilities={"operations": ["echo", "sort"]},
+            capabilities={"operations": ["run_code"]},
         )
     )
     old_key = ("workspace-default", "slave", "slave-a", "old")
@@ -166,7 +166,7 @@ async def test_slave_runtime_view_prefers_active_instance_over_expired_history()
 
     assert repo.slave_agents["slave-a"]["instance_id"] == "active"
     assert repo.slave_agents["slave-a"]["lease_state"] == "active"
-    assert repo.slave_capabilities["slave-a"]["operations"] == {"echo", "sort"}
+    assert repo.slave_capabilities["slave-a"]["operations"] == {"run_code"}
 
 
 @pytest.mark.asyncio

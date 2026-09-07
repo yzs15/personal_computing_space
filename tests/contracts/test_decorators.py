@@ -5,7 +5,7 @@ from loom_v2.contracts.decorators import attach_constraint, task_closure
 def test_decorators_materialize_explicit_metadata_without_calling_function():
     calls = []
 
-    @task_closure(goal="echo", operation_ref="loom://echo")
+    @task_closure(goal="run test code", operation_ref="loom://test_double")
     @attach_constraint(
         ConstraintSpec(
             subject=["ComputeSpec"],
@@ -18,6 +18,6 @@ def test_decorators_materialize_explicit_metadata_without_calling_function():
         calls.append("executed")
 
     contract = task.materialize_contract()
-    assert contract.goal == "echo"
+    assert contract.goal == "run test code"
     assert calls == []
     assert len(contract.declared_constraints) == 1

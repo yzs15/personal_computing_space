@@ -12,7 +12,7 @@ def _digest(value: object) -> str:
 
 
 async def _started_run(repo: ObserverRepository, run_id: str) -> tuple[object, dict[str, object]]:
-    record = await repo.open_run(run_id, f"conversation-{run_id}", "echo")
+    record = await repo.open_run(run_id, f"conversation-{run_id}", "run lifecycle")
     await repo.begin_refinement(record.run_id)
     committed = await repo.commit(record.run_id, record.draft_version, record.draft_digest)
     started = await repo.start(record.run_id, committed.version_id)
@@ -22,7 +22,7 @@ async def _started_run(repo: ObserverRepository, run_id: str) -> tuple[object, d
 @pytest.mark.asyncio
 async def test_readiness_failure_keeps_run_in_thinking() -> None:
     repo = ObserverRepository()
-    record = await repo.open_run("run-readiness-state", "conversation-readiness-state", "sort")
+    record = await repo.open_run("run-readiness-state", "conversation-readiness-state", "run code readiness")
     await repo.begin_refinement(record.run_id)
     patched = await repo.apply_patch(
         record.run_id,
@@ -30,9 +30,9 @@ async def test_readiness_failure_keeps_run_in_thinking() -> None:
         record.draft_digest,
         "readiness-blocker",
         [
-            {"kind": "set_program_ref", "value": "loom://sort"},
-            {"kind": "set_compute_spec", "value": {"operation_ref": "loom://sort"}},
-            {"kind": "add_typed_hole", "value": {"hole_id": "h_sort"}},
+            {"kind": "set_program_ref", "value": "loom://run_code"},
+            {"kind": "set_compute_spec", "value": {"operation_ref": "loom://run_code"}},
+            {"kind": "add_typed_hole", "value": {"hole_id": "h_run_code"}},
         ],
     )
 

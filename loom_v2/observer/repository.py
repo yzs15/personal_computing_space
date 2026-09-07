@@ -2284,6 +2284,13 @@ class ObserverRepository:
                 descriptor_name = descriptor_ref.resource_id if isinstance(descriptor_ref, ResourceRef) else str(descriptor_ref)
                 if operation and self._operation_name(descriptor_name) != operation:
                     blockers.append({"code": "operation_descriptor_mismatch", "operation": operation})
+            elif operation == "run_code":
+                # ``run_code`` is the generic subprocess executor, not an
+                # executable builtin.  A concrete capability package is the
+                # only source of program bytes and its IO contract, so a
+                # binding without a package must be rejected during
+                # readiness rather than discovered at dispatch time.
+                blockers.append({"code": "capability_package_required", "hole_id": hole.hole_id})
             elif operation and operation not in capability.get("operations", set()):
                 blockers.append({"code": "capability_unavailable", "operation": operation, "target_resource_ref": target})
 
@@ -2292,7 +2299,9 @@ class ObserverRepository:
             capability = self.slave_capabilities.get(default_target, {})
             if not self._slave_is_active(default_target):
                 blockers.append({"code": "slave_unavailable", "target_resource_ref": default_target})
-            if operation not in capability.get("operations", set()):
+            if operation == "run_code":
+                blockers.append({"code": "capability_package_required", "target_resource_ref": default_target})
+            elif operation not in capability.get("operations", set()):
                 blockers.append({"code": "capability_unavailable", "operation": operation, "target_resource_ref": default_target})
 
         return {

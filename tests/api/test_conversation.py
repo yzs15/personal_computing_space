@@ -26,7 +26,7 @@ class ApiStalledProvider:
 def test_message_runs_fake_driver_and_sse_exposes_events(monkeypatch):
     monkeypatch.setenv("LOOM_CODING_AGENT_BACKEND", "fake")
     client = TestClient(create_app())
-    response = client.post("/api/v1/messages", json={"conversation_ref": "conversation-ui", "text": "echo hello"})
+    response = client.post("/api/v1/messages", json={"conversation_ref": "conversation-ui", "text": "run the test program"})
     assert response.status_code == 200
     payload = response.json()
     assert payload["state"] == "completed"
@@ -46,7 +46,7 @@ def test_message_runs_fake_driver_and_sse_exposes_events(monkeypatch):
 def test_completed_conversation_exposes_status(monkeypatch):
     monkeypatch.setenv("LOOM_CODING_AGENT_BACKEND", "fake")
     client = TestClient(create_app())
-    response = client.post("/api/v1/messages", json={"conversation_ref": "conversation-status", "text": "echo hello"})
+    response = client.post("/api/v1/messages", json={"conversation_ref": "conversation-status", "text": "run the test program"})
     assert response.status_code == 200
     assert client.get("/api/v1/conversations/conversation-status").json()["status"] == "completed"
     summary = client.get("/api/v1/conversations").json()[0]

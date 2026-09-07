@@ -285,7 +285,7 @@ async def test_codex_provider_registers_and_answers_dynamic_tools():
     sent: list[dict] = []
     messages = iter(
         [
-            {"id": 7, "method": "item/tool/call", "params": {"tool": "loom_open_run", "arguments": {"goal": "sort"}}},
+            {"id": 7, "method": "item/tool/call", "params": {"tool": "loom_open_run", "arguments": {"goal": "transform"}}},
             {"method": "turn/completed", "params": {}},
         ]
     )
@@ -299,13 +299,13 @@ async def test_codex_provider_registers_and_answers_dynamic_tools():
     provider._send = fake_send
     provider._read_message = fake_read_message
 
-    events = [event async for event in provider.send_turn("sort")]
+    events = [event async for event in provider.send_turn("transform")]
 
     assert events[0].kind == "tool_call"
     assert sent[-1] == {
         "jsonrpc": "2.0",
         "id": 7,
-        "result": {"contentItems": [{"type": "inputText", "text": '{"tool": "loom_open_run", "goal": "sort"}'}], "success": True},
+        "result": {"contentItems": [{"type": "inputText", "text": '{"tool": "loom_open_run", "goal": "transform"}'}], "success": True},
     }
 
 

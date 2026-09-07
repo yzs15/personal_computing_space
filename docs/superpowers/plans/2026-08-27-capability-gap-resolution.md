@@ -13,7 +13,7 @@ Implement the capability-gap design in `docs/superpowers/specs/2026-08-26-capabi
 
 2. **Unified Executor Adapter registry**
    - Replace Slave operation `if` branches with an adapter registry and descriptors.
-   - Implement `builtin_v1` and constrained `subprocess_json_v1` adapters; keep `http_service_v1`, `grpc_service_v1`, and `mcp_v1` as explicit unsupported extension points.
+   - Implement the constrained `subprocess_json_v1` adapter; keep `http_service_v1`, `grpc_service_v1`, and `mcp_v1` as explicit unsupported extension points.
    - Add tests for descriptor identity, built-ins, subprocess execution, and unsupported adapters.
 
 3. **Observer package candidate, persistence, and promotion**
@@ -62,4 +62,4 @@ Implement the capability-gap design in `docs/superpowers/specs/2026-08-26-capabi
 
 - Follow test-driven development for each step (RED → GREEN → refactor).
 - Keep program bodies in the content store; protocol/database records contain refs and digests only.
-- Preserve backward compatibility for existing `echo`/`hash`/`sort` flows and existing untracked user files.
+- Preserve existing untracked user files. Legacy demo operations are historical fixtures only and are not part of the active capability contract; executable work uses provisioned `subprocess_json_v1/run_code` packages.

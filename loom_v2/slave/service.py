@@ -45,7 +45,7 @@ class SlaveService:
     replica: WorkspaceReplica = field(default_factory=lambda: WorkspaceReplica("workspace-default"))
     available: bool = True
     attempts: dict[str, ExecutionResult] = field(default_factory=dict)
-    supported_operations: set[str] = field(default_factory=lambda: {"echo", "hash", "sort", "run_code"})
+    supported_operations: set[str] = field(default_factory=lambda: {"run_code"})
     engine: AsyncEngine | None = None
     content_store: ContentStore | None = None
     executor_registry: ExecutorRegistry = field(default_factory=lambda: default_registry)
@@ -182,7 +182,16 @@ class SlaveService:
             target_slave=self.slave_id,
             activation_state="ready",
             evidence_refs=activation.evidence_refs,
-            details={"operation": operation_name, "executor_kind": package.executor_kind},
+            details={
+                "operation": operation_name,
+                "executor_kind": package.executor_kind,
+                "executor_operation": package.executor_operation,
+                "executor_descriptor_ref": self.executor_registry.get(package.executor_kind).descriptor.descriptor_ref,
+                "executor_descriptor_digest": self.executor_registry.get(package.executor_kind).descriptor.digest,
+                "package_version_ref": package.version_ref,
+                "package_digest": package.package_digest,
+                "program_digest": package.program_digest,
+            },
             session_generation=command.session_generation,
         )
         self.resource_events.append(ResourceEventFrame(event_id=f"resource-{report.report_id}", resource_ref=ref, event_type="activation_ready", package_version_ref=ref, package_digest=package.package_digest, target_slave=self.slave_id, evidence_refs=report.evidence_refs))
@@ -382,6 +391,7 @@ class SlaveService:
         if not self.available or self.replica.state != "ready":
             raise RuntimeError("slave_unavailable")
         package: CapabilityPackageVersion | None = None
+        package_required = False
         if binding is not None and binding.capability_package_ref is not None:
             package_ref = binding.capability_package_ref.resource_id
             digest = binding.capability_package_ref.version_or_digest
@@ -392,6 +402,10 @@ class SlaveService:
                 raise RuntimeError("capability_package_digest_mismatch")
         elif operation not in self.supported_operations:
             raise RuntimeError(f"capability_unavailable:{operation}")
+        else:
+            # Application operations are materialized as content-addressed
+            # capability packages.  There is no in-process builtin fallback.
+            package_required = True
         if closure is not None:
             operation_ref = closure.program.operation_ref or closure.compute.operation_ref
             expected_operation = operation_ref.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1] if operation_ref else ""
@@ -406,6 +420,8 @@ class SlaveService:
                     raise RuntimeError(f"compute_binding_missing:{hole.hole_id}")
             if binding is not None and binding.target_resource_ref.resource_id != self.slave_id:
                 raise RuntimeError("binding_target_mismatch")
+        if package_required:
+            raise RuntimeError("capability_package_required")
         if attempt_id in self.attempts:
             return self.attempts[attempt_id]
         if self.sessions is not None:
@@ -421,6 +437,7 @@ class SlaveService:
                         terminal_state=result_payload.get("terminal_state", "completed"),
                         terminal_error=result_payload.get("terminal_error"),
                         validation_evidence=result_payload.get("validation_evidence", []),
+                        provenance=result_payload.get("provenance"),
                     )
                     self.attempts[attempt_id] = result
                     return result
@@ -428,8 +445,24 @@ class SlaveService:
         if package is not None:
             program = await self.content_store.get(package.program_content_ref, expected_digest=package.program_digest)
             result = await self.executor_registry.execute(package.executor_kind, package.executor_operation, payload, program=program)
+            descriptor = self.executor_registry.get(package.executor_kind).descriptor
+            result = replace(
+                result,
+                provenance={
+                    "package_version_ref": package.version_ref,
+                    "package_digest": package.package_digest,
+                    "program_content_ref": package.program_content_ref.model_dump(mode="json"),
+                    "program_digest": package.program_digest,
+                    "executor_kind": package.executor_kind,
+                    "executor_operation": package.executor_operation,
+                    "executor_descriptor_ref": descriptor.descriptor_ref,
+                    "executor_descriptor_digest": descriptor.digest,
+                },
+            )
         else:
-            result = await self.executor_registry.execute("builtin_v1", operation, payload)
+            # The no-package branch is rejected above; keep this guard local
+            # to the execution boundary in case future callers bypass it.
+            raise RuntimeError("capability_package_required")
         result = await self._validate_terminal_result(
             result,
             attempt_id=attempt_id,
@@ -456,6 +489,7 @@ class SlaveService:
                         "terminal_state": result.terminal_state,
                         "terminal_error": result.terminal_error,
                         "validation_evidence": result.validation_evidence,
+                        "provenance": result.provenance,
                     },
                 ))
                 await session.commit()

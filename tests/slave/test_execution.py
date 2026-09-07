@@ -2,40 +2,67 @@ import pytest
 
 from loom_v2.contracts.types import CapabilityPackageVersion, CapabilityProvisionCommand, ComputeSpec, NodeInputBinding, ResourceRef, TaskClosure, TypedHole
 from loom_v2.content_store import canonical_json_bytes
-from loom_v2.slave.executor import SubprocessJSONV1Adapter, execute_operation
+from loom_v2.slave.executor import SubprocessJSONV1Adapter, default_registry
 from loom_v2.slave.service import SlaveService
+from tests.support.run_code_fixture import make_run_code_fixture, provision_run_code_fixture
 
 
 @pytest.mark.asyncio
-async def test_echo_execution_returns_resource_ref():
-    result = await execute_operation("echo", {"text": "hello"})
+async def test_subprocess_run_code_execution_returns_resource_ref():
+    adapter = SubprocessJSONV1Adapter()
+    result = await adapter.execute(
+        "run_code",
+        {"value": 3},
+        program=b'import json,sys; d=json.load(sys.stdin); print(json.dumps({"value": d["value"] * 2}))',
+    )
     assert result.resource_ref.resource_id
-    assert result.value == {"text": "hello"}
+    assert result.value == {"value": 6}
+    assert result.replay_safety == "DeclaredByPackage"
 
 
 @pytest.mark.asyncio
-async def test_hash_execution_is_replay_safe():
-    first = await execute_operation("hash", {"text": "hello"})
-    second = await execute_operation("hash", {"text": "hello"})
+async def test_subprocess_run_code_is_replay_safe():
+    adapter = SubprocessJSONV1Adapter()
+    program = b'import json,sys; d=json.load(sys.stdin); print(json.dumps({"value": d["value"] * 2}))'
+    first = await adapter.execute("run_code", {"value": 3}, program=program)
+    second = await adapter.execute("run_code", {"value": 3}, program=program)
     assert first.value == second.value
-    assert first.replay_safety == "Idempotent"
+    assert first.replay_safety == "DeclaredByPackage"
+
+
+def test_default_registry_has_only_subprocess_adapter():
+    assert {descriptor.kind for descriptor in default_registry.descriptors()} == {"subprocess_json_v1"}
+
+
+def test_default_registry_rejects_removed_builtin_executor():
+    legacy_kind = "".join(("builtin", "_v1"))
+    with pytest.raises(ValueError, match="unsupported_executor:" + legacy_kind):
+        default_registry.get(legacy_kind)
 
 
 @pytest.mark.asyncio
 async def test_slave_rejects_unbound_typed_hole_before_execution():
-    service = SlaveService("slave-a")
-    closure = TaskClosure(program={"operation_ref": "loom://sort"}, compute=ComputeSpec(operation_ref="loom://sort", typed_holes=[TypedHole(hole_id="h_sort")]))
+    service = SlaveService("slave-a", supported_operations={"test_double"})
+    closure = TaskClosure(program={"operation_ref": "loom://test_double"}, compute=ComputeSpec(operation_ref="loom://test_double", typed_holes=[TypedHole(hole_id="h_test_double")]))
 
-    with pytest.raises(RuntimeError, match="typed_hole_unbound:h_sort"):
-        await service.run("attempt-unbound", "sort", {"items": [2, 1]}, closure=closure)
+    with pytest.raises(RuntimeError, match="typed_hole_unbound:h_test_double"):
+        await service.run("attempt-unbound", "test_double", {"value": 2}, closure=closure)
 
 
 @pytest.mark.asyncio
 async def test_slave_rejects_unsupported_operation():
-    service = SlaveService("slave-a", supported_operations={"echo"})
+    service = SlaveService("slave-a")
 
-    with pytest.raises(RuntimeError, match="capability_unavailable:sort"):
-        await service.run("attempt-unsupported", "sort", {"items": [2, 1]})
+    with pytest.raises(RuntimeError, match="capability_unavailable:unknown_operation"):
+        await service.run("attempt-unsupported", "unknown_operation", {"value": 2})
+
+
+@pytest.mark.asyncio
+async def test_slave_rejects_unbound_run_code_without_package():
+    service = SlaveService("slave-a")
+
+    with pytest.raises(RuntimeError, match="capability_package_required"):
+        await service.run("attempt-unbound-run-code", "run_code", {"value": 2})
 
 
 @pytest.mark.asyncio
@@ -113,12 +140,16 @@ async def test_slave_admission_reads_bound_input_from_content_store_not_driver_p
         input_schema={"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}},
     )
     input_ref = await service.content_store.put(canonical_json_bytes({"text": "from-store"}), media_type="application/json")
-    closure = TaskClosure(
-        program={"operation_ref": "loom://echo", "io_contract_ref": contract_ref.model_dump(mode="json")},
-        node_input_bindings=[NodeInputBinding(node_id="echo", input_ref=input_ref)],
+    fixture = await make_run_code_fixture(
+        service,
+        operation="test_store_input",
+        io_contract_ref=contract_ref,
+        program=b'import json,sys; d=json.load(sys.stdin); print(json.dumps({"text": d["text"]}))',
     )
+    await provision_run_code_fixture(service, fixture)
+    closure = fixture.closure(io_contract_ref=contract_ref, input_refs=[input_ref])
 
-    result = await service.run("attempt-admission-ref", "echo", {"text": "tampered-driver-payload"}, closure=closure)
+    result = await service.run("attempt-admission-ref", fixture.operation, {"text": "tampered-driver-payload"}, closure=closure, binding=fixture.binding)
 
     assert result.value == {"text": "from-store"}
 
@@ -131,22 +162,33 @@ async def test_slave_admission_rejects_bound_input_that_fails_input_schema():
         input_schema={"type": "object", "required": ["scores"], "properties": {"scores": {"type": "array"}}},
     )
     input_ref = await service.content_store.put(canonical_json_bytes({"payload": {"scores": [1, 2]}}), media_type="application/json")
-    closure = TaskClosure(
-        program={"operation_ref": "loom://echo", "io_contract_ref": contract_ref.model_dump(mode="json")},
-        node_input_bindings=[NodeInputBinding(node_id="echo", input_ref=input_ref)],
+    fixture = await make_run_code_fixture(
+        service,
+        operation="test_invalid_input",
+        io_contract_ref=contract_ref,
+        program=b'import json,sys; print(json.dumps({"ok": True}))',
     )
+    await provision_run_code_fixture(service, fixture)
+    closure = fixture.closure(io_contract_ref=contract_ref, input_refs=[input_ref])
 
     with pytest.raises(RuntimeError, match="payload_schema_mismatch"):
-        await service.run("attempt-admission-invalid", "echo", {"scores": [1, 2]}, closure=closure)
+        await service.run("attempt-admission-invalid", fixture.operation, {"scores": [1, 2]}, closure=closure, binding=fixture.binding)
 
 
 @pytest.mark.asyncio
 async def test_slave_terminal_output_schema_pass_emits_validation_evidence():
     service = SlaveService("slave-a")
     contract_ref = await _contract_ref(service, output_schema={"type": "object", "required": ["text"]})
-    closure = TaskClosure(program={"operation_ref": "loom://echo", "io_contract_ref": contract_ref.model_dump(mode="json")})
+    fixture = await make_run_code_fixture(
+        service,
+        operation="test_output_pass",
+        io_contract_ref=contract_ref,
+        program=b'import json,sys; d=json.load(sys.stdin); print(json.dumps({"text": d["text"]}))',
+    )
+    await provision_run_code_fixture(service, fixture)
+    closure = fixture.closure(io_contract_ref=contract_ref)
 
-    result = await service.run("attempt-output-pass", "echo", {"text": "hello"}, closure=closure)
+    result = await service.run("attempt-output-pass", fixture.operation, {"text": "hello"}, closure=closure, binding=fixture.binding)
 
     assert result.terminal_state == "completed"
     assert result.validation_evidence
@@ -158,9 +200,16 @@ async def test_slave_terminal_output_schema_pass_emits_validation_evidence():
 async def test_slave_terminal_evidence_uses_dispatch_execution_epoch():
     service = SlaveService("slave-a")
     contract_ref = await _contract_ref(service, output_schema={"type": "object", "required": ["text"]})
-    closure = TaskClosure(program={"operation_ref": "loom://echo", "io_contract_ref": contract_ref.model_dump(mode="json")})
+    fixture = await make_run_code_fixture(
+        service,
+        operation="test_output_epoch",
+        io_contract_ref=contract_ref,
+        program=b'import json,sys; d=json.load(sys.stdin); print(json.dumps({"text": d["text"]}))',
+    )
+    await provision_run_code_fixture(service, fixture)
+    closure = fixture.closure(io_contract_ref=contract_ref)
 
-    result = await service.run("attempt-output-epoch", "echo", {"text": "hello"}, closure=closure, execution_epoch=7)
+    result = await service.run("attempt-output-epoch", fixture.operation, {"text": "hello"}, closure=closure, binding=fixture.binding, execution_epoch=7)
 
     assert result.validation_evidence[0]["execution_epoch"] == 7
 
@@ -169,9 +218,16 @@ async def test_slave_terminal_evidence_uses_dispatch_execution_epoch():
 async def test_slave_terminal_output_schema_failure_is_not_completed():
     service = SlaveService("slave-a")
     contract_ref = await _contract_ref(service, output_schema={"type": "object", "required": ["missing"]})
-    closure = TaskClosure(program={"operation_ref": "loom://echo", "io_contract_ref": contract_ref.model_dump(mode="json")})
+    fixture = await make_run_code_fixture(
+        service,
+        operation="test_output_failure",
+        io_contract_ref=contract_ref,
+        program=b'import json,sys; print(json.dumps({"text": "hello"}))',
+    )
+    await provision_run_code_fixture(service, fixture)
+    closure = fixture.closure(io_contract_ref=contract_ref)
 
-    result = await service.run("attempt-output-fail", "echo", {"text": "hello"}, closure=closure)
+    result = await service.run("attempt-output-fail", fixture.operation, {"text": "hello"}, closure=closure, binding=fixture.binding)
 
     assert result.terminal_state == "failed"
     assert result.terminal_error["code"] == "output_schema_mismatch"
@@ -186,9 +242,16 @@ async def test_slave_without_validator_requires_attestation_for_semantic_success
         output_schema={"type": "object", "required": ["text"]},
         success_semantics={"criterion": "contains-greeting"},
     )
-    closure = TaskClosure(program={"operation_ref": "loom://echo", "io_contract_ref": contract_ref.model_dump(mode="json")})
+    fixture = await make_run_code_fixture(
+        service,
+        operation="test_attestation",
+        io_contract_ref=contract_ref,
+        program=b'import json,sys; d=json.load(sys.stdin); print(json.dumps({"text": d["text"]}))',
+    )
+    await provision_run_code_fixture(service, fixture)
+    closure = fixture.closure(io_contract_ref=contract_ref)
 
-    result = await service.run("attempt-attestation", "echo", {"text": "hello"}, closure=closure)
+    result = await service.run("attempt-attestation", fixture.operation, {"text": "hello"}, closure=closure, binding=fixture.binding)
 
     assert result.terminal_state == "decision_required"
     assert result.terminal_error["code"] == "attestation_required"
@@ -207,9 +270,16 @@ async def test_slave_validator_plugin_failure_is_structured():
         success_semantics={"criterion": "contains-greeting"},
         validator_ref=validator_ref,
     )
-    closure = TaskClosure(program={"operation_ref": "loom://echo", "io_contract_ref": contract_ref.model_dump(mode="json")})
+    fixture = await make_run_code_fixture(
+        service,
+        operation="test_validator_failure",
+        io_contract_ref=contract_ref,
+        program=b'import json,sys; d=json.load(sys.stdin); print(json.dumps({"text": d["text"]}))',
+    )
+    await provision_run_code_fixture(service, fixture)
 
-    result = await service.run("attempt-validator-fail", "echo", {"text": "hello"}, closure=closure)
+    closure = fixture.closure(io_contract_ref=contract_ref)
+    result = await service.run("attempt-validator-fail", fixture.operation, {"text": "hello"}, closure=closure, binding=fixture.binding)
 
     assert result.terminal_state == "failed"
     assert result.terminal_error["code"] == "success_validation_failed"

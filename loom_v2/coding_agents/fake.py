@@ -12,7 +12,19 @@ class FakeCodingAgentProvider:
     def __init__(self) -> None:
         self.session_ref: str | None = None
         self._active_context: TurnContext | None = None
+        self._tool_handler: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
         self.contexts: list[TurnContext] = []
+
+    def set_tool_handler(
+        self,
+        tools: list[dict[str, Any]],
+        handler: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]],
+    ) -> None:
+        # The local legacy ``start`` API does not pass a handler into
+        # ``begin_turn``. Keep the same explicit tool seam as the remote
+        # context API so the deterministic provider exercises real MCP/package
+        # mutations instead of a hidden builtin executor.
+        self._tool_handler = handler
 
     async def begin_turn(
         self,
@@ -32,7 +44,7 @@ class FakeCodingAgentProvider:
             owner_generation=uuid4().hex,
             thread_id=existing_thread_id or f"fake-session:{conversation_ref}",
             dynamic_tools=list(tools or []),
-            mcp_handler=handler,
+            mcp_handler=handler if handler is not None else self._tool_handler,
         )
         self._active_context = context
         self.contexts.append(context)
@@ -53,6 +65,46 @@ class FakeCodingAgentProvider:
             user_message = user_message or ""
         else:
             user_message = context_or_message
+        handler = context.mcp_handler if context is not None else self._tool_handler
+        if handler is None:
+            raise RuntimeError("fake_mcp_handler_required")
+
+        program = await handler(
+            "loom_put_content",
+            {
+                "media_type": "text/x-python",
+                "content": (
+                    "import json, sys\n"
+                    "payload = json.load(sys.stdin)\n"
+                    "value = payload.get('value', 0)\n"
+                    "print(json.dumps({'value': value * 2}))\n"
+                ),
+            },
+        )
+        yield AgentEvent("tool_call", {"tool": "loom_put_content"})
+        io_contract = await handler(
+            "loom_put_content",
+            {
+                "media_type": "application/vnd.loom.io-contract+json",
+                "content": {
+                    "schema_version": "io.v1",
+                    "input_schema_ref": None,
+                    "output_schema_ref": None,
+                    "success_semantics": None,
+                    "success_validator_ref": None,
+                },
+            },
+        )
+        yield AgentEvent("tool_call", {"tool": "loom_put_content"})
+        input_content = await handler(
+            "loom_put_content",
+            {"media_type": "application/json", "content": {"value": 3}},
+        )
+        yield AgentEvent("tool_call", {"tool": "loom_put_content"})
+        program_ref = program["resource_ref"]
+        io_contract_ref = io_contract["resource_ref"]
+        input_ref = input_content["resource_ref"]
+        operation_ref = "loom://test_double"
         yield AgentEvent(
             "open_run",
             {
@@ -70,30 +122,64 @@ class FakeCodingAgentProvider:
             },
         )
         yield AgentEvent("assistant_text", {"text": "I will refine the closure in multiple patches."})
-        yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "set_program_ref", "value": "loom://echo"}]})
-        yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "set_compute_spec", "value": {"operation_ref": "loom://echo"}}]})
-        yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "add_typed_hole", "value": {"hole_id": "h_compute"}}]})
-        yield AgentEvent(
-            "apply_plan_patch",
-            {
-                "ops": [
-                    {
-                        "kind": "bind_compute_hole",
-                        "value": {
-                            "binding_id": "binding-h_compute",
-                            "hole_id": "h_compute",
-                            "capability_descriptor_ref": {"resource_id": "capability://slave-a/echo"},
-                            "target_resource_ref": {"resource_id": "slave-a"},
-                            "realization_digest": "fake-realization-echo",
-                            "bound_by": "fake-driver",
-                        },
-                    }
-                ]
-            },
+
+        async def apply_patch(operation_id: str, ops: list[dict[str, Any]]) -> AgentEvent:
+            await handler(
+                "loom_apply_plan_patch",
+                {"operation_id": operation_id, "ops": ops},
+            )
+            return AgentEvent("tool_call", {"tool": "loom_apply_plan_patch"})
+
+        yield await apply_patch(
+            "fake-run-code-program",
+            [
+                {"kind": "set_program_ref", "value": operation_ref},
+                {"kind": "set_io_contract_ref", "value": io_contract_ref},
+                {"kind": "set_compute_spec", "value": {"operation_ref": operation_ref}},
+                {"kind": "add_typed_hole", "value": {"hole_id": "h_compute"}},
+            ],
         )
-        yield AgentEvent("inspect_plan_readiness", {})
-        yield AgentEvent("commit_plan", {})
-        yield AgentEvent("start_run", {})
+        yield await apply_patch(
+            "fake-run-code-package",
+            [
+                {
+                    "kind": "materialize_capability_package_candidate",
+                    "value": {
+                        "package_id": "fake-run-code",
+                        "package_version": "v1",
+                        "operation_descriptor_ref": operation_ref,
+                        "program_content_ref": program_ref,
+                        "io_contract_ref": io_contract_ref,
+                        "executor_kind": "subprocess_json_v1",
+                        "executor_operation": "run_code",
+                    },
+                }
+            ],
+        )
+        yield await apply_patch(
+            "fake-run-code-binding",
+            [
+                {
+                    "kind": "bind_compute_hole",
+                    "value": {
+                        "binding_id": "binding-h_compute",
+                        "hole_id": "h_compute",
+                        "capability_descriptor_ref": {"resource_id": "executor://subprocess_json_v1/1"},
+                        "capability_package_ref": {"resource_id": "capability-package://fake-run-code/v1"},
+                        "target_resource_ref": {"resource_id": "slave-a"},
+                        "realization_digest": program_ref.get("version_or_digest", ""),
+                        "bound_by": "fake-driver",
+                    },
+                },
+                {"kind": "set_execution_payload", "value": {"node_id": operation_ref, "input_ref": input_ref}},
+            ],
+        )
+        await handler("loom_inspect_plan_readiness", {})
+        yield AgentEvent("tool_call", {"tool": "loom_inspect_plan_readiness"})
+        await handler("loom_commit_plan", {})
+        yield AgentEvent("tool_call", {"tool": "loom_commit_plan"})
+        await handler("loom_start_run", {})
+        yield AgentEvent("tool_call", {"tool": "loom_start_run"})
 
     async def interrupt(self, context_or_turn: TurnContext | str | None = None) -> None:
         if isinstance(context_or_turn, TurnContext) and self._active_context is not context_or_turn:

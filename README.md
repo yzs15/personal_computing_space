@@ -188,6 +188,12 @@ provisioning returns a health report and activation evidence. Unknown required
 terms still fail with a structured capability error; installing new term
 support remains a later roadmap item.
 
+The default Slave capability is the generic `run_code` executor only. Every
+ordinary execution must carry a provisioned capability package with program
+content and an `io.v1` contract; an unbound `run_code` request is rejected as
+`capability_package_required`. The removed demo operations are not aliases or
+fallbacks, and are not advertised by capability discovery.
+
 Dynamic distributed runs use a content-addressed `orchestrator_python_v1`
 capability package. The Driver executes its single-file `orchestrate(ctx,
 input_ref)` program in a per-run Docker sandbox (`--network none`, read-only

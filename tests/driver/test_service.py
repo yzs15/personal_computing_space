@@ -15,70 +15,24 @@ from loom_v2.slave.app import create_app as create_slave_app
 @pytest.mark.asyncio
 async def test_driver_applies_fake_patches_continuously_and_starts_execution():
     repo = ObserverRepository()
-    driver = DriverService(repo, FakeCodingAgentProvider())
-    result = await driver.run_prompt("conversation-1", "echo hello")
+    slave = SlaveService("slave-a", content_store=repo.content_store)
+    driver = DriverService(repo, FakeCodingAgentProvider(), slaves={"slave-a": slave})
+    result = await driver.run_prompt("conversation-1", "run the test capability")
     assert result["state"] == "completed"
     assert result["patches"] >= 3
     assert result["closure_version"].startswith("committed-")
     assert result["resource_ref"].startswith("result-")
+    assert result["outcome"]["value"] == {"value": 6}
+    assert result["outcome"]["provenance"]["executor_kind"] == "subprocess_json_v1"
+    assert result["outcome"]["provenance"]["executor_operation"] == "run_code"
+    assert result["outcome"]["provenance"]["package_version_ref"].startswith("capability-package://fake-run-code/")
     assert result["conversation_ref"] == "conversation-1"
     assert result["assistant_text"] == "I will refine the closure in multiple patches."
     conversation = await repo.get_conversation("conversation-1")
     assert [message["role"] for message in conversation["messages"]] == ["user", "assistant"]
 
 
-class SortClosureProvider:
-    async def start(self, conversation_ref: str, workspace_root: str) -> str:
-        return "sort-thread"
-
-    async def send_turn(self, user_message: str):
-        yield AgentEvent(
-            "open_run",
-            {
-                "closure_contract": {
-                    "closure_id": "closure-sort",
-                    "goal": user_message,
-                    "required_success_criteria": [],
-                    "allowed_effects": ["read_workspace"],
-                    "resource_budget": {"max_attempts": 1},
-                    "recovery_policy": {},
-                    "result_expectations": [{"kind": "content"}],
-                    "body": {"closure_id": "closure-sort"},
-                }
-            },
-        )
-        yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "set_program_ref", "value": "loom://sort"}]})
-        yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "set_compute_spec", "value": {"operation_ref": "loom://sort"}}]})
-        yield AgentEvent("apply_plan_patch", {"ops": [{"kind": "add_typed_hole", "value": {"hole_id": "h_sort"}}]})
-        yield AgentEvent(
-            "apply_plan_patch",
-            {
-                "ops": [
-                    {
-                        "kind": "bind_compute_hole",
-                        "value": {
-                            "binding_id": "binding-sort",
-                            "hole_id": "h_sort",
-                            "capability_descriptor_ref": {"resource_id": "capability://slave-a/sort"},
-                            "target_resource_ref": {"resource_id": "slave-a"},
-                            "realization_digest": "realization-sort",
-                        },
-                    }
-                ]
-            },
-        )
-        yield AgentEvent("inspect_plan_readiness", {})
-        yield AgentEvent("commit_plan", {})
-        yield AgentEvent("start_run", {})
-
-    async def interrupt(self, turn_ref: str | None = None) -> None:
-        return None
-
-    async def close(self) -> None:
-        return None
-
-
-class DynamicToolProvider:
+class RunCodeClosureProvider:
     def __init__(self, *, fail_after_start: bool = False) -> None:
         self.fail_after_start = fail_after_start
 
@@ -87,49 +41,126 @@ class DynamicToolProvider:
         self.tool_handler = handler
 
     async def start(self, conversation_ref: str, workspace_root: str) -> str:
-        return "dynamic-tool-thread"
+        return "run-code-thread"
 
     async def send_turn(self, user_message: str):
         assert "loom_open_run" in self.tool_names
+        program = await self.tool_handler(
+            "loom_put_content",
+            {
+                "media_type": "text/x-python",
+                "content": "import json,sys; d=json.load(sys.stdin); print(json.dumps({'value': d.get('value', 0) * 2}))",
+            },
+        )
+        contract = await self.tool_handler(
+            "loom_put_content",
+            {
+                "media_type": "application/vnd.loom.io-contract+json",
+                "content": {
+                    "schema_version": "io.v1",
+                    "input_schema_ref": None,
+                    "output_schema_ref": None,
+                    "success_semantics": None,
+                    "success_validator_ref": None,
+                },
+            },
+        )
+        input_content = await self.tool_handler(
+            "loom_put_content",
+            {"media_type": "application/json", "content": {"value": 3}},
+        )
+        operation_ref = "loom://test_double"
         await self.tool_handler(
             "loom_open_run",
             {
                 "closure_contract": {
-                    "closure_id": "closure-dynamic-tool",
+                    "closure_id": "closure-run-code",
                     "goal": user_message,
-                    "required_success_criteria": [{"criterion_id": "echoed"}],
-                    "allowed_effects": [],
+                    "required_success_criteria": [],
+                    "allowed_effects": ["read_workspace"],
                     "resource_budget": {"max_attempts": 1},
-                    "recovery_policy": {"allow_reassignment": False},
+                    "recovery_policy": {},
                     "result_expectations": [{"kind": "content"}],
-                    "body": {
-                        "closure_id": "closure-dynamic-tool",
-                        "program": {"operation_ref": "loom://echo"},
-                        "compute": {"operation_ref": "loom://echo"},
-                    },
+                    "body": {"closure_id": "closure-run-code"},
                 }
             },
         )
         yield AgentEvent("tool_call", {"tool": "loom_open_run"})
+
+        async def apply_patch(operation_id: str, ops: list[dict[str, object]]) -> None:
+            await self.tool_handler(
+                "loom_apply_plan_patch",
+                {"operation_id": operation_id, "ops": ops},
+            )
+            return None
+
+        program_ref = program["resource_ref"]
+        contract_ref = contract["resource_ref"]
+        input_ref = input_content["resource_ref"]
+        await apply_patch(
+            "run-code-program",
+            [
+                {"kind": "set_program_ref", "value": operation_ref},
+                {"kind": "set_io_contract_ref", "value": contract_ref},
+                {"kind": "set_compute_spec", "value": {"operation_ref": operation_ref}},
+                {"kind": "add_typed_hole", "value": {"hole_id": "h_run_code"}},
+            ],
+        )
+        yield AgentEvent("tool_call", {"tool": "loom_apply_plan_patch"})
+        await apply_patch(
+            "run-code-package",
+            [
+                {
+                    "kind": "materialize_capability_package_candidate",
+                    "value": {
+                        "package_id": "run-code-package",
+                        "package_version": "v1",
+                        "operation_descriptor_ref": operation_ref,
+                        "program_content_ref": program_ref,
+                        "io_contract_ref": contract_ref,
+                        "executor_kind": "subprocess_json_v1",
+                        "executor_operation": "run_code",
+                    },
+                }
+            ],
+        )
+        yield AgentEvent("tool_call", {"tool": "loom_apply_plan_patch"})
+        await apply_patch(
+            "run-code-binding",
+            [
+                {
+                    "kind": "bind_compute_hole",
+                    "value": {
+                        "binding_id": "binding-run-code",
+                        "hole_id": "h_run_code",
+                        "capability_descriptor_ref": {"resource_id": "executor://subprocess_json_v1/1"},
+                        "capability_package_ref": {"resource_id": "capability-package://run-code-package/v1"},
+                        "target_resource_ref": {"resource_id": "slave-a"},
+                        "realization_digest": program_ref.get("version_or_digest", ""),
+                    },
+                },
+                {"kind": "set_execution_payload", "value": {"node_id": operation_ref, "input_ref": input_ref}},
+            ],
+        )
+        yield AgentEvent("tool_call", {"tool": "loom_apply_plan_patch"})
+        await self.tool_handler("loom_inspect_plan_readiness", {})
+        yield AgentEvent("tool_call", {"tool": "loom_inspect_plan_readiness"})
         await self.tool_handler("loom_commit_plan", {})
         yield AgentEvent("tool_call", {"tool": "loom_commit_plan"})
         await self.tool_handler("loom_start_run", {})
         yield AgentEvent("tool_call", {"tool": "loom_start_run"})
         if self.fail_after_start:
-            yield AgentEvent(
-                "agent_error",
-                {
-                    "code": "coding_agent_stalled",
-                    "source": "composite_signal",
-                    "message": "the turn failed after start_run",
-                },
-            )
+            yield AgentEvent("agent_error", {"code": "coding_agent_stalled", "source": "composite_signal", "message": "the turn failed after start_run"})
 
     async def interrupt(self, turn_ref: str | None = None) -> None:
         return None
 
     async def close(self) -> None:
         return None
+
+
+class DynamicToolProvider(RunCodeClosureProvider):
+    pass
 
 
 class OpenOnlyProvider:
@@ -264,13 +295,13 @@ async def test_driver_enforces_absolute_conversation_deadline():
 @pytest.mark.asyncio
 async def test_driver_dispatches_committed_operation_to_bound_slave():
     repo = ObserverRepository()
-    driver = DriverService(repo, SortClosureProvider(), slaves={"slave-a": SlaveService("slave-a")})
+    driver = DriverService(repo, RunCodeClosureProvider(), slaves={"slave-a": SlaveService("slave-a", content_store=repo.content_store)})
 
-    result = await driver.run_prompt("conversation-sort", "[3, 1, 2]")
+    result = await driver.run_prompt("conversation-run-code", "double three")
 
     assert result["state"] == "completed"
     run = await repo.get_run(result["run_id"])
-    assert run.outcome["value"] == {"items": [1, 2, 3]}
+    assert run.outcome["value"] == {"value": 6}
     assert run.attempts[0]["target"] == "slave-a"
 
 
@@ -279,28 +310,28 @@ async def test_driver_dispatches_through_worker_session_http_boundary():
     repo = ObserverRepository()
     slave_app = create_slave_app("slave-a")
     worker = WorkerSession("slave-a", "http://slave-a", transport=httpx.ASGITransport(app=slave_app))
-    driver = DriverService(repo, SortClosureProvider(), workers={"slave-a": worker})
+    driver = DriverService(repo, RunCodeClosureProvider(), workers={"slave-a": worker})
 
-    result = await driver.run_prompt("conversation-worker-http", "[3, 1, 2]")
+    result = await driver.run_prompt("conversation-worker-http", "double three")
 
     assert result["state"] == "completed"
     run = await repo.get_run(result["run_id"])
-    assert run.outcome["value"] == {"items": [1, 2, 3]}
+    assert run.outcome["value"] == {"value": 6}
 
 
 @pytest.mark.asyncio
 async def test_driver_adopts_run_opened_through_dynamic_mcp_tool():
     repo = ObserverRepository()
-    driver = DriverService(repo, DynamicToolProvider(), slaves={"slave-a": SlaveService("slave-a")})
+    driver = DriverService(repo, DynamicToolProvider(), slaves={"slave-a": SlaveService("slave-a", content_store=repo.content_store)})
 
-    result = await driver.run_prompt("conversation-dynamic", "echo through MCP")
+    result = await driver.run_prompt("conversation-dynamic", "run code through MCP")
 
     assert result["run_id"] is not None
     assert result["state"] == "completed"
     run = await repo.get_run(result["run_id"])
     assert run.closure_contract is not None
     assert run.closure_contract.origin_conversation_ref == "conversation-dynamic"
-    assert run.outcome["value"] == {"text": "echo through MCP"}
+    assert run.outcome["value"] == {"value": 6}
 
 
 @pytest.mark.asyncio
@@ -311,17 +342,17 @@ async def test_driver_keeps_execution_completed_when_turn_fails_after_start():
     driver = DriverService(
         repo,
         DynamicToolProvider(fail_after_start=True),
-        slaves={"slave-a": SlaveService("slave-a")},
+        slaves={"slave-a": SlaveService("slave-a", content_store=repo.content_store)},
     )
 
-    result = await driver.run_prompt("conversation-started-then-error", "echo through MCP")
+    result = await driver.run_prompt("conversation-started-then-error", "run code through MCP")
 
     assert result["state"] == "completed"
     assert result["agent_error"]["code"] == "coding_agent_stalled"
 
     runs = (await repo.get_conversation("conversation-started-then-error"))["runs"]
     assert runs[0]["state"] == "completed"
-    assert runs[0]["outcome"]["value"] == {"text": "echo through MCP"}
+    assert runs[0]["outcome"]["value"] == {"value": 6}
 
 
 @pytest.mark.asyncio

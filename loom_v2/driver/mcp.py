@@ -152,7 +152,15 @@ class DriverMCP:
     async def _query_capabilities(self) -> dict[str, Any]:
         if self.control is not None:
             result = await self.control.command("capability.list", {})
-            return {"workspace_id": self.workspace_id, "capabilities": result.get("capabilities", []), "packages": result.get("packages", [])}
+            return {
+                "workspace_id": self.workspace_id,
+                "capabilities": result.get("capabilities", []),
+                "packages": result.get("packages", []),
+                "executor_descriptors": [
+                    {"kind": "subprocess_json_v1", "version": "1", "operations": ["run_code"]},
+                    {"kind": "orchestrator_python_v1", "version": "1", "operations": ["orchestrate"]},
+                ],
+            }
         await self.repository.refresh_slaves(self.workspace_id)
         return {
             "workspace_id": self.workspace_id,
@@ -165,7 +173,6 @@ class DriverMCP:
                 for resource_id, details in sorted(self.repository.slave_capabilities.items())
             ],
             "executor_descriptors": [
-                {"kind": "builtin_v1", "version": "1", "operations": ["echo", "hash", "sort", "run_code"]},
                 {"kind": "subprocess_json_v1", "version": "1", "operations": ["run_code"]},
                 {"kind": "orchestrator_python_v1", "version": "1", "operations": ["orchestrate"]},
             ],

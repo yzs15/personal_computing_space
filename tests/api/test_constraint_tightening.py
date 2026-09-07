@@ -5,7 +5,7 @@ from loom_v2.observer.app import create_app
 
 def test_relaxed_constraint_patch_is_rejected_without_polluting_draft():
     client = TestClient(create_app())
-    run = client.post("/api/v1/runs", json={"task_ref": "task-constraint", "goal": "echo"}).json()
+    run = client.post("/api/v1/runs", json={"task_ref": "task-constraint", "goal": "run test code"}).json()
     first = client.post(
         f"/api/v1/runs/{run['run_id']}/patches",
         json={

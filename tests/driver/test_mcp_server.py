@@ -38,7 +38,7 @@ def test_mcp_json_rpc_registers_tools_and_scopes_calls_to_conversation():
                 "arguments": {
                     "closure_contract": {
                         "closure_id": "closure-mcp-http",
-                        "goal": "echo",
+                        "goal": "run test code",
                         "body": {"closure_id": "closure-mcp-http"},
                     }
                 },

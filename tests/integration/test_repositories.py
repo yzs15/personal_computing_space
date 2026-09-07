@@ -6,7 +6,7 @@ from loom_v2.observer.repository import ObserverRepository
 @pytest.mark.asyncio
 async def test_patch_is_cas_and_idempotent():
     repo = ObserverRepository()
-    run = await repo.open_run("run-1", "task-1", "echo")
+    run = await repo.open_run("run-1", "task-1", "run test code")
     base_version = run.draft_version
     base_digest = run.draft_digest
     first = await repo.apply_patch(

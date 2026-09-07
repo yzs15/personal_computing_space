@@ -12,40 +12,39 @@ from loom_v2.contracts.types import (
     TaskClosure,
     TypedHole,
 )
-from loom_v2.slave.executor import execute_operation
-
-ITEMS = [1, 3, 4, 3, 2, 10, 58]
+from loom_v2.slave.executor import SubprocessJSONV1Adapter
 
 
-def build_sort_closure() -> TaskClosure:
+def build_run_code_closure() -> TaskClosure:
     return TaskClosure(
-        closure_id="closure-sort-demo",
+        closure_id="closure-run-code-demo",
         data=DataApplication(
             logical_inputs=[
-                ResourceRef(resource_id="input://items/1-3-4-3-2-10-58", version_or_digest="v1", identity_criterion="content_digest")
+                ResourceRef(resource_id="input://value/3", version_or_digest="v1", identity_criterion="content_digest")
             ],
             identity_criterion="content_digest",
-            expected_cardinality="7",
+            expected_cardinality="1",
             terms=[TypedTerm(kind="loom.data.locality.v1", schema_ref="loom.data.locality/1", value={"locality": "workspace"})],
         ),
-        program=ProgramApplication(operation_ref="loom://sort", success_semantics={"result": "sorted ascending"}),
-        compute=ComputeSpec(operation_ref="loom://sort", typed_holes=[TypedHole(hole_id="h_sort")]),
-        compute_application=ComputeApplication(result_expectation={"items": sorted(ITEMS)}),
-        metadata={"goal": "sort the given list", "input_items": ITEMS},
+        program=ProgramApplication(operation_ref="loom://test_double"),
+        compute=ComputeSpec(operation_ref="loom://test_double", typed_holes=[TypedHole(hole_id="h_run_code")]),
+        compute_application=ComputeApplication(result_expectation={"value": 6}),
+        metadata={"goal": "run the supplied value through a capability package", "input_value": 3},
     )
 
 
 async def main() -> None:
-    closure = build_sort_closure()
+    closure = build_run_code_closure()
     print("closure_id:", closure.closure_id)
     print("operation_ref:", closure.program.operation_ref)
     print("canonical_digest:", closure.canonical_digest())
     print("result_expectation:", closure.compute_application.result_expectation)
 
-    result = await execute_operation("sort", {"items": ITEMS})
+    program = b'import json,sys; value=json.load(sys.stdin)["value"]; print(json.dumps({"value": value * 2}))'
+    result = await SubprocessJSONV1Adapter().execute("run_code", {"value": 3}, program=program)
     print("execution_digest:", result.digest)
     print("resource_ref:", result.resource_ref.resource_id)
-    print("sorted_items:", result.value["items"])
+    print("result:", result.value)
 
 
 if __name__ == "__main__":

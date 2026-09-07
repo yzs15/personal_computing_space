@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import asyncio
-import json
 import shutil
 from contextlib import suppress
 from dataclasses import dataclass
@@ -14,7 +13,7 @@ from loom_v2.contracts.types import CapabilityProvisionCommand, ComputeBinding, 
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.driver.worker import WorkerSession
 from loom_v2.slave.service import SlaveService
-from loom_v2.slave.executor import ExecutionResult, execute_operation
+from loom_v2.slave.executor import ExecutionResult
 from loom_v2.settings import Settings
 from loom_v2.coding_agents.turn import TurnContext
 from loom_v2.driver.coordinator import DriverTurnCoordinator
@@ -43,7 +42,7 @@ class DriverService:
         self,
         repository: ObserverRepository,
         provider: CodingAgentProvider,
-        executor=execute_operation,
+        executor=None,
         slaves: dict[str, SlaveService] | None = None,
         workers: dict[str, WorkerSession] | None = None,
         deadline_seconds: float | None = None,
@@ -52,8 +51,12 @@ class DriverService:
     ) -> None:
         self.control_client = repository if hasattr(repository, "command") and not hasattr(repository, "get_run") else None
         self.repository = repository
-        self.remote_repository = RemoteObserverRepository(repository, content_store=content_store) if self.control_client is not None else None
-        self.content_store = content_store
+        self.content_store = (
+            content_store
+            or getattr(repository, "content_store", None)
+            or getattr(getattr(repository, "repository", None), "content_store", None)
+        )
+        self.remote_repository = RemoteObserverRepository(repository, content_store=self.content_store) if self.control_client is not None else None
         self.provider = provider
         self.tools = DriverTools(repository)
         self.executor = executor
@@ -722,18 +725,8 @@ class DriverService:
         worker = self.workers.get(target)
         if worker is None:
             raise RuntimeError(f"capability_unavailable:{target}")
-        operation = self._operation_name(snapshot.program.operation_ref or snapshot.compute.operation_ref) or "echo"
-        payload: dict[str, Any]
-        if operation in {"echo", "hash"}:
-            payload = {"text": prompt}
-        elif operation == "sort":
-            try:
-                decoded = json.loads(prompt)
-                payload = {"items": decoded if isinstance(decoded, list) else []}
-            except (TypeError, json.JSONDecodeError):
-                payload = {"items": []}
-        else:
-            payload = {}
+        operation = self._operation_name(snapshot.program.operation_ref or snapshot.compute.operation_ref) or "run_code"
+        payload = await self._execution_payload(snapshot, operation, prompt)
         binding = snapshot.compute_bindings[0] if snapshot.compute_bindings else None
         if binding is not None and binding.capability_package_ref is not None and self.remote_repository is not None:
             package = await self.remote_repository.get_capability_package(binding.capability_package_ref, run_id=run_id)
@@ -760,7 +753,7 @@ class DriverService:
                 request_id=f"health:{execution_id}:{target}:{package.package_digest}",
             )
         result = await worker.dispatch(attempt_id=str(attempt["attempt_id"]), execution_id=str(execution_id), execution_epoch=execution_epoch, workspace_id=getattr(control, "workspace_id", "workspace-default"), operation=operation, payload=payload, closure=snapshot, binding=binding, driver_id=getattr(control, "driver_id", None), driver_epoch=getattr(control, "driver_epoch", None))
-        await control.command("run.result", {"run_id": run_id, "result": {"attempt_id": attempt["attempt_id"], "execution_id": execution_id, "execution_epoch": execution_epoch, "resource_ref": result.resource_ref.model_dump(mode="json"), "digest": result.digest, "value": result.value, "terminal_state": result.terminal_state, "terminal_error": result.terminal_error, "validation_evidence": result.validation_evidence}}, request_id=f"execution:{execution_id}:{execution_epoch}")
+        await control.command("run.result", {"run_id": run_id, "result": {"attempt_id": attempt["attempt_id"], "execution_id": execution_id, "execution_epoch": execution_epoch, "resource_ref": result.resource_ref.model_dump(mode="json"), "digest": result.digest, "value": result.value, "terminal_state": result.terminal_state, "terminal_error": result.terminal_error, "validation_evidence": result.validation_evidence, "provenance": result.provenance}}, request_id=f"execution:{execution_id}:{execution_epoch}")
 
     async def _refresh_remote_workers(self) -> None:
         if self.control_client is None:
@@ -937,7 +930,7 @@ class DriverService:
                 driver_epoch=getattr(self.control_client, "driver_epoch", None),
             )
             return await runtime.run(run_id)
-        operation = self._operation_name(snapshot.program.operation_ref or snapshot.compute.operation_ref) or "echo"
+        operation = self._operation_name(snapshot.program.operation_ref or snapshot.compute.operation_ref) or "run_code"
         payload = await self._execution_payload(snapshot, operation, prompt)
         binding = self._binding_for_operation(snapshot)
         current_attempt = next(
@@ -1023,6 +1016,8 @@ class DriverService:
                     execution_epoch=execution_epoch,
                 )
         else:
+            if self.executor is None:
+                raise RuntimeError("node_target_unavailable")
             result = await self.executor(operation, payload)
         completed = await self.repository.record_result(
             run_id,
@@ -1036,6 +1031,7 @@ class DriverService:
                 "terminal_state": result.terminal_state,
                 "terminal_error": result.terminal_error,
                 "validation_evidence": result.validation_evidence,
+                "provenance": result.provenance,
             },
         )
         return completed, result
@@ -1051,22 +1047,12 @@ class DriverService:
         # Resolve it at dispatch time so the closure carries only semantic
         # references and no mutable/raw payload in metadata.
         operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
-        binding = self.repository._input_binding_for(snapshot, operation_ref)
+        repository = self.remote_repository if self.remote_repository is not None else self.repository
+        binding = repository._input_binding_for(snapshot, operation_ref)
         if binding is not None:
-            value = await self.repository._load_json_content(binding.input_ref)
+            value = await repository._load_json_content(binding.input_ref)
             return dict(value) if isinstance(value, dict) else {"value": value}
-
-        payload: dict[str, Any] = {}
-        if operation in {"echo", "hash"}:
-            payload.setdefault("text", prompt)
-        elif operation == "sort" and "items" not in payload:
-            try:
-                decoded = json.loads(prompt)
-                items = decoded if isinstance(decoded, list) else []
-            except (TypeError, json.JSONDecodeError):
-                items = []
-            payload["items"] = items
-        return payload
+        return {}
 
     @staticmethod
     def _binding_for_operation(snapshot: TaskClosure) -> ComputeBinding | None:
