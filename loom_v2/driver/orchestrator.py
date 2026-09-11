@@ -32,7 +32,7 @@ class OrchestrationProgramError(RuntimeError):
 
 @dataclass(frozen=True)
 class OrchestrationExecutorDescriptor:
-    kind: str = "orchestrator_python_v1"
+    kind: str = "container:python_orchestrator"
     version: str = "1"
     operation: str = "orchestrate"
 

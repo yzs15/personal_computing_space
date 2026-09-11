@@ -682,7 +682,7 @@ class DriverService:
         snapshot = run_payload.get("snapshot") if isinstance(run_payload, dict) else None
         systems = snapshot.get("program_systems") if isinstance(snapshot, dict) else None
         orchestration = bool(run_payload.get("orchestration")) or (
-            isinstance(systems, dict) and systems.get("executor_kind") == "orchestrator_python_v1"
+            isinstance(systems, dict) and (systems.get("execution") or {}).get("kind") == "container:python_orchestrator"
         )
         if orchestration and shutil.which("docker") is None:
             raise RuntimeError("orchestrator_runtime_unavailable")
@@ -706,7 +706,7 @@ class DriverService:
         if not snapshot_payload:
             return
         snapshot = TaskClosure.model_validate(snapshot_payload)
-        if snapshot.program_systems.executor_kind == "orchestrator_python_v1":
+        if snapshot.program_systems.execution.kind == "container:python_orchestrator":
             assert self.remote_repository is not None
             await self.remote_repository.refresh_slaves()
             runtime = DynamicOrchestrationRuntime(
@@ -738,7 +738,7 @@ class DriverService:
                 workspace_id=getattr(control, "workspace_id", "workspace-default"),
                 activation_closure_version_ref=(current.get("committed") or {}).get("version_id") or package.package_closure_version_ref,
                 compute_binding=binding,
-                program_content_ref=package.program_content_ref,
+                program_content_ref=package.function_body.program_content_ref,
                 idempotency_key=f"run-{execution_id}-{package.package_digest}-{target}",
             )
             report = await worker.provision(
@@ -794,7 +794,7 @@ class DriverService:
             workspace_id=self.control_client.workspace_id,
             activation_closure_version_ref=package.package_closure_version_ref,
             compute_binding=compute_binding,
-            program_content_ref=package.program_content_ref,
+            program_content_ref=package.function_body.program_content_ref,
             idempotency_key=idempotency_key or f"promote-{package.package_digest}-{target_slave}",
         )
         report = await worker.provision(
@@ -920,7 +920,7 @@ class DriverService:
         execution_id = record.execution_id
         execution_epoch = record.execution_epoch
         snapshot = record.committed.snapshot if record.committed is not None else TaskClosure.minimal()
-        if snapshot.program_systems.executor_kind == "orchestrator_python_v1":
+        if snapshot.program_systems.execution.kind == "container:python_orchestrator":
             runtime = DynamicOrchestrationRuntime(
                 repository=self.repository,
                 executor=self.orchestration_executor,
@@ -970,7 +970,7 @@ class DriverService:
                         workspace_id=record.closure_contract.workspace_id if record.closure_contract else "workspace-default",
                         activation_closure_version_ref=record.committed.version_id if record.committed else package.package_closure_version_ref,
                         compute_binding=binding,
-                        program_content_ref=package.program_content_ref,
+                        program_content_ref=package.function_body.program_content_ref,
                         idempotency_key=f"run-{execution_id}-{package.package_digest}-{target}",
                     )
                     report = await worker.provision(command=command, package=package, driver_id=getattr(self.control_client, "driver_id", None), driver_epoch=getattr(self.control_client, "driver_epoch", None))
@@ -1002,7 +1002,7 @@ class DriverService:
                         workspace_id=record.closure_contract.workspace_id if record.closure_contract else "workspace-default",
                         activation_closure_version_ref=record.committed.version_id if record.committed else package.package_closure_version_ref,
                         compute_binding=binding,
-                        program_content_ref=package.program_content_ref,
+                        program_content_ref=package.function_body.program_content_ref,
                         idempotency_key=f"run-{execution_id}-{package.package_digest}-{target}",
                     )
                     report = await slave.provision(command, package)

@@ -145,14 +145,16 @@ class FakeCodingAgentProvider:
                 {
                     "kind": "materialize_capability_package_candidate",
                     "value": {
-                        "package_id": "fake-run-code",
-                        "package_version": "v1",
-                        "operation_descriptor_ref": operation_ref,
-                        "program_content_ref": program_ref,
-                        "io_contract_ref": io_contract_ref,
-                        "executor_kind": "subprocess_json_v1",
-                        "executor_operation": "run_code",
-                    },
+                                 "package_id": "fake-run-code",
+                                 "package_version": "v1",
+                                 "package_type": "function",
+                                 "execution": {"kind": "process:json_stdio", "version": "1"},
+                                 "body": {
+                                     "operation_descriptor_ref": operation_ref,
+                                     "program_content_ref": program_ref,
+                                     "io_contract_ref": io_contract_ref,
+                                 },
+                             },
                 }
             ],
         )
@@ -164,7 +166,7 @@ class FakeCodingAgentProvider:
                     "value": {
                         "binding_id": "binding-h_compute",
                         "hole_id": "h_compute",
-                        "capability_descriptor_ref": {"resource_id": "executor://subprocess_json_v1/1"},
+                        "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
                         "capability_package_ref": {"resource_id": "capability-package://fake-run-code/v1"},
                         "target_resource_ref": {"resource_id": "slave-a"},
                         "realization_digest": program_ref.get("version_or_digest", ""),

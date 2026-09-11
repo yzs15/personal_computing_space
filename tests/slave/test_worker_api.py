@@ -64,7 +64,7 @@ def test_slave_capabilities_endpoint_reports_worker_contract():
     payload = response.json()
     assert payload["slave_id"] == "slave-a"
     assert payload["operations"] == ["run_code"]
-    assert [item["kind"] for item in payload["executor_descriptors"]] == ["subprocess_json_v1"]
+    assert [item["kind"] for item in payload["executor_descriptors"]] == ["process:json_stdio"]
 
 
 @pytest.mark.asyncio
@@ -368,11 +368,7 @@ async def test_worker_session_provision_sends_only_content_references():
         package_closure_version_ref="closure",
         source_run_ref="run",
         source_closure_version_ref="version",
-        operation_descriptor_ref=ResourceRef(resource_id="loom://check"),
-        operation_descriptor_digest="descriptor",
-        program_content_ref=program_ref,
-        program_digest=program_ref.version_or_digest,
-        io_contract_ref=contract_ref,
+        body={"operation_descriptor_ref": ResourceRef(resource_id="loom://check"), "operation_descriptor_digest": "descriptor", "program_content_ref": program_ref, "program_digest": program_ref.version_or_digest, "io_contract_ref": contract_ref},
     )
     session = WorkerSession("slave-a", "http://slave-a", transport=httpx.ASGITransport(app=app))
     await session.provision(

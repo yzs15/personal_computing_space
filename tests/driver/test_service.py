@@ -23,8 +23,7 @@ async def test_driver_applies_fake_patches_continuously_and_starts_execution():
     assert result["closure_version"].startswith("committed-")
     assert result["resource_ref"].startswith("result-")
     assert result["outcome"]["value"] == {"value": 6}
-    assert result["outcome"]["provenance"]["executor_kind"] == "subprocess_json_v1"
-    assert result["outcome"]["provenance"]["executor_operation"] == "run_code"
+    assert result["outcome"]["provenance"]["execution"] == {"kind": "process:json_stdio", "version": "1"}
     assert result["outcome"]["provenance"]["package_version_ref"].startswith("capability-package://fake-run-code/")
     assert result["conversation_ref"] == "conversation-1"
     assert result["assistant_text"] == "I will refine the closure in multiple patches."
@@ -113,14 +112,15 @@ class RunCodeClosureProvider:
                 {
                     "kind": "materialize_capability_package_candidate",
                     "value": {
-                        "package_id": "run-code-package",
-                        "package_version": "v1",
-                        "operation_descriptor_ref": operation_ref,
-                        "program_content_ref": program_ref,
-                        "io_contract_ref": contract_ref,
-                        "executor_kind": "subprocess_json_v1",
-                        "executor_operation": "run_code",
-                    },
+                                 "package_id": "run-code-package",
+                                 "package_version": "v1",
+                                 "execution": {"kind": "process:json_stdio", "version": "1"},
+                                 "body": {
+                                     "operation_descriptor_ref": operation_ref,
+                                     "program_content_ref": program_ref,
+                                     "io_contract_ref": contract_ref,
+                                 },
+                             },
                 }
             ],
         )
@@ -133,7 +133,7 @@ class RunCodeClosureProvider:
                     "value": {
                         "binding_id": "binding-run-code",
                         "hole_id": "h_run_code",
-                        "capability_descriptor_ref": {"resource_id": "executor://subprocess_json_v1/1"},
+                        "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
                         "capability_package_ref": {"resource_id": "capability-package://run-code-package/v1"},
                         "target_resource_ref": {"resource_id": "slave-a"},
                         "realization_digest": program_ref.get("version_or_digest", ""),

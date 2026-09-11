@@ -346,22 +346,26 @@ def run_mcp_mode(
                 {
                     "kind": "materialize_capability_package_candidate",
                     "value": {
-                        "package_id": "summarize-bandgap",
-                        "package_version": "v1",
-                        "program_content_ref": summarize_program,
-                        "io_contract_ref": summarize_contract,
-                        "operation_descriptor_ref": "loom://summarize-bandgap",
-                    },
+                                 "package_id": "summarize-bandgap",
+                                 "package_version": "v1",
+                                 "body": {
+                                     "program_content_ref": summarize_program,
+                                     "io_contract_ref": summarize_contract,
+                                     "operation_descriptor_ref": "loom://summarize-bandgap",
+                                 },
+                             },
                 },
                 {
                     "kind": "materialize_capability_package_candidate",
                     "value": {
-                        "package_id": "merge-bandgap",
-                        "package_version": "v1",
-                        "program_content_ref": merge_program,
-                        "io_contract_ref": merge_contract,
-                        "operation_descriptor_ref": "loom://merge-bandgap",
-                    },
+                                 "package_id": "merge-bandgap",
+                                 "package_version": "v1",
+                                 "body": {
+                                     "program_content_ref": merge_program,
+                                     "io_contract_ref": merge_contract,
+                                     "operation_descriptor_ref": "loom://merge-bandgap",
+                                 },
+                             },
                 },
             ]
         },
@@ -382,17 +386,18 @@ def run_mcp_mode(
                 {
                     "kind": "materialize_capability_package_candidate",
                     "value": {
-                        "package_id": "orchestrate",
-                        "package_version": "v1",
-                        "program_content_ref": orchestration_program,
-                        "io_contract_ref": parent_contract,
-                        "operation_descriptor_ref": "loom://orchestrate",
-                        "executor_kind": "orchestrator_python_v1",
-                        "executor_operation": "orchestrate",
-                        "allowed_node_package_refs": [summarize_ref, merge_ref],
-                        "max_nodes": 8,
-                        "max_live_nodes": 2,
-                    },
+                                 "package_id": "orchestrate",
+                                 "package_version": "v1",
+                                 "execution": {"kind": "container:python_orchestrator", "version": "1"},
+                                 "body": {
+                                     "program_content_ref": orchestration_program,
+                                     "io_contract_ref": parent_contract,
+                                     "operation_descriptor_ref": "loom://orchestrate",
+                                     "allowed_node_package_refs": [summarize_ref, merge_ref],
+                                     "max_nodes": 8,
+                                     "max_live_nodes": 2,
+                                 },
+                             },
                 }
             ]
         },

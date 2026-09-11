@@ -239,32 +239,38 @@ async def test_deterministic_bandgap_report_executes_parse_summarize_merge_and_r
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "df_xml_parse",
-                    "package_version": "v1",
-                    "program_content_ref": parse_program.model_dump(mode="json"),
-                    "io_contract_ref": parse_contract.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://df_xml_parse",
-                },
+                             "package_id": "df_xml_parse",
+                             "package_version": "v1",
+                             "body": {
+                                 "program_content_ref": parse_program.model_dump(mode="json"),
+                                 "io_contract_ref": parse_contract.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://df_xml_parse",
+                             },
+                         },
             },
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "summarize_bandgap",
-                    "package_version": "v1",
-                    "program_content_ref": summarize_program.model_dump(mode="json"),
-                    "io_contract_ref": summarize_contract.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://summarize_bandgap",
-                },
+                             "package_id": "summarize_bandgap",
+                             "package_version": "v1",
+                             "body": {
+                                 "program_content_ref": summarize_program.model_dump(mode="json"),
+                                 "io_contract_ref": summarize_contract.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://summarize_bandgap",
+                             },
+                         },
             },
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "merge_bandgap_report",
-                    "package_version": "v1",
-                    "program_content_ref": merge_program.model_dump(mode="json"),
-                    "io_contract_ref": merge_contract.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://merge_bandgap_report",
-                },
+                             "package_id": "merge_bandgap_report",
+                             "package_version": "v1",
+                             "body": {
+                                 "program_content_ref": merge_program.model_dump(mode="json"),
+                                 "io_contract_ref": merge_contract.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://merge_bandgap_report",
+                             },
+                         },
             },
         ],
     )
@@ -298,21 +304,22 @@ async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> 
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "orchestrate_bandgap",
-                    "package_version": "v1",
-                    "program_content_ref": orchestration_program.model_dump(mode="json"),
-                    "io_contract_ref": parent_contract.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://orchestrate",
-                    "executor_kind": "orchestrator_python_v1",
-                    "executor_operation": "orchestrate",
-                    "allowed_node_package_refs": [
+                             "package_id": "orchestrate_bandgap",
+                             "package_version": "v1",
+                             "execution": {"kind": "container:python_orchestrator", "version": "1"},
+                             "body": {
+                                 "program_content_ref": orchestration_program.model_dump(mode="json"),
+                                 "io_contract_ref": parent_contract.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://orchestrate",
+                                 "allowed_node_package_refs": [
                         package_refs["df_xml_parse"].model_dump(mode="json"),
                         package_refs["summarize_bandgap"].model_dump(mode="json"),
                         package_refs["merge_bandgap_report"].model_dump(mode="json"),
                     ],
-                    "max_nodes": 6,
-                    "max_live_nodes": 2,
-                },
+                                 "max_nodes": 6,
+                                 "max_live_nodes": 2,
+                             },
+                         },
             },
         ],
     )
@@ -388,12 +395,14 @@ async def test_parse_package_promotion_and_abandon_are_explicit_user_decisions()
                 {
                     "kind": "materialize_capability_package_candidate",
                     "value": {
-                        "package_id": f"df_xml_parse_{terminal_action}",
-                        "package_version": "v1",
-                        "program_content_ref": program_ref.model_dump(mode="json"),
-                        "io_contract_ref": contract_ref.model_dump(mode="json"),
-                        "operation_descriptor_ref": "loom://df_xml_parse",
-                    },
+                                 "package_id": f"df_xml_parse_{terminal_action}",
+                                 "package_version": "v1",
+                                 "body": {
+                                     "program_content_ref": program_ref.model_dump(mode="json"),
+                                     "io_contract_ref": contract_ref.model_dump(mode="json"),
+                                     "operation_descriptor_ref": "loom://df_xml_parse",
+                                 },
+                             },
                 },
             ],
         )
@@ -459,12 +468,14 @@ async def test_lost_slave_a_attempt_is_reassigned_to_slave_b():
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "probe",
-                    "package_version": "v1",
-                    "program_content_ref": node_program.model_dump(mode="json"),
-                    "io_contract_ref": contract.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://probe",
-                },
+                             "package_id": "probe",
+                             "package_version": "v1",
+                             "body": {
+                                 "program_content_ref": node_program.model_dump(mode="json"),
+                                 "io_contract_ref": contract.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://probe",
+                             },
+                         },
             },
         ],
     )
@@ -479,17 +490,18 @@ async def test_lost_slave_a_attempt_is_reassigned_to_slave_b():
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "orchestrate_probe",
-                    "package_version": "v1",
-                    "program_content_ref": orchestration_program.model_dump(mode="json"),
-                    "io_contract_ref": contract.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://orchestrate",
-                    "executor_kind": "orchestrator_python_v1",
-                    "executor_operation": "orchestrate",
-                    "allowed_node_package_refs": [node_ref.model_dump(mode="json")],
-                    "max_nodes": 1,
-                    "max_live_nodes": 1,
-                },
+                             "package_id": "orchestrate_probe",
+                             "package_version": "v1",
+                             "execution": {"kind": "container:python_orchestrator", "version": "1"},
+                             "body": {
+                                 "program_content_ref": orchestration_program.model_dump(mode="json"),
+                                 "io_contract_ref": contract.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://orchestrate",
+                                 "allowed_node_package_refs": [node_ref.model_dump(mode="json")],
+                                 "max_nodes": 1,
+                                 "max_live_nodes": 1,
+                             },
+                         },
             },
         ],
     )

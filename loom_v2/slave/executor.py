@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from loom_v2.contracts.types import ResourceRef
+from loom_v2.contracts.types import ExecutionContract, ResourceRef
 from loom_v2.content_store import canonical_json_bytes
 
 
@@ -46,7 +46,7 @@ class ExecutorDescriptor:
 class ExecutorAdapter(Protocol):
     descriptor: ExecutorDescriptor
 
-    async def execute(self, operation: str, payload: dict[str, Any], *, program: bytes | None = None) -> ExecutionResult: ...
+    async def invoke(self, payload: dict[str, Any], *, program: bytes | None = None) -> ExecutionResult: ...
 
 
 def _result(value: Any, replay_safety: str = "Idempotent") -> ExecutionResult:
@@ -59,8 +59,8 @@ def _result(value: Any, replay_safety: str = "Idempotent") -> ExecutionResult:
     )
 
 
-class SubprocessJSONV1Adapter:
-    descriptor = ExecutorDescriptor(kind="subprocess_json_v1", operations=frozenset({"run_code"}), replay_safety="DeclaredByPackage", effect_class="Sandboxed")
+class ProcessJSONStdioV1Adapter:
+    descriptor = ExecutorDescriptor(kind="process:json_stdio", operations=frozenset({"run_code"}), replay_safety="DeclaredByPackage", effect_class="Sandboxed")
 
     def __init__(self, timeout_seconds: float | None = None) -> None:
         # Keep the timeout on the child-operation adapter, independent from
@@ -73,9 +73,7 @@ class SubprocessJSONV1Adapter:
         configured = os.getenv("LOOM_CAPABILITY_OPERATION_TIMEOUT_SECONDS", "30")
         return self.timeout_seconds if self.timeout_seconds is not None else float(configured)
 
-    async def execute(self, operation: str, payload: dict[str, Any], *, program: bytes | None = None) -> ExecutionResult:
-        if operation != "run_code":
-            raise ValueError(f"unsupported_operation:{operation}")
+    async def invoke(self, payload: dict[str, Any], *, program: bytes | None = None) -> ExecutionResult:
         if not program:
             raise ValueError("program_required")
         proc = await asyncio.create_subprocess_exec(
@@ -103,42 +101,27 @@ class SubprocessJSONV1Adapter:
             raise RuntimeError("subprocess_invalid_json") from exc
         return _result(value, replay_safety=self.descriptor.replay_safety)
 
-
 class ExecutorRegistry:
     def __init__(self, adapters: list[ExecutorAdapter] | None = None, *, capability_timeout_seconds: float | None = None) -> None:
-        self._adapters: dict[str, ExecutorAdapter] = {}
-        for adapter in adapters or [SubprocessJSONV1Adapter(capability_timeout_seconds)]:
+        self._adapters: dict[tuple[str, str], ExecutorAdapter] = {}
+        for adapter in adapters if adapters is not None else [ProcessJSONStdioV1Adapter(capability_timeout_seconds)]:
             self.register(adapter)
 
-    def register(self, adapter: ExecutorAdapter | str, implementation: ExecutorAdapter | None = None) -> None:
-        # Accept both ``register(adapter)`` and ``register(kind, adapter)``
-        # for small integrations that keep an explicit registry key.
-        value = implementation if implementation is not None else adapter
-        if isinstance(value, str):
-            raise TypeError("executor_adapter_required")
-        self._adapters[value.descriptor.kind if not isinstance(adapter, str) else adapter] = value
+    def register(self, adapter: ExecutorAdapter) -> None:
+        self._adapters[(adapter.descriptor.kind, adapter.descriptor.version)] = adapter
 
-    def get(self, kind: str) -> ExecutorAdapter:
+    def get(self, execution: ExecutionContract) -> ExecutorAdapter:
         try:
-            return self._adapters[kind]
+            return self._adapters[(execution.kind, execution.version)]
         except KeyError as exc:
-            if kind in FUTURE_EXECUTOR_KINDS:
-                raise ValueError(f"unsupported_executor_extension:{kind}") from exc
-            raise ValueError(f"unsupported_executor:{kind}") from exc
+            raise ValueError(f"unsupported_executor:{execution.kind}/{execution.version}") from exc
 
     def descriptors(self) -> list[ExecutorDescriptor]:
         return [adapter.descriptor for adapter in self._adapters.values()]
 
-    async def execute(self, executor_kind: str, operation: str, payload: dict[str, Any], *, program: bytes | None = None) -> ExecutionResult:
-        adapter = self.get(executor_kind)
-        if operation not in adapter.descriptor.operations:
-            raise ValueError(f"unsupported_operation:{operation}")
-        return await adapter.execute(operation, payload, program=program)
+    async def invoke(self, execution: ExecutionContract, payload: dict[str, Any], *, program: bytes | None = None) -> ExecutionResult:
+        adapter = self.get(execution)
+        return await adapter.invoke(payload, program=program)
 
 
 default_registry = ExecutorRegistry()
-
-FUTURE_EXECUTOR_KINDS = frozenset({"http_service_v1", "grpc_service_v1", "mcp_v1"})
-
-# Public alias mirrors the wire-level adapter kind used in the design.
-subprocess_json_v1 = SubprocessJSONV1Adapter

@@ -94,12 +94,14 @@ async def test_dynamic_orchestration_runtime_executes_docker_program_and_slave_n
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "summarize",
-                    "package_version": "v1",
-                    "program_content_ref": node_program.model_dump(mode="json"),
-                    "io_contract_ref": node_contract.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://summarize",
-                },
+                             "package_id": "summarize",
+                             "package_version": "v1",
+                             "body": {
+                                 "program_content_ref": node_program.model_dump(mode="json"),
+                                 "io_contract_ref": node_contract.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://summarize",
+                             },
+                         },
             },
         ],
     )
@@ -128,17 +130,18 @@ async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> 
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "orchestrate",
-                    "package_version": "v1",
-                    "program_content_ref": orchestration_program.model_dump(mode="json"),
-                    "io_contract_ref": parent_contract.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://orchestrate",
-                    "executor_kind": "orchestrator_python_v1",
-                    "executor_operation": "orchestrate",
-                    "allowed_node_package_refs": [package_ref.model_dump(mode="json")],
-                    "max_nodes": 2,
-                    "max_live_nodes": 1,
-                },
+                             "package_id": "orchestrate",
+                             "package_version": "v1",
+                             "execution": {"kind": "container:python_orchestrator", "version": "1"},
+                             "body": {
+                                 "program_content_ref": orchestration_program.model_dump(mode="json"),
+                                 "io_contract_ref": parent_contract.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://orchestrate",
+                                 "allowed_node_package_refs": [package_ref.model_dump(mode="json")],
+                                 "max_nodes": 2,
+                                 "max_live_nodes": 1,
+                             },
+                         },
             },
         ],
     )
@@ -187,7 +190,7 @@ async def test_target_selection_applies_permissions_locality_and_round_robin():
         },
     )
 
-    denied = package.model_copy(update={"permissions": ["compute"], "package_digest": ""})
+    denied = package.model_copy(update={"body": package.function_body.model_copy(update={"permissions": ["compute"]}), "package_digest": ""})
     try:
         runtime._select_target(denied, record)
     except RuntimeError as exc:
@@ -283,12 +286,14 @@ async def _dynamic_fixture_for_target_selection(
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "summarize",
-                    "package_version": "v1",
-                    "program_content_ref": node_program.model_dump(mode="json"),
-                    "io_contract_ref": contract.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://summarize",
-                },
+                             "package_id": "summarize",
+                             "package_version": "v1",
+                             "body": {
+                                 "program_content_ref": node_program.model_dump(mode="json"),
+                                 "io_contract_ref": contract.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://summarize",
+                             },
+                         },
             },
         ],
     )
@@ -307,17 +312,18 @@ async def _dynamic_fixture_for_target_selection(
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "orchestrate",
-                    "package_version": "v1",
-                    "program_content_ref": program.model_dump(mode="json"),
-                    "io_contract_ref": contract.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://orchestrate",
-                    "executor_kind": "orchestrator_python_v1",
-                    "executor_operation": "orchestrate",
-                    "allowed_node_package_refs": [package_ref.model_dump(mode="json")],
-                    "max_nodes": 2,
-                    "max_live_nodes": 2,
-                },
+                             "package_id": "orchestrate",
+                             "package_version": "v1",
+                             "execution": {"kind": "container:python_orchestrator", "version": "1"},
+                             "body": {
+                                 "program_content_ref": program.model_dump(mode="json"),
+                                 "io_contract_ref": contract.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://orchestrate",
+                                 "allowed_node_package_refs": [package_ref.model_dump(mode="json")],
+                                 "max_nodes": 2,
+                                 "max_live_nodes": 2,
+                             },
+                         },
             },
         ],
     )

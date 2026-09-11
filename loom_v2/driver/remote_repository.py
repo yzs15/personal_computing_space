@@ -164,9 +164,11 @@ class RemoteObserverRepository:
         agent = self.slave_agents.get(slave_id)
         if agent is None or agent.get("lease_state") != "active":
             return False
-        operation = package.executor_operation or "run_code"
+        execution = package.execution
+        execution_kind = execution.kind
+        operation = "run_code" if execution_kind == "process:json_stdio" else ""
         details = self.slave_capabilities.get(slave_id, {})
-        if operation not in details.get("operations", set()):
+        if operation and operation not in details.get("operations", set()):
             return False
         declared_executors = (
             details.get("executor_kinds")
@@ -175,11 +177,11 @@ class RemoteObserverRepository:
         )
         if declared_executors:
             raw_executors = [declared_executors] if isinstance(declared_executors, str) else declared_executors
-            executor_kinds = {
-                str(item.get("kind")) if isinstance(item, dict) else str(item)
+            return any(
+                ((str(item.get("kind")), str(item.get("version", "1"))) == (execution.kind, execution.version))
+                if isinstance(item, dict) else str(item) == execution.kind
                 for item in raw_executors
-            }
-            return package.executor_kind in executor_kinds
+            )
         return True
 
     async def accept_node_intent(self, run_id: str, intent: NodeIntent, *, selected_target: str) -> DynamicNode:

@@ -65,14 +65,15 @@ class DynamicToolProvider:
             "loom_apply_plan_patch",
             {
                 "ops": [{"kind": "materialize_capability_package_candidate", "value": {
-                    "package_id": "remote-run-code",
-                    "package_version": "v1",
-                    "operation_descriptor_ref": operation_ref,
-                    "program_content_ref": program["resource_ref"],
-                    "io_contract_ref": contract["resource_ref"],
-                    "executor_kind": "subprocess_json_v1",
-                    "executor_operation": "run_code",
-                }}]
+                                                                                          "package_id": "remote-run-code",
+                                                                                          "package_version": "v1",
+                                                                                          "execution": {"kind": "process:json_stdio", "version": "1"},
+                                                                                          "body": {
+                                                                                              "operation_descriptor_ref": operation_ref,
+                                                                                              "program_content_ref": program["resource_ref"],
+                                                                                              "io_contract_ref": contract["resource_ref"],
+                                                                                          },
+                                                                                      }}]
             },
         )
         yield AgentEvent("tool_call", {"tool": "loom_apply_plan_patch"})
@@ -82,7 +83,7 @@ class DynamicToolProvider:
                 "ops": [{"kind": "bind_compute_hole", "value": {
                     "binding_id": "binding-dynamic",
                     "hole_id": "h_dynamic",
-                    "capability_descriptor_ref": {"resource_id": "executor://subprocess_json_v1/1"},
+                    "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
                     "capability_package_ref": {"resource_id": "capability-package://remote-run-code/v1"},
                     "target_resource_ref": {"resource_id": "slave-a"},
                     "realization_digest": program["resource_ref"]["version_or_digest"],

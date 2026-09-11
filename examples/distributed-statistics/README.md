@@ -9,9 +9,9 @@ compute nodes running on **both** WorkspaceReplica Slaves (`slave-a` and
 
 | Node | Role in this app | Hosted by |
 | --- | --- | --- |
-| `loom://orchestrate` | Parent node: reads the input, emits one summarize child per partition, awaits them, then emits a single merge child | Driver (Docker `orchestrator_python_v1`) |
-| `summarize` | Map node: computes `count/sum/min/max/sumsq` for one partition | `slave-a` / `slave-b` (`subprocess_json_v1`) |
-| `merge-summaries` | Reduce node: combines all summaries into `mean/stddev` | `slave-a` / `slave-b` (`subprocess_json_v1`) |
+| `loom://orchestrate` | Parent node: reads the input, emits one summarize child per partition, awaits them, then emits a single merge child | Driver (container `container:python_orchestrator`) |
+| `summarize` | Map node: computes `count/sum/min/max/sumsq` for one partition | `slave-a` / `slave-b` (`process:json_stdio`) |
+| `merge-summaries` | Reduce node: combines all summaries into `mean/stddev` | `slave-a` / `slave-b` (`process:json_stdio`) |
 
 The Observer is the state authority, the Driver owns the orchestration, and
 each Slave keeps its own PostgreSQL ledger. Content (schemas, programs, input,
@@ -34,9 +34,9 @@ results) lives only in MinIO/S3 and is referenced by immutable
 
 1. Upload io-contract documents and schemas via `loom_put_content`.
 2. Materialize `summarize` and `merge-summaries` capability packages
-   (`subprocess_json_v1`, operation `run_code`).
+   (`process:json_stdio`).
 3. Materialize the `orchestrate` capability package
-   (`orchestrator_python_v1`, `allowed_node_package_refs=[summarize, merge]`,
+   (`container:python_orchestrator`, `allowed_node_package_refs=[summarize, merge]`,
    `max_nodes=6`, `max_live_nodes=2`).
 4. Open the Run, bind the execution payload, commit, start.
 5. The Driver runs the orchestration program in Docker; it emits summarize nodes

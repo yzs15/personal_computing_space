@@ -48,7 +48,14 @@ async def test_capability_get_command_normalizes_resource_ref_dict():
         [
             {"kind": "set_program_ref", "value": "loom://check"},
             {"kind": "add_typed_hole", "value": {"hole_id": "h"}},
-            {"kind": "materialize_capability_package_candidate", "value": {"package_id": "cgpkg", "program_content_ref": program_ref.model_dump(mode="json"), "io_contract_ref": io_contract_ref.model_dump(mode="json"), "operation_descriptor_ref": "loom://check"}},
+            {"kind": "materialize_capability_package_candidate", "value": {
+                                                                              "package_id": "cgpkg",
+                                                                              "body": {
+                                                                                  "program_content_ref": program_ref.model_dump(mode="json"),
+                                                                                  "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                                                                                  "operation_descriptor_ref": "loom://check",
+                                                                              },
+                                                                          }},
         ],
     )
     package = (await repo.get_run(run.run_id)).capability_packages[0]
@@ -81,7 +88,14 @@ async def test_candidate_is_run_bound_and_cannot_be_used_by_another_run():
         [
             {"kind": "set_program_ref", "value": "loom://matmul"},
             {"kind": "add_typed_hole", "value": {"hole_id": "h"}},
-            {"kind": "materialize_capability_package_candidate", "value": {"package_id": "pkg", "program_content_ref": program_ref.model_dump(mode="json"), "io_contract_ref": io_contract_ref.model_dump(mode="json"), "operation_descriptor_ref": "loom://matmul"}},
+            {"kind": "materialize_capability_package_candidate", "value": {
+                                                                              "package_id": "pkg",
+                                                                              "body": {
+                                                                                  "program_content_ref": program_ref.model_dump(mode="json"),
+                                                                                  "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                                                                                  "operation_descriptor_ref": "loom://matmul",
+                                                                              },
+                                                                          }},
         ],
     )
     package = (await repo.get_run(first.run_id)).capability_packages[0]
@@ -97,7 +111,7 @@ async def test_candidate_is_run_bound_and_cannot_be_used_by_another_run():
             {"kind": "bind_compute_hole", "value": ComputeBinding(
                 binding_id="binding-b", hole_id="h", capability_descriptor_ref=ResourceRef(resource_id="run-code"),
                 capability_package_ref=ResourceRef(resource_id=package.version_ref), target_resource_ref=ResourceRef(resource_id="slave-a"),
-                realization_digest=package.program_digest,
+                realization_digest=package.function_body.program_digest,
             ).model_dump(mode="json")},
         ],
     )
@@ -121,12 +135,14 @@ async def test_same_run_package_coordinate_rejects_digest_conflict():
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "same-coordinate",
-                    "package_version": "v1",
-                    "program_content_ref": first_program_ref.model_dump(mode="json"),
-                    "io_contract_ref": io_contract_ref.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://check",
-                },
+                             "package_id": "same-coordinate",
+                             "package_version": "v1",
+                             "body": {
+                                 "program_content_ref": first_program_ref.model_dump(mode="json"),
+                                 "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://check",
+                             },
+                         },
             }
         ],
     )
@@ -140,12 +156,14 @@ async def test_same_run_package_coordinate_rejects_digest_conflict():
                 {
                     "kind": "materialize_capability_package_candidate",
                     "value": {
-                        "package_id": "same-coordinate",
-                        "package_version": "v1",
-                        "program_content_ref": second_program_ref.model_dump(mode="json"),
-                        "io_contract_ref": io_contract_ref.model_dump(mode="json"),
-                        "operation_descriptor_ref": "loom://check",
-                    },
+                                 "package_id": "same-coordinate",
+                                 "package_version": "v1",
+                                 "body": {
+                                     "program_content_ref": second_program_ref.model_dump(mode="json"),
+                                     "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                                     "operation_descriptor_ref": "loom://check",
+                                 },
+                             },
                 }
             ],
         )
@@ -168,12 +186,14 @@ async def test_same_package_coordinate_across_runs_resolves_by_digest():
                 {
                     "kind": "materialize_capability_package_candidate",
                     "value": {
-                        "package_id": "cross-run-coordinate",
-                        "package_version": "v1",
-                        "program_content_ref": program_ref.model_dump(mode="json"),
-                        "io_contract_ref": io_contract_ref.model_dump(mode="json"),
-                        "operation_descriptor_ref": "loom://check",
-                    },
+                                 "package_id": "cross-run-coordinate",
+                                 "package_version": "v1",
+                                 "body": {
+                                     "program_content_ref": program_ref.model_dump(mode="json"),
+                                     "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                                     "operation_descriptor_ref": "loom://check",
+                                 },
+                             },
                 }
             ],
         )
@@ -205,12 +225,14 @@ async def test_promoting_different_digest_same_reusable_coordinate_is_rejected()
                 {
                     "kind": "materialize_capability_package_candidate",
                     "value": {
-                        "package_id": "promote-coordinate",
-                        "package_version": "v1",
-                        "program_content_ref": program_ref.model_dump(mode="json"),
-                        "io_contract_ref": io_contract_ref.model_dump(mode="json"),
-                        "operation_descriptor_ref": "loom://check",
-                    },
+                                 "package_id": "promote-coordinate",
+                                 "package_version": "v1",
+                                 "body": {
+                                     "program_content_ref": program_ref.model_dump(mode="json"),
+                                     "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                                     "operation_descriptor_ref": "loom://check",
+                                 },
+                             },
                 }
             ],
         )
@@ -233,7 +255,14 @@ async def test_promotion_derives_reusable_version_without_mutating_candidate():
     io_contract_ref = await _empty_io_contract_ref(repo)
     receipt = await repo.apply_patch(
         run.run_id, run.draft_version, run.draft_digest, "materialize-promote",
-        [{"kind": "materialize_capability_package_candidate", "value": {"package_id": "pkg-promote", "program_content_ref": program_ref.model_dump(mode="json"), "io_contract_ref": io_contract_ref.model_dump(mode="json"), "operation_descriptor_ref": "loom://check"}}],
+        [{"kind": "materialize_capability_package_candidate", "value": {
+                                                                           "package_id": "pkg-promote",
+                                                                           "body": {
+                                                                               "program_content_ref": program_ref.model_dump(mode="json"),
+                                                                               "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                                                                               "operation_descriptor_ref": "loom://check",
+                                                                           },
+                                                                       }}],
     )
     await repo.fail_run(run.run_id, "test")
     candidate = (await repo.get_run(run.run_id)).capability_packages[0]
@@ -256,7 +285,14 @@ async def test_candidate_ref_promotion_is_idempotent():
         run.draft_version,
         run.draft_digest,
         "materialize-promote-idempotent",
-        [{"kind": "materialize_capability_package_candidate", "value": {"package_id": "pkg-idempotent", "program_content_ref": program_ref.model_dump(mode="json"), "io_contract_ref": io_contract_ref.model_dump(mode="json"), "operation_descriptor_ref": "loom://check"}}],
+        [{"kind": "materialize_capability_package_candidate", "value": {
+                                                                           "package_id": "pkg-idempotent",
+                                                                           "body": {
+                                                                               "program_content_ref": program_ref.model_dump(mode="json"),
+                                                                               "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                                                                               "operation_descriptor_ref": "loom://check",
+                                                                           },
+                                                                       }}],
     )
     await repo.fail_run(run.run_id, "test")
     candidate = (await repo.get_run(run.run_id)).capability_packages[0]
@@ -286,7 +322,14 @@ async def test_candidate_ref_promotion_is_idempotent_under_concurrent_retries():
         run.draft_version,
         run.draft_digest,
         "materialize-promote-concurrent",
-        [{"kind": "materialize_capability_package_candidate", "value": {"package_id": "pkg-concurrent", "program_content_ref": program_ref.model_dump(mode="json"), "io_contract_ref": io_contract_ref.model_dump(mode="json"), "operation_descriptor_ref": "loom://check"}}],
+        [{"kind": "materialize_capability_package_candidate", "value": {
+                                                                           "package_id": "pkg-concurrent",
+                                                                           "body": {
+                                                                               "program_content_ref": program_ref.model_dump(mode="json"),
+                                                                               "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                                                                               "operation_descriptor_ref": "loom://check",
+                                                                           },
+                                                                       }}],
     )
     await repo.fail_run(run.run_id, "test")
     candidate = (await repo.get_run(run.run_id)).capability_packages[0]
@@ -331,10 +374,12 @@ async def test_materialization_requires_io_contract_and_preuploaded_program_ref(
                 {
                     "kind": "materialize_capability_package_candidate",
                     "value": {
-                        "package_id": "pkg-contract-required",
-                        "program_content_ref": program_ref.model_dump(mode="json"),
-                        "operation_descriptor_ref": "loom://check",
-                    },
+                                 "package_id": "pkg-contract-required",
+                                 "body": {
+                                     "program_content_ref": program_ref.model_dump(mode="json"),
+                                     "operation_descriptor_ref": "loom://check",
+                                 },
+                             },
                 }
             ],
         )
@@ -350,11 +395,13 @@ async def test_materialization_requires_io_contract_and_preuploaded_program_ref(
                 {
                     "kind": "materialize_capability_package_candidate",
                     "value": {
-                        "package_id": "pkg-inline-program",
-                        "program": "print(1)",
-                        "io_contract_ref": contract_ref.model_dump(mode="json"),
-                        "operation_descriptor_ref": "loom://check",
-                    },
+                                 "package_id": "pkg-inline-program",
+                                 "body": {
+                                     "program": "print(1)",
+                                     "io_contract_ref": contract_ref.model_dump(mode="json"),
+                                     "operation_descriptor_ref": "loom://check",
+                                 },
+                             },
                 }
             ],
         )
@@ -405,11 +452,13 @@ async def test_binding_package_with_different_io_contract_is_not_ready() -> None
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "pkg-contract-mismatch",
-                    "program_content_ref": program_ref.model_dump(mode="json"),
-                    "io_contract_ref": package_contract_ref.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://check",
-                },
+                             "package_id": "pkg-contract-mismatch",
+                             "body": {
+                                 "program_content_ref": program_ref.model_dump(mode="json"),
+                                 "io_contract_ref": package_contract_ref.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://check",
+                             },
+                         },
             },
         ],
     )
@@ -428,7 +477,7 @@ async def test_binding_package_with_different_io_contract_is_not_ready() -> None
                     "capability_descriptor_ref": {"resource_id": "capability://slave-a/check"},
                     "capability_package_ref": {"resource_id": package.version_ref},
                     "target_resource_ref": {"resource_id": "slave-a"},
-                    "realization_digest": package.program_digest,
+                    "realization_digest": package.function_body.program_digest,
                 },
             }
         ],

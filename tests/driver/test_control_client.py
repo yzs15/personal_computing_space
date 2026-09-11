@@ -74,13 +74,8 @@ async def test_control_client_lists_capability_packages():
         "package_closure_version_ref": "package-closure-1",
         "source_run_ref": "run-1",
         "source_closure_version_ref": "committed-1",
-        "operation_descriptor_ref": "loom://summarize",
-        "operation_descriptor_digest": "op-digest",
-        "program_content_ref": {"resource_id": "content://sha256/program", "version_or_digest": "program-digest"},
-        "program_digest": "program-digest",
-        "io_contract_ref": {"resource_id": "content://sha256/io", "version_or_digest": "io-digest"},
-        "executor_kind": "subprocess_json_v1",
-        "executor_operation": "run_code",
+            "body": {"operation_descriptor_ref": "loom://summarize", "operation_descriptor_digest": "op-digest", "program_content_ref": {"resource_id": "content://sha256/program", "version_or_digest": "program-digest"}, "program_digest": "program-digest", "io_contract_ref": {"resource_id": "content://sha256/io", "version_or_digest": "io-digest"}},
+        "execution": {"kind": "process:json_stdio", "version": "1"},
         "package_digest": "package-digest",
     }
     transport = RecordingTransport(httpx.Response(200, json={"packages": [package]}))

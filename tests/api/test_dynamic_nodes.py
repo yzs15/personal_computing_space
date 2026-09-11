@@ -92,13 +92,15 @@ async def _dynamic_run(
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "summarize",
-                    "package_version": "v1",
-                    "program_content_ref": node_program.model_dump(mode="json"),
-                    "io_contract_ref": node_contract.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://summarize",
-                    "replay_safety": node_replay_safety,
-                },
+                             "package_id": "summarize",
+                             "package_version": "v1",
+                             "body": {
+                                 "program_content_ref": node_program.model_dump(mode="json"),
+                                 "io_contract_ref": node_contract.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://summarize",
+                                 "replay_safety": node_replay_safety,
+                             },
+                         },
             },
         ],
     )
@@ -116,22 +118,23 @@ async def _dynamic_run(
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "orchestrate",
-                    "package_version": "v1",
-                    "program_content_ref": orchestration_program.model_dump(mode="json"),
-                    "io_contract_ref": parent_contract.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://orchestrate",
-                    "executor_kind": "orchestrator_python_v1",
-                    "executor_operation": "orchestrate",
-                    "allowed_node_package_refs": [
+                             "package_id": "orchestrate",
+                             "package_version": "v1",
+                             "execution": {"kind": "container:python_orchestrator", "version": "1"},
+                             "body": {
+                                 "program_content_ref": orchestration_program.model_dump(mode="json"),
+                                 "io_contract_ref": parent_contract.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://orchestrate",
+                                 "allowed_node_package_refs": [
                         ResourceRef(
                             resource_id=node_package.version_ref,
                             version_or_digest=node_package.package_digest,
                         ).model_dump(mode="json")
                     ],
-                    "max_nodes": max_nodes,
-                    "max_live_nodes": max_live_nodes,
-                },
+                                 "max_nodes": max_nodes,
+                                 "max_live_nodes": max_live_nodes,
+                             },
+                         },
             },
         ],
     )
@@ -191,7 +194,7 @@ async def test_orchestration_package_is_bound_and_parent_run_is_ready():
 
     assert patched.readiness["ready"] is True
     record = await repo.get_run(run.run_id)
-    orchestration_package = next(package for package in record.capability_packages if package.executor_kind == "orchestrator_python_v1")
+    orchestration_package = next(package for package in record.capability_packages if package.execution.kind == "container:python_orchestrator")
     assert record.draft.snapshot.program_systems.package_ref == ResourceRef(
         resource_id=orchestration_package.version_ref,
         version_or_digest=orchestration_package.package_digest,
@@ -267,7 +270,7 @@ async def test_accept_node_intent_rejects_unauthorized_package_and_live_limit():
     started = await repo.start(run.run_id, committed.version_id)
     record = await repo.get_run(run.run_id)
     node_package = next(package for package in record.capability_packages if package.package_id == "summarize")
-    orchestration_package = next(package for package in record.capability_packages if package.executor_kind == "orchestrator_python_v1")
+    orchestration_package = next(package for package in record.capability_packages if package.execution.kind == "container:python_orchestrator")
     input_ref = next(binding.input_ref for binding in record.draft.snapshot.node_input_bindings if binding.node_id == "loom://summarize")
     package_ref = ResourceRef(resource_id=node_package.version_ref, version_or_digest=node_package.package_digest)
     intent = NodeIntent(
@@ -277,12 +280,12 @@ async def test_accept_node_intent_rejects_unauthorized_package_and_live_limit():
         input_refs=[input_ref],
     )
 
-    orchestration_package.allowed_node_package_refs = []
+    orchestration_package.function_body.allowed_node_package_refs = []
     with pytest.raises(ValueError, match="node_package_not_allowed"):
         await repo.accept_node_intent(run.run_id, intent, selected_target="slave-a")
 
-    orchestration_package.allowed_node_package_refs = [package_ref]
-    orchestration_package.allowed_node_package_refs = [package_ref]
+    orchestration_package.function_body.allowed_node_package_refs = [package_ref]
+    orchestration_package.function_body.allowed_node_package_refs = [package_ref]
     accepted = await repo.accept_node_intent(run.run_id, intent, selected_target="slave-a")
     second_intent = intent.model_copy(update={"intent_id": "intent-2"})
 
@@ -300,9 +303,9 @@ async def test_accept_node_intent_validates_input_schema():
     started = await repo.start(run.run_id, committed.version_id)
     record = await repo.get_run(run.run_id)
     node_package = next(package for package in record.capability_packages if package.package_id == "summarize")
-    orchestration_package = next(package for package in record.capability_packages if package.executor_kind == "orchestrator_python_v1")
+    orchestration_package = next(package for package in record.capability_packages if package.execution.kind == "container:python_orchestrator")
     package_ref = ResourceRef(resource_id=node_package.version_ref, version_or_digest=node_package.package_digest)
-    orchestration_package.allowed_node_package_refs = [package_ref]
+    orchestration_package.function_body.allowed_node_package_refs = [package_ref]
     invalid_input = await repo.put_content({"wrong": True}, media_type="application/json")
     intent = NodeIntent(
         intent_id="intent-invalid",

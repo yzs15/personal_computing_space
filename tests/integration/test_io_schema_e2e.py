@@ -64,11 +64,13 @@ async def test_content_refs_drive_readiness_dispatch_and_terminal_evidence():
             {
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "scores-package",
-                    "program_content_ref": program_ref.model_dump(mode="json"),
-                    "io_contract_ref": io_contract_ref.model_dump(mode="json"),
-                    "operation_descriptor_ref": "loom://average",
-                },
+                             "package_id": "scores-package",
+                             "body": {
+                                 "program_content_ref": program_ref.model_dump(mode="json"),
+                                 "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                                 "operation_descriptor_ref": "loom://average",
+                             },
+                         },
             },
         ],
     )
@@ -76,13 +78,13 @@ async def test_content_refs_drive_readiness_dispatch_and_terminal_evidence():
     binding = ComputeBinding(
         binding_id="binding-scores-e2e",
         hole_id="h_average",
-        capability_descriptor_ref=ResourceRef(resource_id="executor://subprocess_json_v1/1"),
+        capability_descriptor_ref=ResourceRef(resource_id="executor://process:json_stdio/1"),
         capability_package_ref=ResourceRef(
             resource_id=package.package_closure_version_ref,
             version_or_digest=package.package_digest,
         ),
         target_resource_ref=ResourceRef(resource_id="slave-a"),
-        realization_digest=package.program_digest,
+        realization_digest=package.function_body.program_digest,
     )
     bound = await repo.apply_patch(
         record.run_id,

@@ -11,7 +11,7 @@ def _binding(operation: str = "run_code", target: str = "slave-a", *, package_re
     return {
         "binding_id": f"binding-{operation}",
         "hole_id": "h_run_code",
-        "capability_descriptor_ref": {"resource_id": "executor://subprocess_json_v1/1"},
+        "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
         "capability_package_ref": package_ref,
         "target_resource_ref": {"resource_id": target},
         "realization_digest": f"realization-{target}-{operation}",
@@ -106,14 +106,15 @@ def test_run_code_binding_requires_package_and_then_allows_start():
                 {
                     "kind": "materialize_capability_package_candidate",
                     "value": {
-                        "package_id": "readiness-run-code",
-                        "package_version": "v1",
-                        "operation_descriptor_ref": "loom://run_code",
-                        "program_content_ref": program_ref,
-                        "io_contract_ref": contract_ref,
-                        "executor_kind": "subprocess_json_v1",
-                        "executor_operation": "run_code",
-                    },
+                                 "package_id": "readiness-run-code",
+                                 "package_version": "v1",
+                                 "execution": {"kind": "process:json_stdio", "version": "1"},
+                                 "body": {
+                                     "operation_descriptor_ref": "loom://run_code",
+                                     "program_content_ref": program_ref,
+                                     "io_contract_ref": contract_ref,
+                                 },
+                             },
                 },
             ],
         },

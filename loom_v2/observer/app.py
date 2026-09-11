@@ -625,7 +625,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
                 "target_slave": target,
                 "workspace_id": settings.workspace_id,
                 "activation_closure_version_ref": package.package_closure_version_ref,
-                "program_content_ref": package.program_content_ref.model_dump(mode="json"),
+                "program_content_ref": package.function_body.program_content_ref.model_dump(mode="json"),
                 "compute_binding": payload.get("compute_binding"),
                 "idempotency_key": payload.get("idempotency_key") or f"promote-{package.package_digest}-{target}",
             }

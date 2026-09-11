@@ -15,6 +15,7 @@ from loom_v2.contracts.types import (
     CapabilityPackageVersion,
     CapabilityProvisionCommand,
     ComputeBinding,
+    ExecutionContract,
     IoContract,
     ResourceRef,
     ResourceEventFrame,
@@ -93,7 +94,7 @@ class SlaveService:
             package.package_version,
             package.package_id,
             package.package_digest,
-            package.program_digest,
+            package.function_body.program_digest,
         }
 
     def _cache_package(self, package: CapabilityPackageVersion, command_ref: str) -> None:
@@ -130,19 +131,19 @@ class SlaveService:
         package = package or self._find_cached_package(command.package_version_ref, command.package_digest)
         if package is None:
             raise RuntimeError("capability_package_not_found")
-        if package.executor_kind == "orchestrator_python_v1":
+        if package.execution.kind == "container:python_orchestrator":
             raise RuntimeError("driver_side_executor_required")
-        if package.io_contract_ref is None:
+        if package.function_body.io_contract_ref is None:
             raise RuntimeError("io_contract_required")
         try:
-            await self._load_io_contract(package.io_contract_ref)
+            await self._load_io_contract(package.function_body.io_contract_ref)
         except (FileNotFoundError, RuntimeError, ValueError, TypeError) as exc:
             raise RuntimeError("io_contract_invalid") from exc
         if package.package_digest.lower() != command.package_digest.lower():
             raise RuntimeError("capability_package_digest_mismatch")
-        if command.program_content_ref is not None and command.program_content_ref.version_or_digest not in {None, package.program_digest}:
+        if command.program_content_ref is not None and command.program_content_ref.version_or_digest not in {None, package.function_body.program_digest}:
             raise RuntimeError("program_digest_mismatch")
-        if package.provider_fillable_hole_refs and (command.compute_binding is None or not command.compute_binding.runtime_profile):
+        if package.function_body.provider_fillable_hole_refs and (command.compute_binding is None or not command.compute_binding.runtime_profile):
             raise RuntimeError("provider_fillable_binding_required")
         ref = package.version_ref
         activation_key = self._package_cache_key(ref, package.package_digest)
@@ -158,8 +159,8 @@ class SlaveService:
                 details={"idempotent": True},
                 session_generation=command.session_generation,
             )
-        stat = await self.content_store.stat(package.program_content_ref)
-        if stat is None or not stat.integrity_verified or stat.declared_digest != package.program_digest:
+        stat = await self.content_store.stat(package.function_body.program_content_ref)
+        if stat is None or not stat.integrity_verified or stat.declared_digest != package.function_body.program_digest:
             raise RuntimeError("program_content_unavailable")
         activation = CapabilityPackageActivation(
             package_version_ref=ref,
@@ -171,7 +172,7 @@ class SlaveService:
         )
         self._cache_package(package, command.package_version_ref)
         self.activations[activation_key] = activation
-        operation_ref = package.operation_descriptor_ref
+        operation_ref = package.function_body.operation_descriptor_ref
         operation_name = operation_ref.resource_id if isinstance(operation_ref, ResourceRef) else str(operation_ref)
         if package.scope == "workspace_reusable" and package.publication_state == "published":
             self.supported_operations.add(operation_name.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
@@ -184,13 +185,12 @@ class SlaveService:
             evidence_refs=activation.evidence_refs,
             details={
                 "operation": operation_name,
-                "executor_kind": package.executor_kind,
-                "executor_operation": package.executor_operation,
-                "executor_descriptor_ref": self.executor_registry.get(package.executor_kind).descriptor.descriptor_ref,
-                "executor_descriptor_digest": self.executor_registry.get(package.executor_kind).descriptor.digest,
+                "execution": package.execution.model_dump(mode="json"),
+                "executor_descriptor_ref": self.executor_registry.get(package.execution).descriptor.descriptor_ref,
+                "executor_descriptor_digest": self.executor_registry.get(package.execution).descriptor.digest,
                 "package_version_ref": package.version_ref,
                 "package_digest": package.package_digest,
-                "program_digest": package.program_digest,
+                "program_digest": package.function_body.program_digest,
             },
             session_generation=command.session_generation,
         )
@@ -230,8 +230,8 @@ class SlaveService:
             raise RuntimeError("input_binding_missing")
 
         contract_ref = (
-            package.io_contract_ref
-            if package is not None and package.io_contract_ref is not None
+            package.function_body.io_contract_ref
+            if package is not None and package.function_body.io_contract_ref is not None
             else closure.program.io_contract_ref
         )
         contract = await self._load_io_contract(contract_ref) if contract_ref is not None else None
@@ -289,7 +289,7 @@ class SlaveService:
         package: CapabilityPackageVersion | None,
         binding: ComputeBinding | None,
     ) -> ExecutionResult:
-        contract_ref = package.io_contract_ref if package is not None and package.io_contract_ref is not None else closure.program.io_contract_ref if closure is not None else None
+        contract_ref = package.function_body.io_contract_ref if package is not None and package.function_body.io_contract_ref is not None else closure.program.io_contract_ref if closure is not None else None
         if contract_ref is None:
             return result
         contract = await self._load_io_contract(contract_ref)
@@ -347,7 +347,7 @@ class SlaveService:
         if contract.success_validator_ref is not None:
             plugin = await self.content_store.get(contract.success_validator_ref)
             plugin_input = result.value if isinstance(result.value, dict) else {"value": result.value}
-            plugin_result = await self.executor_registry.execute("subprocess_json_v1", "run_code", plugin_input, program=plugin)
+            plugin_result = await self.executor_registry.invoke(ExecutionContract(kind="process:json_stdio", version="1"), plugin_input, program=plugin)
             payload = plugin_result.value if isinstance(plugin_result.value, dict) else {}
             plugin_status = payload.get("result")
             plugin_errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
@@ -398,7 +398,7 @@ class SlaveService:
             package = self._find_cached_package(package_ref, digest)
             if package is None:
                 raise RuntimeError("capability_package_not_installed")
-            if binding.realization_digest and binding.realization_digest not in {package.program_digest, package.package_digest}:
+            if binding.realization_digest and binding.realization_digest not in {package.function_body.program_digest, package.package_digest}:
                 raise RuntimeError("capability_package_digest_mismatch")
         elif operation not in self.supported_operations:
             raise RuntimeError(f"capability_unavailable:{operation}")
@@ -443,18 +443,17 @@ class SlaveService:
                     return result
         payload = await self._admission_payload(payload, operation=operation, closure=closure, package=package)
         if package is not None:
-            program = await self.content_store.get(package.program_content_ref, expected_digest=package.program_digest)
-            result = await self.executor_registry.execute(package.executor_kind, package.executor_operation, payload, program=program)
-            descriptor = self.executor_registry.get(package.executor_kind).descriptor
+            program = await self.content_store.get(package.function_body.program_content_ref, expected_digest=package.function_body.program_digest)
+            result = await self.executor_registry.invoke(package.execution, payload, program=program)
+            descriptor = self.executor_registry.get(package.execution).descriptor
             result = replace(
                 result,
                 provenance={
                     "package_version_ref": package.version_ref,
                     "package_digest": package.package_digest,
-                    "program_content_ref": package.program_content_ref.model_dump(mode="json"),
-                    "program_digest": package.program_digest,
-                    "executor_kind": package.executor_kind,
-                    "executor_operation": package.executor_operation,
+                    "program_content_ref": package.function_body.program_content_ref.model_dump(mode="json"),
+                    "program_digest": package.function_body.program_digest,
+                    "execution": package.execution.model_dump(mode="json"),
                     "executor_descriptor_ref": descriptor.descriptor_ref,
                     "executor_descriptor_digest": descriptor.digest,
                 },

@@ -55,22 +55,22 @@ class DynamicOrchestrationRuntime:
             raise RuntimeError("execution_not_running")
         snapshot = record.committed.snapshot if record.committed is not None else record.draft.snapshot
         orchestration_ref = snapshot.program_systems.package_ref
-        if orchestration_ref is None or snapshot.program_systems.executor_kind != "orchestrator_python_v1":
+        if orchestration_ref is None or snapshot.program_systems.execution.kind != "container:python_orchestrator":
             raise RuntimeError("orchestration_package_not_bound")
         try:
             orchestration_package = await self.repository.get_capability_package(orchestration_ref, run_id=run_id)
             if orchestration_package.publication_state == "abandoned":
                 raise RuntimeError("capability_package_abandoned")
             if (
-                orchestration_package.replay_safety != "DeterministicByEventLog"
-                or orchestration_package.captures_run_state
-                or orchestration_package.captured_secret_refs
-                or orchestration_package.captured_path_refs
+                orchestration_package.function_body.replay_safety != "DeterministicByEventLog"
+                or orchestration_package.function_body.captures_run_state
+                or orchestration_package.function_body.captured_secret_refs
+                or orchestration_package.function_body.captured_path_refs
             ):
                 raise RuntimeError("orchestration_not_replayable")
             program = await self.repository.content_store.get(
-                orchestration_package.program_content_ref,
-                expected_digest=orchestration_package.program_digest,
+                orchestration_package.function_body.program_content_ref,
+                expected_digest=orchestration_package.function_body.program_digest,
             )
             operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
             input_binding = self.repository._input_binding_for(snapshot, operation_ref)
@@ -214,7 +214,7 @@ class DynamicOrchestrationRuntime:
         execution_result = ExecutionResult(
             resource_ref=final_ref,
             value=value,
-            replay_safety=orchestration_package.replay_safety,
+            replay_safety=orchestration_package.function_body.replay_safety,
             digest=final_ref.version_or_digest or "",
             terminal_state=terminal_state,
             terminal_error=completed.outcome.get("terminal_error") if completed.outcome else None,
@@ -230,7 +230,7 @@ class DynamicOrchestrationRuntime:
     ) -> str:
         closure = record.committed.snapshot if getattr(record, "committed", None) is not None else record.draft.snapshot
         allowed_effects = set(record.closure_contract.allowed_effects) if record.closure_contract is not None else set()
-        if package.permissions and not set(package.permissions).issubset(allowed_effects):
+        if package.function_body.permissions and not set(package.function_body.permissions).issubset(allowed_effects):
             raise RuntimeError("node_permission_denied")
         available = sorted(
             slave_id
@@ -371,7 +371,7 @@ class DynamicOrchestrationRuntime:
         attempt_id = str(attempt["attempt_id"])
         target = str(attempt["target"])
         record = await self.repository.get_run(run_id)
-        operation_ref = package.operation_descriptor_ref
+        operation_ref = package.function_body.operation_descriptor_ref
         operation_ref = operation_ref.resource_id if isinstance(operation_ref, ResourceRef) else str(operation_ref)
         if len(node.input_refs) == 1:
             execution_input_ref = node.input_refs[0]
@@ -385,11 +385,11 @@ class DynamicOrchestrationRuntime:
             capability_package_ref=node.package_ref,
             target_resource_ref=ResourceRef(resource_id=target),
             realization_digest=node.package_digest,
-            executor_descriptor_digest=default_registry.get(package.executor_kind).descriptor.digest,
+            executor_descriptor_digest=default_registry.get(package.execution).descriptor.digest,
         )
         closure = TaskClosure(
             closure_id=node.node_id,
-            program={"operation_ref": operation_ref, "io_contract_ref": package.io_contract_ref.model_dump(mode="json")},
+            program={"operation_ref": operation_ref, "io_contract_ref": package.function_body.io_contract_ref.model_dump(mode="json")},
             node_input_bindings=[
                 NodeInputBinding(node_id=operation_ref, input_ref=execution_input_ref)
             ],
@@ -402,7 +402,7 @@ class DynamicOrchestrationRuntime:
             workspace_id=record.closure_contract.workspace_id if record.closure_contract else "workspace-default",
             activation_closure_version_ref=record.committed.version_id if record.committed else package.package_closure_version_ref,
             compute_binding=binding,
-            program_content_ref=package.program_content_ref,
+            program_content_ref=package.function_body.program_content_ref,
             idempotency_key=f"{record.execution_id}-{node.node_id}-{package.package_digest}",
         )
         operation = self.repository._operation_name(operation_ref)

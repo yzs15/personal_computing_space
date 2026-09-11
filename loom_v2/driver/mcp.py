@@ -157,8 +157,8 @@ class DriverMCP:
                 "capabilities": result.get("capabilities", []),
                 "packages": result.get("packages", []),
                 "executor_descriptors": [
-                    {"kind": "subprocess_json_v1", "version": "1", "operations": ["run_code"]},
-                    {"kind": "orchestrator_python_v1", "version": "1", "operations": ["orchestrate"]},
+                    {"kind": "process:json_stdio", "version": "1", "operations": ["run_code"]},
+                    {"kind": "container:python_orchestrator", "version": "1", "operations": ["orchestrate"]},
                 ],
             }
         await self.repository.refresh_slaves(self.workspace_id)
@@ -173,8 +173,8 @@ class DriverMCP:
                 for resource_id, details in sorted(self.repository.slave_capabilities.items())
             ],
             "executor_descriptors": [
-                {"kind": "subprocess_json_v1", "version": "1", "operations": ["run_code"]},
-                {"kind": "orchestrator_python_v1", "version": "1", "operations": ["orchestrate"]},
+                {"kind": "process:json_stdio", "version": "1", "operations": ["run_code"]},
+                {"kind": "container:python_orchestrator", "version": "1", "operations": ["orchestrate"]},
             ],
         }
 

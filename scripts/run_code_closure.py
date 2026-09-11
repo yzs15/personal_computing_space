@@ -12,7 +12,7 @@ from loom_v2.contracts.types import (
     TaskClosure,
     TypedHole,
 )
-from loom_v2.slave.executor import SubprocessJSONV1Adapter
+from loom_v2.slave.executor import ProcessJSONStdioV1Adapter
 
 
 def build_run_code_closure() -> TaskClosure:
@@ -41,7 +41,7 @@ async def main() -> None:
     print("result_expectation:", closure.compute_application.result_expectation)
 
     program = b'import json,sys; value=json.load(sys.stdin)["value"]; print(json.dumps({"value": value * 2}))'
-    result = await SubprocessJSONV1Adapter().execute("run_code", {"value": 3}, program=program)
+    result = await ProcessJSONStdioV1Adapter().invoke({"value": 3}, program=program)
     print("execution_digest:", result.digest)
     print("resource_ref:", result.resource_ref.resource_id)
     print("result:", result.value)

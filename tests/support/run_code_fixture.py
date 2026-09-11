@@ -40,7 +40,7 @@ class RunCodeFixture:
         input_refs: list[ResourceRef] | None = None,
         closure_id: str = "closure-run-code",
     ) -> TaskClosure:
-        contract_ref = io_contract_ref or self.package.io_contract_ref
+        contract_ref = io_contract_ref or self.package.function_body.io_contract_ref
         assert contract_ref is not None
         hole = TypedHole(
             hole_id=self.binding.hole_id,
@@ -90,27 +90,28 @@ async def make_run_code_fixture(
         package_closure_version_ref=f"package-closure-{operation}",
         source_run_ref="test-run",
         source_closure_version_ref="test-closure-v1",
-        operation_descriptor_ref=operation_ref,
-        operation_descriptor_digest=hashlib.sha256(operation_ref.resource_id.encode()).hexdigest(),
-        program_content_ref=program_ref,
-        program_digest=program_ref.version_or_digest or "",
-        io_contract_ref=contract_ref,
-        executor_kind="subprocess_json_v1",
-        executor_operation="run_code",
+        execution={"kind": "process:json_stdio", "version": "1"},
+        body={
+            "operation_descriptor_ref": operation_ref,
+            "operation_descriptor_digest": hashlib.sha256(operation_ref.resource_id.encode()).hexdigest(),
+            "program_content_ref": program_ref,
+            "program_digest": program_ref.version_or_digest or "",
+            "io_contract_ref": contract_ref,
+        },
     )
-    descriptor_digest = default_registry.get("subprocess_json_v1").descriptor.digest
+    descriptor_digest = default_registry.get(package.execution).descriptor.digest
     binding = ComputeBinding(
         binding_id=f"binding-{operation}",
         hole_id=f"hole-{operation}",
         capability_descriptor_ref=ResourceRef(
-            resource_id="executor://subprocess_json_v1/1",
+            resource_id="executor://process:json_stdio/1",
         ),
         capability_package_ref=ResourceRef(
             resource_id=package.version_ref,
             version_or_digest=package.package_digest,
         ),
         target_resource_ref=ResourceRef(resource_id=service.slave_id),
-        realization_digest=package.program_digest,
+        realization_digest=package.function_body.program_digest,
         executor_descriptor_digest=descriptor_digest,
     )
     return RunCodeFixture(

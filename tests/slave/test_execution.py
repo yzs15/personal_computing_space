@@ -1,17 +1,16 @@
 import pytest
 
-from loom_v2.contracts.types import CapabilityPackageVersion, CapabilityProvisionCommand, ComputeSpec, NodeInputBinding, ResourceRef, TaskClosure, TypedHole
+from loom_v2.contracts.types import CapabilityPackageVersion, CapabilityProvisionCommand, ComputeSpec, ExecutionContract, FunctionCapabilityPackageBody, NodeInputBinding, ResourceRef, TaskClosure, TypedHole
 from loom_v2.content_store import canonical_json_bytes
-from loom_v2.slave.executor import SubprocessJSONV1Adapter, default_registry
+from loom_v2.slave.executor import ProcessJSONStdioV1Adapter, default_registry
 from loom_v2.slave.service import SlaveService
 from tests.support.run_code_fixture import make_run_code_fixture, provision_run_code_fixture
 
 
 @pytest.mark.asyncio
 async def test_subprocess_run_code_execution_returns_resource_ref():
-    adapter = SubprocessJSONV1Adapter()
-    result = await adapter.execute(
-        "run_code",
+    adapter = ProcessJSONStdioV1Adapter()
+    result = await adapter.invoke(
         {"value": 3},
         program=b'import json,sys; d=json.load(sys.stdin); print(json.dumps({"value": d["value"] * 2}))',
     )
@@ -22,22 +21,21 @@ async def test_subprocess_run_code_execution_returns_resource_ref():
 
 @pytest.mark.asyncio
 async def test_subprocess_run_code_is_replay_safe():
-    adapter = SubprocessJSONV1Adapter()
+    adapter = ProcessJSONStdioV1Adapter()
     program = b'import json,sys; d=json.load(sys.stdin); print(json.dumps({"value": d["value"] * 2}))'
-    first = await adapter.execute("run_code", {"value": 3}, program=program)
-    second = await adapter.execute("run_code", {"value": 3}, program=program)
+    first = await adapter.invoke({"value": 3}, program=program)
+    second = await adapter.invoke({"value": 3}, program=program)
     assert first.value == second.value
     assert first.replay_safety == "DeclaredByPackage"
 
 
 def test_default_registry_has_only_subprocess_adapter():
-    assert {descriptor.kind for descriptor in default_registry.descriptors()} == {"subprocess_json_v1"}
+    assert {descriptor.kind for descriptor in default_registry.descriptors()} == {"process:json_stdio"}
 
 
 def test_default_registry_rejects_removed_builtin_executor():
-    legacy_kind = "".join(("builtin", "_v1"))
-    with pytest.raises(ValueError, match="unsupported_executor:" + legacy_kind):
-        default_registry.get(legacy_kind)
+    with pytest.raises(ValueError, match="unsupported_executor:builtin:function/1"):
+        default_registry.get(ExecutionContract(kind="builtin:function", version="1"))
 
 
 @pytest.mark.asyncio
@@ -68,11 +66,11 @@ async def test_slave_rejects_unbound_run_code_without_package():
 @pytest.mark.asyncio
 async def test_subprocess_capability_timeout_is_independently_configurable(monkeypatch):
     monkeypatch.setenv("LOOM_CAPABILITY_OPERATION_TIMEOUT_SECONDS", "0.01")
-    adapter = SubprocessJSONV1Adapter()
+    adapter = ProcessJSONStdioV1Adapter()
     program = b"import time; time.sleep(0.10); print('{}')"
 
     with pytest.raises(RuntimeError, match="capability_timeout"):
-        await adapter.execute("run_code", {}, program=program)
+        await adapter.invoke({}, program=program)
 
 
 @pytest.mark.asyncio
@@ -85,11 +83,7 @@ async def test_slave_provision_rejects_package_without_io_contract():
         package_closure_version_ref="closure",
         source_run_ref="run",
         source_closure_version_ref="version",
-        operation_descriptor_ref=ResourceRef(resource_id="loom://check"),
-        operation_descriptor_digest="descriptor",
-        program_content_ref=program_ref,
-        program_digest=program_ref.version_or_digest,
-        io_contract_ref=None,
+        body=FunctionCapabilityPackageBody(operation_descriptor_ref=ResourceRef(resource_id="loom://check"), operation_descriptor_digest="descriptor", program_content_ref=program_ref, program_digest=program_ref.version_or_digest, io_contract_ref=None),
     )
 
     with pytest.raises(RuntimeError, match="io_contract_required"):

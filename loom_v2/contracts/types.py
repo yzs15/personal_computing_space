@@ -77,8 +77,15 @@ class ProgramApplication(ContractModel):
     terms: list[TypedTerm] = Field(default_factory=list)
 
 
+class ExecutionContract(ContractModel):
+    """How a capability package is started and invoked."""
+
+    kind: str = "process:json_stdio"
+    version: str = "1"
+
+
 class ProgramSystems(ContractModel):
-    executor_kind: str = "python"
+    execution: ExecutionContract = Field(default_factory=ExecutionContract)
     effect_class: str = "Known"
     permissions: list[str] = Field(default_factory=list)
     package_ref: ResourceRef | None = None
@@ -145,28 +152,18 @@ class ComputeBinding(ContractModel):
     activation_ref: str | None = None
 
 
-class CapabilityPackageVersion(ContractModel):
-    """Immutable, content-addressed realization of a closure subgraph."""
+class CapabilityPackageBody(ContractModel):
+    """Marker base for package-specific bodies."""
 
-    package_id: str
-    package_version: str
-    package_closure_version_ref: str
-    source_run_ref: str
-    source_closure_version_ref: str
+
+class FunctionCapabilityPackageBody(CapabilityPackageBody):
     operation_descriptor_ref: ResourceRef | str
     operation_descriptor_digest: str
     program_content_ref: ResourceRef
     program_digest: str
-    # Nullable only so persisted pre-I/O records can be read; every new
-    # executable materialization/provision/readiness path rejects ``None``.
     io_contract_ref: ResourceRef | None = None
     effective_constraint_refs: list[ConstraintRef] = Field(default_factory=list)
     provider_fillable_hole_refs: list[str] = Field(default_factory=list)
-    scope: Literal["run_bound", "workspace_reusable"] = "run_bound"
-    publication_state: Literal["candidate", "published", "abandoned"] = "candidate"
-    provenance: list[dict[str, Any]] = Field(default_factory=list)
-    executor_kind: str = "subprocess_json_v1"
-    executor_operation: str = "run_code"
     effect_class: str = "Sandboxed"
     permissions: list[str] = Field(default_factory=list)
     replay_safety: str = "DeclaredByPackage"
@@ -177,27 +174,85 @@ class CapabilityPackageVersion(ContractModel):
     allowed_node_package_refs: list[ResourceRef] = Field(default_factory=list)
     max_nodes: int | None = None
     max_live_nodes: int | None = None
+
+
+class ServiceCapabilityPackageBody(CapabilityPackageBody):
+    """Extensible body for a long-lived, multi-endpoint capability service."""
+
+    endpoints: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class PythonModuleCapabilityPackageBody(CapabilityPackageBody):
+    module_content_ref: ResourceRef
+    exported_symbols: list[str] = Field(default_factory=list)
+    dependency_manifest: dict[str, Any] = Field(default_factory=dict)
+
+
+class CapabilityPackageVersion(ContractModel):
+    """Immutable package envelope with a type-specific body.
+
+    New wire data uses ``package_type``, ``execution`` and ``body``.  The body
+    is owned by the package type and is intentionally not flattened into this
+    envelope.
+    """
+
+    package_type: str = "function"
+    package_id: str
+    package_version: str
+    package_closure_version_ref: str
+    source_run_ref: str
+    source_closure_version_ref: str
+    scope: Literal["run_bound", "workspace_reusable"] = "run_bound"
+    publication_state: Literal["candidate", "published", "abandoned"] = "candidate"
+    provenance: list[dict[str, Any]] = Field(default_factory=list)
+    execution: ExecutionContract = Field(default_factory=ExecutionContract)
+    body: FunctionCapabilityPackageBody | ServiceCapabilityPackageBody | PythonModuleCapabilityPackageBody | dict[str, Any]
     package_digest: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_body(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        body_types = {
+            "function": FunctionCapabilityPackageBody,
+            "service": ServiceCapabilityPackageBody,
+            "module": PythonModuleCapabilityPackageBody,
+        }
+        package_type = value.get("package_type", "function")
+        if package_type not in body_types:
+            raise ValueError(f"unsupported_package_type:{package_type}")
+        if "body" in value:
+            return {**value, "body": body_types[package_type].model_validate(value["body"])}
+        return value
 
     @model_validator(mode="after")
     def validate_orchestration_policy(self) -> "CapabilityPackageVersion":
-        fields_set = bool(self.allowed_node_package_refs or self.max_nodes is not None or self.max_live_nodes is not None)
-        if self.executor_kind != "orchestrator_python_v1":
+        if not isinstance(self.body, FunctionCapabilityPackageBody):
+            return self
+        body = self.function_body
+        fields_set = bool(body.allowed_node_package_refs or body.max_nodes is not None or body.max_live_nodes is not None)
+        if self.execution.kind != "container:python_orchestrator":
             if fields_set:
                 raise ValueError("orchestration_fields_require_orchestrator")
             return self
         if (
-            not self.allowed_node_package_refs
-            or self.max_nodes is None
-            or self.max_live_nodes is None
-            or self.max_nodes <= 0
-            or self.max_live_nodes <= 0
-            or self.max_live_nodes > self.max_nodes
-            or self.executor_operation != "orchestrate"
-            or self.io_contract_ref is None
+            not body.allowed_node_package_refs
+            or body.max_nodes is None
+            or body.max_live_nodes is None
+            or body.max_nodes <= 0
+            or body.max_live_nodes <= 0
+            or body.max_live_nodes > body.max_nodes
+            or body.io_contract_ref is None
         ):
             raise ValueError("orchestration_package_invalid")
         return self
+
+    @property
+    def function_body(self) -> FunctionCapabilityPackageBody:
+        if not isinstance(self.body, FunctionCapabilityPackageBody):
+            raise TypeError(f"package_type_has_no_function_body:{self.package_type}")
+        return self.body
 
     @property
     def version_ref(self) -> str:
@@ -209,14 +264,15 @@ class CapabilityPackageVersion(ContractModel):
             # Access bindings may contain machine-local paths; they must not
             # change the package identity or prevent activation on another
             # Slave.  The content digest remains the portable identity.
-            if isinstance(payload.get("program_content_ref"), dict):
-                ref = payload["program_content_ref"]
-                payload["program_content_ref"] = {key: ref.get(key) for key in ("resource_id", "version_or_digest", "identity_criterion") if ref.get(key) is not None}
-            if isinstance(payload.get("allowed_node_package_refs"), list):
-                payload["allowed_node_package_refs"] = [
+            body_payload = payload.get("body") if isinstance(payload.get("body"), dict) else None
+            if isinstance(body_payload, dict) and isinstance(body_payload.get("program_content_ref"), dict):
+                ref = body_payload["program_content_ref"]
+                body_payload["program_content_ref"] = {key: ref.get(key) for key in ("resource_id", "version_or_digest", "identity_criterion") if ref.get(key) is not None}
+            if isinstance(body_payload, dict) and isinstance(body_payload.get("allowed_node_package_refs"), list):
+                body_payload["allowed_node_package_refs"] = [
                     {key: ref.get(key) for key in ("resource_id", "version_or_digest", "identity_criterion") if ref.get(key) is not None}
                     if isinstance(ref, dict) else ref
-                    for ref in payload["allowed_node_package_refs"]
+                    for ref in body_payload["allowed_node_package_refs"]
                 ]
             self.package_digest = hashlib.sha256(
                 json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()

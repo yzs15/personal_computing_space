@@ -43,7 +43,7 @@ def test_package_and_node_binding_carry_semantic_refs() -> None:
     )
 
     package_fields = CapabilityPackageVersion.model_fields
-    assert "io_contract_ref" in package_fields
+    assert "body" in package_fields
 
     binding = NodeInputBinding(node_id="node-1", input_ref=input_ref)
     assert binding.model_dump(mode="json") == {

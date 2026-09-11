@@ -125,14 +125,15 @@ async def test_bind_compute_hole_accepts_capability_uri_target_for_registered_sl
             "ops": [{
                 "kind": "materialize_capability_package_candidate",
                 "value": {
-                    "package_id": "mcp-binding-package",
-                    "package_version": "v1",
-                    "operation_descriptor_ref": "loom://test_binding",
-                    "program_content_ref": program["resource_ref"],
-                    "io_contract_ref": contract["resource_ref"],
-                    "executor_kind": "subprocess_json_v1",
-                    "executor_operation": "run_code",
-                },
+                             "package_id": "mcp-binding-package",
+                             "package_version": "v1",
+                             "execution": {"kind": "process:json_stdio", "version": "1"},
+                             "body": {
+                                 "operation_descriptor_ref": "loom://test_binding",
+                                 "program_content_ref": program["resource_ref"],
+                                 "io_contract_ref": contract["resource_ref"],
+                             },
+                         },
             }],
         },
     )
@@ -146,7 +147,7 @@ async def test_bind_compute_hole_accepts_capability_uri_target_for_registered_sl
                     "value": {
                         "binding_id": "binding-test",
                         "hole_id": "h_binding",
-                        "capability_descriptor_ref": {"resource_id": "executor://subprocess_json_v1/1"},
+                        "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
                         "capability_package_ref": {"resource_id": "capability-package://mcp-binding-package/v1"},
                         "target_resource_ref": {"resource_id": "loom://compute/slave-a"},
                         "realization_digest": program["resource_ref"]["version_or_digest"],

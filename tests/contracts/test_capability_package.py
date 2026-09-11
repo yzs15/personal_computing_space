@@ -40,11 +40,7 @@ async def test_package_digest_and_scope_are_explicit():
         package_closure_version_ref="closure-pkg-v1",
         source_run_ref="run-1",
         source_closure_version_ref="committed-1",
-        operation_descriptor_ref=ResourceRef(resource_id="loom://matmul"),
-        operation_descriptor_digest="descriptor-digest",
-        program_content_ref=program,
-        program_digest=program.version_or_digest,
-        io_contract_ref=contract,
+        body={"operation_descriptor_ref": ResourceRef(resource_id="loom://matmul"), "operation_descriptor_digest": "descriptor-digest", "program_content_ref": program, "program_digest": program.version_or_digest, "io_contract_ref": contract},
     )
     assert package.scope == "run_bound"
     assert package.publication_state == "candidate"

@@ -41,17 +41,24 @@ async def test_observer_and_slave_share_immutable_content_store():
                 {"kind": "set_program_ref", "value": "loom://double"},
                 {"kind": "set_io_contract_ref", "value": io_contract_ref.model_dump(mode="json")},
                 {"kind": "add_typed_hole", "value": {"hole_id": "h_double"}},
-            {"kind": "materialize_capability_package_candidate", "value": {"package_id": "pkg-minio-e2e", "program_content_ref": program_ref.model_dump(mode="json"), "io_contract_ref": io_contract_ref.model_dump(mode="json"), "operation_descriptor_ref": "loom://double"}},
+            {"kind": "materialize_capability_package_candidate", "value": {
+                                                                              "package_id": "pkg-minio-e2e",
+                                                                              "body": {
+                                                                                  "program_content_ref": program_ref.model_dump(mode="json"),
+                                                                                  "io_contract_ref": io_contract_ref.model_dump(mode="json"),
+                                                                                  "operation_descriptor_ref": "loom://double",
+                                                                              },
+                                                                          }},
         ],
     )
     package = (await repo.get_run(run.run_id)).capability_packages[0]
     binding = ComputeBinding(
         binding_id="binding-minio-e2e",
         hole_id="h_double",
-        capability_descriptor_ref=ResourceRef(resource_id="executor://subprocess_json_v1/1"),
+        capability_descriptor_ref=ResourceRef(resource_id="executor://process:json_stdio/1"),
         capability_package_ref=ResourceRef(resource_id=package.version_ref),
         target_resource_ref=ResourceRef(resource_id="slave-a"),
-        realization_digest=package.program_digest,
+        realization_digest=package.function_body.program_digest,
     )
     bound = await repo.apply_patch(
         run.run_id,
@@ -71,7 +78,7 @@ async def test_observer_and_slave_share_immutable_content_store():
         package_version_ref=package.version_ref,
         package_digest=package.package_digest,
         target_slave="slave-a",
-        program_content_ref=package.program_content_ref,
+        program_content_ref=package.function_body.program_content_ref,
         compute_binding=binding,
     )
     report = await worker.provision(command=command, package=package)
@@ -88,5 +95,5 @@ async def test_observer_and_slave_share_immutable_content_store():
     )
     assert result.value == {"value": 14}
     slave_store = _store()
-    assert await slave_store.get(package.program_content_ref, expected_digest=package.program_digest) == code.encode()
-    assert await observer_store.get(package.program_content_ref) == code.encode()
+    assert await slave_store.get(package.function_body.program_content_ref, expected_digest=package.function_body.program_digest) == code.encode()
+    assert await observer_store.get(package.function_body.program_content_ref) == code.encode()
