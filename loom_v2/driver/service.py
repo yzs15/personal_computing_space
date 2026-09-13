@@ -17,7 +17,6 @@ from loom_v2.slave.executor import ExecutionResult
 from loom_v2.settings import Settings
 from loom_v2.coding_agents.turn import TurnContext
 from loom_v2.driver.coordinator import DriverTurnCoordinator
-from loom_v2.contracts.messages import message_payload_digest
 from loom_v2.contracts.errors import DomainError, DomainErrorEnvelope
 
 from .orchestrator import DockerOrchestrationExecutor
@@ -81,14 +80,13 @@ class DriverService:
             return await self._run_prompt_remote(context.conversation_ref, prompt, request_id=context.request_id, claim_token=context.claim_token, context=context)
         return await self._run_prompt(context.conversation_ref, prompt, request_id=context.request_id)
 
-    async def run_prompt(self, conversation_ref: str, prompt: str, request_id: str | None = None, payload_digest: str | None = None) -> dict[str, Any]:
+    async def run_prompt(self, conversation_ref: str, prompt: str, request_id: str | None = None) -> dict[str, Any]:
         if request_id is not None and (self.control_client is None or hasattr(self.control_client, "claim_message")):
             return await self.coordinator.submit(
                 {
                     "request_id": request_id,
                     "conversation_ref": conversation_ref,
                     "prompt": prompt,
-                    "payload_digest": payload_digest or message_payload_digest(conversation_ref, prompt),
                 },
                 prompt,
             )
@@ -738,7 +736,6 @@ class DriverService:
                 workspace_id=getattr(control, "workspace_id", "workspace-default"),
                 activation_closure_version_ref=(current.get("committed") or {}).get("version_id") or package.package_closure_version_ref,
                 compute_binding=binding,
-                program_content_ref=package.function_body.program_content_ref,
                 idempotency_key=f"run-{execution_id}-{package.package_digest}-{target}",
             )
             report = await worker.provision(
@@ -753,7 +750,7 @@ class DriverService:
                 request_id=f"health:{execution_id}:{target}:{package.package_digest}",
             )
         result = await worker.dispatch(attempt_id=str(attempt["attempt_id"]), execution_id=str(execution_id), execution_epoch=execution_epoch, workspace_id=getattr(control, "workspace_id", "workspace-default"), operation=operation, payload=payload, closure=snapshot, binding=binding, driver_id=getattr(control, "driver_id", None), driver_epoch=getattr(control, "driver_epoch", None))
-        await control.command("run.result", {"run_id": run_id, "result": {"attempt_id": attempt["attempt_id"], "execution_id": execution_id, "execution_epoch": execution_epoch, "resource_ref": result.resource_ref.model_dump(mode="json"), "digest": result.digest, "value": result.value, "terminal_state": result.terminal_state, "terminal_error": result.terminal_error, "validation_evidence": result.validation_evidence, "provenance": result.provenance}}, request_id=f"execution:{execution_id}:{execution_epoch}")
+        await control.command("run.result", {"run_id": run_id, "result": {"attempt_id": attempt["attempt_id"], "execution_id": execution_id, "execution_epoch": execution_epoch, "resource_ref": result.resource_ref.model_dump(mode="json"), "value": result.value, "terminal_state": result.terminal_state, "terminal_error": result.terminal_error, "validation_evidence": result.validation_evidence, "provenance": result.provenance}}, request_id=f"execution:{execution_id}:{execution_epoch}")
 
     async def _refresh_remote_workers(self) -> None:
         if self.control_client is None:
@@ -794,7 +791,6 @@ class DriverService:
             workspace_id=self.control_client.workspace_id,
             activation_closure_version_ref=package.package_closure_version_ref,
             compute_binding=compute_binding,
-            program_content_ref=package.function_body.program_content_ref,
             idempotency_key=idempotency_key or f"promote-{package.package_digest}-{target_slave}",
         )
         report = await worker.provision(
@@ -970,7 +966,6 @@ class DriverService:
                         workspace_id=record.closure_contract.workspace_id if record.closure_contract else "workspace-default",
                         activation_closure_version_ref=record.committed.version_id if record.committed else package.package_closure_version_ref,
                         compute_binding=binding,
-                        program_content_ref=package.function_body.program_content_ref,
                         idempotency_key=f"run-{execution_id}-{package.package_digest}-{target}",
                     )
                     report = await worker.provision(command=command, package=package, driver_id=getattr(self.control_client, "driver_id", None), driver_epoch=getattr(self.control_client, "driver_epoch", None))
@@ -1002,7 +997,6 @@ class DriverService:
                         workspace_id=record.closure_contract.workspace_id if record.closure_contract else "workspace-default",
                         activation_closure_version_ref=record.committed.version_id if record.committed else package.package_closure_version_ref,
                         compute_binding=binding,
-                        program_content_ref=package.function_body.program_content_ref,
                         idempotency_key=f"run-{execution_id}-{package.package_digest}-{target}",
                     )
                     report = await slave.provision(command, package)
@@ -1026,7 +1020,6 @@ class DriverService:
                 "execution_id": execution_id,
                 "execution_epoch": execution_epoch,
                 "resource_ref": result.resource_ref.model_dump(mode="json"),
-                "digest": result.digest,
                 "value": result.value,
                 "terminal_state": result.terminal_state,
                 "terminal_error": result.terminal_error,

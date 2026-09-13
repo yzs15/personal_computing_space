@@ -83,7 +83,7 @@ async def test_slave_provision_rejects_package_without_io_contract():
         package_closure_version_ref="closure",
         source_run_ref="run",
         source_closure_version_ref="version",
-        body=FunctionCapabilityPackageBody(operation_descriptor_ref=ResourceRef(resource_id="loom://check"), operation_descriptor_digest="descriptor", program_content_ref=program_ref, program_digest=program_ref.version_or_digest, io_contract_ref=None),
+        body=FunctionCapabilityPackageBody(operation_descriptor_ref=ResourceRef(resource_id="loom://check"), program_content_ref=program_ref, io_contract_ref=None),
     )
 
     with pytest.raises(RuntimeError, match="io_contract_required"):

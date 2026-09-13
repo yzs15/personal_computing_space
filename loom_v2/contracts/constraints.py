@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from loom_v2.digest import digest_json
 
 
 def _digest(value: Any) -> str:
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    return hashlib.sha256(payload).hexdigest()
+    return digest_json(value, domain="loom/constraint/v1")
 
 
 class ConstraintRef(BaseModel):

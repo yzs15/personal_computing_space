@@ -36,7 +36,6 @@ from loom_v2.contracts.io_schema import ValidationError as SchemaValidationError
 class WorkspaceReplica:
     workspace_id: str
     state: str = "ready"
-    digest: str = ""
 
 
 @dataclass
@@ -71,7 +70,7 @@ class SlaveService:
         async with self.sessions() as session:
             row = await session.get(SlaveReplicaRow, self.slave_id)
             if row is None:
-                session.add(SlaveReplicaRow(slave_id=self.slave_id, workspace_id=self.workspace_id, state=self.replica.state, digest=self.replica.digest))
+                session.add(SlaveReplicaRow(slave_id=self.slave_id, workspace_id=self.workspace_id, state=self.replica.state))
                 await session.commit()
 
     def term_support(self) -> list[TermSupport]:
@@ -94,7 +93,6 @@ class SlaveService:
             package.package_version,
             package.package_id,
             package.package_digest,
-            package.function_body.program_digest,
         }
 
     def _cache_package(self, package: CapabilityPackageVersion, command_ref: str) -> None:
@@ -141,8 +139,6 @@ class SlaveService:
             raise RuntimeError("io_contract_invalid") from exc
         if package.package_digest.lower() != command.package_digest.lower():
             raise RuntimeError("capability_package_digest_mismatch")
-        if command.program_content_ref is not None and command.program_content_ref.version_or_digest not in {None, package.function_body.program_digest}:
-            raise RuntimeError("program_digest_mismatch")
         if package.function_body.provider_fillable_hole_refs and (command.compute_binding is None or not command.compute_binding.runtime_profile):
             raise RuntimeError("provider_fillable_binding_required")
         ref = package.version_ref
@@ -164,9 +160,11 @@ class SlaveService:
             raise RuntimeError("program_content_unavailable")
         activation = CapabilityPackageActivation(
             package_version_ref=ref,
+            package_digest=package.package_digest,
             target_slave=self.slave_id,
             activation_closure_version_ref=command.activation_closure_version_ref or package.package_closure_version_ref,
             compute_binding_ref=command.compute_binding.binding_id if command.compute_binding else "",
+            session_generation=command.session_generation,
             activation_state="ready",
             evidence_refs=[f"package-test:{package.package_digest[:16]}", f"health:{package.package_digest[:16]}"],
         )
@@ -187,10 +185,8 @@ class SlaveService:
                 "operation": operation_name,
                 "execution": package.execution.model_dump(mode="json"),
                 "executor_descriptor_ref": self.executor_registry.get(package.execution).descriptor.descriptor_ref,
-                "executor_descriptor_digest": self.executor_registry.get(package.execution).descriptor.digest,
                 "package_version_ref": package.version_ref,
                 "package_digest": package.package_digest,
-                "program_digest": package.function_body.program_digest,
             },
             session_generation=command.session_generation,
         )
@@ -298,7 +294,7 @@ class SlaveService:
             operation_ref = closure.program.operation_ref or closure.compute.operation_ref
             candidates = {operation_ref, operation_ref.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1], "default"}
             input_binding = next((item for item in closure.node_input_bindings if item.node_id in candidates), None)
-            input_digest = input_binding.input_ref.version_or_digest if input_binding is not None else None
+            input_digest = input_binding.input_ref.digest if input_binding is not None else None
         evidence: list[dict[str, Any]] = []
         if contract.output_schema_ref is not None:
             try:
@@ -394,12 +390,10 @@ class SlaveService:
         package_required = False
         if binding is not None and binding.capability_package_ref is not None:
             package_ref = binding.capability_package_ref.resource_id
-            digest = binding.capability_package_ref.version_or_digest
+            digest = binding.capability_package_ref.digest
             package = self._find_cached_package(package_ref, digest)
             if package is None:
                 raise RuntimeError("capability_package_not_installed")
-            if binding.realization_digest and binding.realization_digest not in {package.function_body.program_digest, package.package_digest}:
-                raise RuntimeError("capability_package_digest_mismatch")
         elif operation not in self.supported_operations:
             raise RuntimeError(f"capability_unavailable:{operation}")
         else:
@@ -433,7 +427,6 @@ class SlaveService:
                         resource_ref=ResourceRef.model_validate(result_payload["resource_ref"]),
                         value=result_payload["value"],
                         replay_safety=result_payload["replay_safety"],
-                        digest=result_payload["digest"],
                         terminal_state=result_payload.get("terminal_state", "completed"),
                         terminal_error=result_payload.get("terminal_error"),
                         validation_evidence=result_payload.get("validation_evidence", []),
@@ -452,10 +445,8 @@ class SlaveService:
                     "package_version_ref": package.version_ref,
                     "package_digest": package.package_digest,
                     "program_content_ref": package.function_body.program_content_ref.model_dump(mode="json"),
-                    "program_digest": package.function_body.program_digest,
                     "execution": package.execution.model_dump(mode="json"),
                     "executor_descriptor_ref": descriptor.descriptor_ref,
-                    "executor_descriptor_digest": descriptor.digest,
                 },
             )
         else:
@@ -484,7 +475,6 @@ class SlaveService:
                         "resource_ref": result.resource_ref.model_dump(mode="json"),
                         "value": result.value,
                         "replay_safety": result.replay_safety,
-                        "digest": result.digest,
                         "terminal_state": result.terminal_state,
                         "terminal_error": result.terminal_error,
                         "validation_evidence": result.validation_evidence,

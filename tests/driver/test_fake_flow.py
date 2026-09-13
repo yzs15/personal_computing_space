@@ -10,7 +10,6 @@ async def fake_tool_handler(tool: str, arguments: dict[str, object]) -> dict[str
         return {
             "resource_ref": ResourceRef(
                 resource_id=f"content://sha256/{digest}",
-                version_or_digest=digest,
                 identity_criterion="content_digest",
             ).model_dump(mode="json")
         }

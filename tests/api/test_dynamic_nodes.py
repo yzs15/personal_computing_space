@@ -378,7 +378,6 @@ async def test_dynamic_node_dispatch_result_and_orchestration_completion():
             "execution_id": started["execution_id"],
             "execution_epoch": 1,
             "value": value,
-            "digest": repo._result_digest(value),
         },
     )
     record = await repo.get_run(run.run_id)
@@ -506,7 +505,6 @@ async def test_reassign_marks_old_attempt_lost_without_bumping_run_epoch():
                 "execution_id": started["execution_id"],
                 "execution_epoch": 1,
                 "value": stale_value,
-                "digest": repo._result_digest(stale_value),
             },
         )
 
@@ -598,7 +596,6 @@ async def test_reassign_rejects_unsatisfied_mechanical_constraints_without_parti
         node.input_refs = [
             ResourceRef(
                 resource_id=f"content://sha256/{missing_digest}",
-                version_or_digest=missing_digest,
                 identity_criterion="content_digest",
             )
         ]
@@ -653,7 +650,6 @@ def test_dynamic_node_event_replay_keeps_reassigned_node_dispatched():
     package_ref = ResourceRef(resource_id="capability-package://summarize/v1", version_or_digest="a" * 64)
     input_ref = ResourceRef(
         resource_id=f"content://sha256/{'b' * 64}",
-        version_or_digest="b" * 64,
         identity_criterion="content_digest",
     )
 

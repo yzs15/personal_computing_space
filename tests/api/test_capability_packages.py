@@ -111,7 +111,7 @@ async def test_candidate_is_run_bound_and_cannot_be_used_by_another_run():
             {"kind": "bind_compute_hole", "value": ComputeBinding(
                 binding_id="binding-b", hole_id="h", capability_descriptor_ref=ResourceRef(resource_id="run-code"),
                 capability_package_ref=ResourceRef(resource_id=package.version_ref), target_resource_ref=ResourceRef(resource_id="slave-a"),
-                realization_digest=package.function_body.program_digest,
+
             ).model_dump(mode="json")},
         ],
     )
@@ -201,7 +201,7 @@ async def test_same_package_coordinate_across_runs_resolves_by_digest():
 
     first, second = packages
     assert first.version_ref == second.version_ref
-    assert first.package_digest != second.package_digest
+    assert first.package_digest == second.package_digest
     first_ref = ResourceRef(resource_id=first.version_ref, version_or_digest=first.package_digest)
     second_ref = ResourceRef(resource_id=second.version_ref, version_or_digest=second.package_digest)
     assert (await repo.get_capability_package(first_ref)).package_digest == first.package_digest
@@ -477,7 +477,6 @@ async def test_binding_package_with_different_io_contract_is_not_ready() -> None
                     "capability_descriptor_ref": {"resource_id": "capability://slave-a/check"},
                     "capability_package_ref": {"resource_id": package.version_ref},
                     "target_resource_ref": {"resource_id": "slave-a"},
-                    "realization_digest": package.function_body.program_digest,
                 },
             }
         ],

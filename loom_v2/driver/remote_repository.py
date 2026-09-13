@@ -119,8 +119,8 @@ class RemoteObserverRepository:
             request_id=f"{request_id}:message" if request_id else None,
         )
 
-    async def claim_message(self, request_id: str, payload_digest: str, *, conversation_ref: str | None = None, claim_token: str) -> dict[str, Any]:
-        return await self.control.claim_message(request_id, payload_digest, conversation_ref=conversation_ref, claim_token=claim_token)
+    async def claim_message(self, request_id: str, *, conversation_ref: str | None = None, claim_token: str) -> dict[str, Any]:
+        return await self.control.claim_message(request_id, conversation_ref=conversation_ref, claim_token=claim_token)
 
     async def update_message(self, request_id: str, *, claim_token: str, state: str | None = None, assistant_text: str | None = None, run_id: str | None = None, outcome: dict[str, Any] | None = None) -> dict[str, Any]:
         return await self.control.update_message(request_id, claim_token=claim_token, state=state, assistant_text=assistant_text, run_id=run_id, outcome=outcome)
@@ -246,7 +246,7 @@ class RemoteObserverRepository:
         payload = await self.control.command(
             "run.result",
             {"run_id": run_id, "result": {"orchestration_final_ref": final_ref.model_dump(mode="json")}},
-            request_id=f"orchestration:{run_id}:{final_ref.version_or_digest or final_ref.resource_id}",
+            request_id=f"orchestration:{run_id}:{final_ref.digest or final_ref.resource_id}",
         )
         return _decode_run(payload)
 

@@ -21,7 +21,7 @@ async def test_driver_applies_fake_patches_continuously_and_starts_execution():
     assert result["state"] == "completed"
     assert result["patches"] >= 3
     assert result["closure_version"].startswith("committed-")
-    assert result["resource_ref"].startswith("result-")
+    assert result["resource_ref"].startswith("content://sha256/")
     assert result["outcome"]["value"] == {"value": 6}
     assert result["outcome"]["provenance"]["execution"] == {"kind": "process:json_stdio", "version": "1"}
     assert result["outcome"]["provenance"]["package_version_ref"].startswith("capability-package://fake-run-code/")
@@ -136,7 +136,6 @@ class RunCodeClosureProvider:
                         "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
                         "capability_package_ref": {"resource_id": "capability-package://run-code-package/v1"},
                         "target_resource_ref": {"resource_id": "slave-a"},
-                        "realization_digest": program_ref.get("version_or_digest", ""),
                     },
                 },
                 {"kind": "set_execution_payload", "value": {"node_id": operation_ref, "input_ref": input_ref}},

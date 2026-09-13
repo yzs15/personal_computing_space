@@ -9,7 +9,7 @@ from loom_v2.driver.orchestrator import (
 
 
 def _ref(resource_id: str, digest: str) -> ResourceRef:
-    return ResourceRef(resource_id=resource_id, version_or_digest=digest)
+    return ResourceRef(resource_id=resource_id, version_or_digest=None if resource_id.startswith("content://sha256/") else digest)
 
 
 def test_docker_executor_uses_os_level_sandbox_flags():

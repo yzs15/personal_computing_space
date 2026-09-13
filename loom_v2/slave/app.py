@@ -168,7 +168,6 @@ def create_app(slave_id: str | None = None, *, observer_transport: httpx.AsyncBa
                     "resource_ref": result.resource_ref.model_dump(mode="json"),
                     "value": result.value,
                     "replay_safety": result.replay_safety,
-                    "digest": result.digest,
                     "provenance": result.provenance,
                 },
             },

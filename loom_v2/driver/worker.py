@@ -96,7 +96,6 @@ class WorkerSession:
             resource_ref=ResourceRef.model_validate(result["resource_ref"]),
             value=result["value"],
             replay_safety=result.get("replay_safety", "Idempotent"),
-            digest=result["digest"],
             terminal_state=terminal_state,
             terminal_error=report.get("error") or report.get("terminal_error"),
             validation_evidence=report.get("validation_evidence") or [],

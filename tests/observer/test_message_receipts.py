@@ -13,14 +13,12 @@ async def test_receipt_state_machine_is_fenced_and_idempotent():
     claimed = await repo.claim_message_receipt(
         receipt.workspace_id,
         receipt.request_id,
-        payload_digest=receipt.payload_digest,
         claim_token="claim-1",
     )
     assert claimed.state == "in_flight"
     duplicate = await repo.claim_message_receipt(
         receipt.workspace_id,
         receipt.request_id,
-        payload_digest=receipt.payload_digest,
         claim_token="claim-2",
     )
     assert duplicate.claim_token == "claim-1"
@@ -31,7 +29,7 @@ async def test_receipt_state_machine_is_fenced_and_idempotent():
     )
     assert completed.state == "completed"
     assert (await repo.claim_message_receipt(
-        "workspace-default", "request-1", payload_digest=receipt.payload_digest, claim_token="claim-3"
+        "workspace-default", "request-1", claim_token="claim-3"
     )).claim_token is None  # terminal receipts are immutable
 
 
@@ -40,7 +38,7 @@ async def test_receipt_only_projection_can_be_loaded():
     repo = ObserverRepository()
     receipt = await repo.create_or_get_message_receipt("workspace-default", "request-2", "conversation-2", "hello")
     await repo.queue_message_receipt("workspace-default", "request-2")
-    claimed = await repo.claim_message_receipt("workspace-default", "request-2", payload_digest=receipt.payload_digest, claim_token="claim")
+    claimed = await repo.claim_message_receipt("workspace-default", "request-2", claim_token="claim")
     await repo.update_message_receipt("workspace-default", "request-2", claim_token=claimed.claim_token or "", state="completed", assistant_text="plain reply")
     view = await repo.get_conversation("conversation-2")
     assert view["status"] == "completed"
@@ -54,7 +52,7 @@ async def test_new_driver_registration_releases_old_message_claims():
 
     repo = ObserverRepository()
     receipt = await repo.create_or_get_message_receipt("workspace-default", "request-3", "conversation-3", "hello")
-    claimed = await repo.claim_message_receipt("workspace-default", receipt.request_id, payload_digest=receipt.payload_digest, claim_token="old")
+    claimed = await repo.claim_message_receipt("workspace-default", receipt.request_id, claim_token="old")
     assert claimed.state == "in_flight"
     await repo.register_agent(AgentRegistration(role="driver", agent_id="driver", instance_id="new", workspace_id="workspace-default", endpoint_url="http://driver", protocol_version="loom.v1"))
     recovered = await repo.get_message_receipt("workspace-default", receipt.request_id)

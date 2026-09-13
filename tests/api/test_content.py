@@ -35,7 +35,7 @@ def test_content_endpoint_canonicalizes_json_and_returns_semantic_ref() -> None:
     assert "bucket" not in first_ref.get("access_binding", {})
     assert "key" not in first_ref.get("access_binding", {})
 
-    digest = first_ref["version_or_digest"]
+    digest = first_ref["resource_id"].rsplit("/", 1)[-1]
     stored = client.get(f"/api/v1/content/{digest}")
     assert stored.status_code == 200
     assert stored.json() == {"required": ["scores"], "type": "object"}

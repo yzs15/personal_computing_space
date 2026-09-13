@@ -228,7 +228,6 @@ async def test_worker_session_rejects_terminal_report_with_wrong_attempt_id():
                 "result": {
                     "resource_ref": {"resource_id": "result-fencing"},
                     "value": {"ok": True},
-                    "digest": "digest",
                 },
             },
         }
@@ -267,7 +266,6 @@ async def test_worker_session_rejects_terminal_report_with_wrong_execution_id():
                 "result": {
                     "resource_ref": {"resource_id": "result-fencing-exec"},
                     "value": {"ok": True},
-                    "digest": "digest",
                 },
             },
         }
@@ -308,12 +306,11 @@ async def test_worker_session_omits_mutable_payload_when_closure_has_input_bindi
                 "result": {
                     "resource_ref": {"resource_id": "result-input-ref"},
                     "value": {"ok": True},
-                    "digest": "digest",
                 },
             },
         }
 
-    input_ref = ResourceRef(resource_id="content://sha256/" + "a" * 64, version_or_digest="a" * 64)
+    input_ref = ResourceRef(resource_id="content://sha256/" + "a" * 64)
     closure = TaskClosure(
         program={"operation_ref": "loom://test_input_ref"},
         node_input_bindings=[NodeInputBinding(node_id="test_input_ref", input_ref=input_ref)],
@@ -368,7 +365,7 @@ async def test_worker_session_provision_sends_only_content_references():
         package_closure_version_ref="closure",
         source_run_ref="run",
         source_closure_version_ref="version",
-        body={"operation_descriptor_ref": ResourceRef(resource_id="loom://check"), "operation_descriptor_digest": "descriptor", "program_content_ref": program_ref, "program_digest": program_ref.version_or_digest, "io_contract_ref": contract_ref},
+        body={"operation_descriptor_ref": ResourceRef(resource_id="loom://check"), "program_content_ref": program_ref, "io_contract_ref": contract_ref},
     )
     session = WorkerSession("slave-a", "http://slave-a", transport=httpx.ASGITransport(app=app))
     await session.provision(
@@ -377,7 +374,6 @@ async def test_worker_session_provision_sends_only_content_references():
             package_version_ref=package.version_ref,
             package_digest=package.package_digest,
             target_slave="slave-a",
-            program_content_ref=program_ref,
         ),
         package=package,
     )

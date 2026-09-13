@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 from contextlib import suppress
 from uuid import uuid4
 from typing import Any
@@ -140,13 +139,11 @@ def create_app(
             raise HTTPException(status_code=422, detail="request_id_required")
         if not str(payload.get("conversation_ref") or "").strip():
             raise HTTPException(status_code=422, detail="conversation_ref_required")
-        if not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("payload_digest") or "")):
-            raise HTTPException(status_code=422, detail="payload_digest_required")
         workspace_id = str(payload.get("workspace_id") or settings.workspace_id)
         if workspace_id != settings.workspace_id:
             raise HTTPException(status_code=403, detail="workspace_binding_mismatch")
         try:
-            return await app.state.service.run_prompt(str(payload["conversation_ref"]), str(payload.get("text", "")), request_id=str(payload["request_id"]), payload_digest=str(payload["payload_digest"]))
+            return await app.state.service.run_prompt(str(payload["conversation_ref"]), str(payload.get("text", "")), request_id=str(payload["request_id"]))
         except HTTPException:
             raise
         except Exception as exc:

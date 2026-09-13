@@ -3,28 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any
 
 import boto3
-import rfc8785
 from botocore.exceptions import ClientError
 
 from loom_v2.contracts.types import ResourceRef
+from loom_v2.digest import canonical_json_bytes, digest_bytes
 
 
 _DIGEST_RE = re.compile(r"^[0-9a-fA-F]{64}$")
-
-
-def canonical_json_bytes(value: Any) -> bytes:
-    """Return RFC 8785/JCS bytes for a JSON-compatible Python value."""
-
-    try:
-        return rfc8785.dumps(value)
-    except (TypeError, ValueError, rfc8785.CanonicalizationError) as exc:
-        raise ValueError("json_canonicalization_error") from exc
 
 
 @dataclass(frozen=True)
@@ -78,7 +68,9 @@ class ContentStore:
 
     @staticmethod
     def digest(content: bytes) -> str:
-        return hashlib.sha256(content).hexdigest()
+        # ContentStore digests are the public SHA-256 object identity and must
+        # remain compatible with existing content://sha256 refs.
+        return digest_bytes(content)
 
     @staticmethod
     def _normalize_digest(value: str | None) -> str:
@@ -96,13 +88,7 @@ class ContentStore:
         if isinstance(ref, ResourceRef):
             if ref.identity_criterion not in {None, "content_digest"}:
                 raise ValueError("invalid_content_digest")
-            if ref.version_or_digest and ref.resource_id.startswith("content://sha256/"):
-                resource_digest = cls._normalize_digest(ref.resource_id)
-                version_digest = cls._normalize_digest(ref.version_or_digest)
-                if resource_digest != version_digest:
-                    raise ValueError("content_digest_mismatch")
-                return version_digest
-            return cls._normalize_digest(ref.version_or_digest or ref.resource_id)
+            return cls._normalize_digest(ref.resource_id)
         return cls._normalize_digest(ref)
 
     def _key(self, digest: str) -> str:
@@ -218,7 +204,6 @@ class ContentStore:
 
         return ResourceRef(
             resource_id=f"content://sha256/{digest}",
-            version_or_digest=digest,
             identity_criterion="content_digest",
             access_binding={"media_type": media_type},
         )

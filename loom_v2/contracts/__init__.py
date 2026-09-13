@@ -2,7 +2,7 @@ from .constraints import Constraint, ConstraintRef, ConstraintSpec
 from .errors import DomainError, DomainErrorEnvelope
 from .terms import TermSupport, TypedTerm, VocabularyRegistry, builtin_registry
 from .agents import AgentLease, AgentRegistration, DriverCommand, DriverRequestReceipt, DriverThreadBinding
-from .messages import MessageReceipt, MessageReceiptState, message_payload_digest
+from .messages import MessageReceipt, MessageReceiptState
 from .types import (
     CapabilityHealthReport,
     CapabilityPackage,
@@ -10,6 +10,7 @@ from .types import (
     CapabilityPackageVersion,
     CapabilityPackageBody,
     FunctionCapabilityPackageBody,
+    HttpServiceEndpoint,
     ServiceCapabilityPackageBody,
     PythonModuleCapabilityPackageBody,
     ExecutionContract,
@@ -44,7 +45,6 @@ __all__ = [
     "DriverThreadBinding",
     "MessageReceipt",
     "MessageReceiptState",
-    "message_payload_digest",
     "TermSupport",
     "TypedTerm",
     "VocabularyRegistry",
@@ -56,6 +56,7 @@ __all__ = [
     "CapabilityPackageVersion",
     "CapabilityPackageBody",
     "FunctionCapabilityPackageBody",
+    "HttpServiceEndpoint",
     "ServiceCapabilityPackageBody",
     "PythonModuleCapabilityPackageBody",
     "ExecutionContract",

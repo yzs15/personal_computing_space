@@ -58,7 +58,7 @@ async def test_observer_and_slave_share_immutable_content_store():
         capability_descriptor_ref=ResourceRef(resource_id="executor://process:json_stdio/1"),
         capability_package_ref=ResourceRef(resource_id=package.version_ref),
         target_resource_ref=ResourceRef(resource_id="slave-a"),
-        realization_digest=package.function_body.program_digest,
+
     )
     bound = await repo.apply_patch(
         run.run_id,
@@ -78,7 +78,6 @@ async def test_observer_and_slave_share_immutable_content_store():
         package_version_ref=package.version_ref,
         package_digest=package.package_digest,
         target_slave="slave-a",
-        program_content_ref=package.function_body.program_content_ref,
         compute_binding=binding,
     )
     report = await worker.provision(command=command, package=package)

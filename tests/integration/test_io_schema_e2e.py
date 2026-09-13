@@ -84,7 +84,7 @@ async def test_content_refs_drive_readiness_dispatch_and_terminal_evidence():
             version_or_digest=package.package_digest,
         ),
         target_resource_ref=ResourceRef(resource_id="slave-a"),
-        realization_digest=package.function_body.program_digest,
+
     )
     bound = await repo.apply_patch(
         record.run_id,

@@ -56,7 +56,6 @@ async def test_record_result_projects_completed_outcome() -> None:
             "execution_id": started["execution_id"],
             "execution_epoch": started["execution_epoch"],
             "value": value,
-            "digest": _digest(value),
             "terminal_state": "completed",
         },
     )
@@ -82,7 +81,6 @@ async def test_attestation_accept_preserves_raw_execution_result() -> None:
             "execution_id": started["execution_id"],
             "execution_epoch": started["execution_epoch"],
             "value": value,
-            "digest": digest,
             "resource_ref": resource_ref,
             "terminal_state": "decision_required",
         },
@@ -117,7 +115,6 @@ async def test_repair_reopen_clears_outcome_and_rerun_fences_old_execution() -> 
             "execution_id": started["execution_id"],
             "execution_epoch": started["execution_epoch"],
             "value": value,
-            "digest": _digest(value),
             "terminal_state": "failed",
             "terminal_error": {"code": "execution_failed"},
         },
@@ -150,7 +147,6 @@ async def test_repair_reopen_clears_outcome_and_rerun_fences_old_execution() -> 
                 "execution_id": started["execution_id"],
                 "execution_epoch": started["execution_epoch"],
                 "value": value,
-                "digest": _digest(value),
                 "terminal_state": "completed",
             },
         )
@@ -169,7 +165,6 @@ async def test_completed_run_rejects_commit_transition() -> None:
             "execution_id": started["execution_id"],
             "execution_epoch": started["execution_epoch"],
             "value": value,
-            "digest": _digest(value),
             "terminal_state": "completed",
         },
     )

@@ -34,7 +34,7 @@ async def test_subprocess_package_is_provisioned_and_executed():
         package_closure_version_ref="closure-pkg-v1",
         source_run_ref="run-1",
         source_closure_version_ref="committed-1",
-        body={"operation_descriptor_ref": ResourceRef(resource_id="loom://double"), "operation_descriptor_digest": "descriptor", "program_content_ref": program_ref, "program_digest": program_ref.version_or_digest, "io_contract_ref": contract_ref},
+        body={"operation_descriptor_ref": ResourceRef(resource_id="loom://double"), "program_content_ref": program_ref, "io_contract_ref": contract_ref},
     )
     service = SlaveService("slave-a", content_store=store)
     binding = ComputeBinding(
@@ -43,7 +43,7 @@ async def test_subprocess_package_is_provisioned_and_executed():
         capability_descriptor_ref=ResourceRef(resource_id="executor://process:json_stdio/1"),
         capability_package_ref=ResourceRef(resource_id="capability-package://pkg/v1"),
         target_resource_ref=ResourceRef(resource_id="slave-a"),
-        realization_digest=package.function_body.program_digest,
+
     )
     report = await service.provision(CapabilityProvisionCommand(command_id="cmd", package_version_ref="pkg:v1", package_digest=package.package_digest, target_slave="slave-a"), package)
     assert report.activation_state == "ready"
@@ -68,7 +68,7 @@ async def test_same_package_version_keeps_distinct_digests_and_runs_requested_pa
             package_closure_version_ref="closure",
             source_run_ref=source_run_ref,
             source_closure_version_ref="version",
-            body={"operation_descriptor_ref": ResourceRef(resource_id="loom://triple"), "operation_descriptor_digest": "descriptor", "program_content_ref": program_ref, "program_digest": program_ref.version_or_digest, "io_contract_ref": contract_ref},
+            body={"operation_descriptor_ref": ResourceRef(resource_id="loom://triple"), "program_content_ref": program_ref, "io_contract_ref": contract_ref},
         )
 
     first = package("run-one", first_program)
@@ -98,7 +98,7 @@ async def test_same_package_version_keeps_distinct_digests_and_runs_requested_pa
         capability_descriptor_ref=ResourceRef(resource_id="executor://process:json_stdio/1"),
         capability_package_ref=ResourceRef(resource_id=second.version_ref, version_or_digest=second.package_digest),
         target_resource_ref=ResourceRef(resource_id="slave-a"),
-        realization_digest=second.function_body.program_digest,
+
     )
     result = await service.run("attempt-two", "triple", {"x": 3}, binding=binding)
     assert result.value == {"value": 9}
@@ -115,7 +115,7 @@ async def test_worker_session_provision_uses_content_ref_and_reports_health():
     package = CapabilityPackageVersion(
         package_id="pkg-http", package_version="v1", package_closure_version_ref="closure",
         source_run_ref="run", source_closure_version_ref="version",
-        body={"operation_descriptor_ref": ResourceRef(resource_id="loom://check"), "operation_descriptor_digest": "d", "program_content_ref": program_ref, "program_digest": program_ref.version_or_digest, "io_contract_ref": contract_ref},
+        body={"operation_descriptor_ref": ResourceRef(resource_id="loom://check"), "program_content_ref": program_ref, "io_contract_ref": contract_ref},
     )
     app = create_app("slave-a")
     session = WorkerSession("slave-a", "http://slave-a", transport=httpx.ASGITransport(app=app))

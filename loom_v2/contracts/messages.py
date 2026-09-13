@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -21,19 +19,11 @@ MessageReceiptState = Literal[
 ]
 
 
-def message_payload_digest(conversation_ref: str, prompt: str) -> str:
-    """Return the stable digest used by the message idempotency contract."""
-    payload = {"conversation_ref": conversation_ref, "text": prompt}
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 class MessageReceipt(ContractModel):
     workspace_id: str = Field(min_length=1)
     request_id: str = Field(min_length=1)
     conversation_ref: str = Field(min_length=1)
     prompt: str
-    payload_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     state: MessageReceiptState
     run_id: str | None = None
     assistant_text: str | None = None

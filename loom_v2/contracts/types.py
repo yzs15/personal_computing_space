@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import hashlib
-import json
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .constraints import Constraint, ConstraintRef
 from .terms import TypedTerm
+from loom_v2.digest import digest_json
 
 
 class ContractModel(BaseModel):
@@ -21,10 +21,21 @@ class ResourceRef(ContractModel):
     identity_criterion: str | None = None
     provenance: list[dict[str, Any]] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def validate_identity(self) -> "ResourceRef":
+        if self.resource_id.startswith("content://sha256/") and self.version_or_digest is not None:
+            raise ValueError("redundant_content_digest")
+        return self
+
+    @property
+    def digest(self) -> str | None:
+        if self.resource_id.startswith("content://sha256/"):
+            return self.resource_id.removeprefix("content://sha256/").lower()
+        return self.version_or_digest.lower() if self.version_or_digest else None
+
 
 class DataApplication(ContractModel):
     logical_inputs: list[ResourceRef] = Field(default_factory=list)
-    schema_digest: str = ""
     identity_criterion: str = "content_digest"
     expected_cardinality: str = "unknown"
     terms: list[TypedTerm] = Field(default_factory=list)
@@ -66,7 +77,6 @@ class ValidationEvidence(ContractModel):
 
 class ProgramApplication(ContractModel):
     operation_ref: str = ""
-    semantics_digest: str = ""
     # These fields remain the v2 application view.  Executable validation is
     # anchored by ``io_contract_ref``; the repository will resolve the view
     # from that content-addressed contract instead of trusting free text.
@@ -115,7 +125,7 @@ class ComputeRequirement(ContractModel):
 
     def model_post_init(self, __context: Any) -> None:
         if not self.requirement_id:
-            self.requirement_id = "requirement-" + hashlib.sha256(self.key.encode()).hexdigest()[:12]
+            self.requirement_id = "requirement-" + digest_json(self.key, domain="loom/requirement/v1")[:12]
 
 
 class TypedHole(ContractModel):
@@ -143,11 +153,9 @@ class ComputeBinding(ContractModel):
     capability_descriptor_ref: ResourceRef
     capability_package_ref: ResourceRef | None = None
     target_resource_ref: ResourceRef
-    realization_digest: str
     constraint_evidence_refs: list[str] = Field(default_factory=list)
     bound_by: str = "driver"
     bound_at: str = ""
-    executor_descriptor_digest: str | None = None
     runtime_profile: dict[str, Any] = Field(default_factory=dict)
     activation_ref: str | None = None
 
@@ -158,9 +166,7 @@ class CapabilityPackageBody(ContractModel):
 
 class FunctionCapabilityPackageBody(CapabilityPackageBody):
     operation_descriptor_ref: ResourceRef | str
-    operation_descriptor_digest: str
     program_content_ref: ResourceRef
-    program_digest: str
     io_contract_ref: ResourceRef | None = None
     effective_constraint_refs: list[ConstraintRef] = Field(default_factory=list)
     provider_fillable_hole_refs: list[str] = Field(default_factory=list)
@@ -175,11 +181,67 @@ class FunctionCapabilityPackageBody(CapabilityPackageBody):
     max_nodes: int | None = None
     max_live_nodes: int | None = None
 
+    @property
+    def program_digest(self) -> str:
+        return self.program_content_ref.digest or ""
+
+
+class HttpServiceEndpoint(ContractModel):
+    endpoint_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
+    operation_descriptor_ref: ResourceRef
+    path: str
+    io_contract_ref: ResourceRef
+    effect_class: str
+    permissions: list[str] = Field(default_factory=list)
+    replay_safety: str
+
+    @model_validator(mode="after")
+    def validate_refs(self) -> "HttpServiceEndpoint":
+        descriptor_digest = self.operation_descriptor_ref.digest
+        if self.operation_descriptor_ref.identity_criterion != "descriptor_digest" or not _is_sha256(descriptor_digest):
+            raise ValueError("service_operation_descriptor_invalid")
+        if (
+            self.io_contract_ref.identity_criterion not in {None, "content_digest"}
+            or not self.io_contract_ref.resource_id.startswith("content://sha256/")
+            or not _is_sha256(self.io_contract_ref.digest)
+        ):
+            raise ValueError("service_io_contract_ref_invalid")
+        _validate_http_path(self.path, "service_endpoint_path_invalid")
+        return self
+
 
 class ServiceCapabilityPackageBody(CapabilityPackageBody):
-    """Extensible body for a long-lived, multi-endpoint capability service."""
+    """Strict body for a long-lived, multi-endpoint HTTP capability service."""
 
-    endpoints: list[dict[str, Any]] = Field(default_factory=list)
+    image_ref: str
+    container_port: int = Field(ge=1, le=65535)
+    health_path: str
+    endpoints: list[HttpServiceEndpoint] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_service(self) -> "ServiceCapabilityPackageBody":
+        if not re.fullmatch(r"[^@/]+(?:/[^@/]+)*/[^@/]+@sha256:[0-9a-f]{64}", self.image_ref):
+            raise ValueError("service_image_ref_invalid")
+        _validate_http_path(self.health_path, "service_health_path_invalid")
+        ids = [endpoint.endpoint_id for endpoint in self.endpoints]
+        paths = [endpoint.path for endpoint in self.endpoints]
+        descriptors = [endpoint.operation_descriptor_ref.digest for endpoint in self.endpoints]
+        if len(set(ids)) != len(ids) or len(set(paths)) != len(paths) or len(set(descriptors)) != len(descriptors):
+            raise ValueError("service_endpoint_duplicate")
+        if self.health_path in paths:
+            raise ValueError("service_health_endpoint_conflict")
+        return self
+
+
+def _is_sha256(value: str | None) -> bool:
+    return bool(value and re.fullmatch(r"[0-9a-fA-F]{64}", value))
+
+
+def _validate_http_path(value: str, error: str) -> None:
+    # v1 paths are origin-form paths only; query, fragment, host and scheme
+    # are not part of an endpoint identity.
+    if not value.startswith("/") or "?" in value or "#" in value or "://" in value:
+        raise ValueError(error)
 
 
 class PythonModuleCapabilityPackageBody(CapabilityPackageBody):
@@ -206,7 +268,7 @@ class CapabilityPackageVersion(ContractModel):
     publication_state: Literal["candidate", "published", "abandoned"] = "candidate"
     provenance: list[dict[str, Any]] = Field(default_factory=list)
     execution: ExecutionContract = Field(default_factory=ExecutionContract)
-    body: FunctionCapabilityPackageBody | ServiceCapabilityPackageBody | PythonModuleCapabilityPackageBody | dict[str, Any]
+    body: FunctionCapabilityPackageBody | ServiceCapabilityPackageBody | PythonModuleCapabilityPackageBody
     package_digest: str = ""
 
     @model_validator(mode="before")
@@ -228,6 +290,12 @@ class CapabilityPackageVersion(ContractModel):
 
     @model_validator(mode="after")
     def validate_orchestration_policy(self) -> "CapabilityPackageVersion":
+        if self.package_type == "service":
+            if self.execution.kind != "container:http" or self.execution.version != "1":
+                raise ValueError("unsupported_execution_contract")
+            if not isinstance(self.body, ServiceCapabilityPackageBody):
+                raise ValueError("service_package_body_invalid")
+            return self
         if not isinstance(self.body, FunctionCapabilityPackageBody):
             return self
         body = self.function_body
@@ -259,44 +327,52 @@ class CapabilityPackageVersion(ContractModel):
         return f"capability-package://{self.package_id}/{self.package_version}"
 
     def model_post_init(self, __context: Any) -> None:
-        if not self.package_digest:
-            payload = self.model_dump(mode="json", exclude={"package_digest"})
-            # Access bindings may contain machine-local paths; they must not
-            # change the package identity or prevent activation on another
-            # Slave.  The content digest remains the portable identity.
-            body_payload = payload.get("body") if isinstance(payload.get("body"), dict) else None
-            if isinstance(body_payload, dict) and isinstance(body_payload.get("program_content_ref"), dict):
-                ref = body_payload["program_content_ref"]
-                body_payload["program_content_ref"] = {key: ref.get(key) for key in ("resource_id", "version_or_digest", "identity_criterion") if ref.get(key) is not None}
-            if isinstance(body_payload, dict) and isinstance(body_payload.get("allowed_node_package_refs"), list):
-                body_payload["allowed_node_package_refs"] = [
-                    {key: ref.get(key) for key in ("resource_id", "version_or_digest", "identity_criterion") if ref.get(key) is not None}
-                    if isinstance(ref, dict) else ref
-                    for ref in body_payload["allowed_node_package_refs"]
-                ]
-            self.package_digest = hashlib.sha256(
-                json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-            ).hexdigest()
+        payload = self._identity_payload()
+        computed = digest_json(payload, domain="loom/package/v1")
+        if self.package_digest:
+            declared = self.package_digest.lower()
+            if len(declared) != 64 or any(char not in "0123456789abcdef" for char in declared):
+                raise ValueError("invalid_package_digest")
+            if declared != computed:
+                raise ValueError("package_digest_mismatch")
+            self.package_digest = declared
+        else:
+            self.package_digest = computed
+
+    def _identity_payload(self) -> dict[str, Any]:
+        """Immutable execution identity; lifecycle/provenance are excluded."""
+        payload = self.model_dump(mode="json", include={"package_type", "execution", "body"})
+
+        def normalize(value: Any) -> Any:
+            if isinstance(value, dict):
+                # ResourceRef carries deployment-local access/provenance data;
+                # only its immutable identity belongs in package_digest.
+                if "resource_id" in value:
+                    return {
+                        key: value[key]
+                        for key in ("resource_id", "version_or_digest", "identity_criterion")
+                        if value.get(key) is not None
+                    }
+                return {key: normalize(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [normalize(item) for item in value]
+            return value
+
+        return normalize(payload)
 
 
 class CapabilityPackageActivation(ContractModel):
     package_version_ref: str
+    package_digest: str
     target_slave: str
     activation_closure_version_ref: str
     compute_binding_ref: str
+    session_generation: int = 1
     evidence_refs: list[str] = Field(default_factory=list)
     activation_state: Literal[
         "not_installed", "provisioning", "ready", "degraded", "stopped", "failed", "lost"
     ] = "not_installed"
     runtime_profile: dict[str, Any] = Field(default_factory=dict)
-    activation_digest: str = ""
-
-    def model_post_init(self, __context: Any) -> None:
-        if not self.activation_digest:
-            payload = self.model_dump(mode="json", exclude={"activation_digest"})
-            self.activation_digest = hashlib.sha256(
-                json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-            ).hexdigest()
 
 
 class CapabilityPackage(ContractModel):
@@ -317,7 +393,6 @@ class CapabilityProvisionCommand(ContractModel):
     workspace_id: str = "workspace-default"
     activation_closure_version_ref: str = ""
     compute_binding: ComputeBinding | None = None
-    program_content_ref: ResourceRef | None = None
     idempotency_key: str = ""
     session_generation: int = 1
 
@@ -349,9 +424,12 @@ class DynamicNode(ContractModel):
     parent_execution_ref: str = Field(min_length=1)
     intent_id: str = Field(min_length=1)
     package_ref: ResourceRef
-    package_digest: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
     input_refs: list[ResourceRef] = Field(default_factory=list)
     state: Literal["accepted", "dispatched", "completed", "failed", "decision_required"] = "accepted"
+
+    @property
+    def package_digest(self) -> str | None:
+        return self.package_ref.digest
 
 
 class ResourceEventFrame(ContractModel):
@@ -409,8 +487,7 @@ class TaskClosure(ContractModel):
                 return [strip_deployment_bindings(item) for item in value]
             return value
 
-        payload = json.dumps(strip_deployment_bindings(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-        return hashlib.sha256(payload).hexdigest()
+        return digest_json(strip_deployment_bindings(payload), domain="loom/closure/v1")
 
 
 class ClosureContract(ContractModel):
@@ -436,7 +513,6 @@ class ClosureVersion(ContractModel):
     snapshot: TaskClosure
     snapshot_digest: str
     patch_cursor: int = 0
-    registry_digest: str = ""
 
 
 class Execution(ContractModel):

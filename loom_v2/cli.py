@@ -29,17 +29,17 @@ class _SelfTestContentStore:
         body = content if isinstance(content, bytes) else content.encode("utf-8") if isinstance(content, str) else canonical_json_bytes(content)
         digest = ContentStore.digest(body)
         self.values.setdefault(digest, (body, media_type))
-        return ResourceRef(resource_id=f"content://sha256/{digest}", version_or_digest=digest, identity_criterion="content_digest")
+        return ResourceRef(resource_id=f"content://sha256/{digest}", identity_criterion="content_digest")
 
     async def get(self, ref: ResourceRef, *, expected_digest: str | None = None) -> bytes:
-        digest = (expected_digest or ref.version_or_digest or ref.resource_id.rsplit("/", 1)[-1]).lower()
+        digest = (expected_digest or ref.digest or ref.resource_id.rsplit("/", 1)[-1]).lower()
         body = self.values[digest][0]
         if expected_digest is not None and ContentStore.digest(body) != expected_digest.lower():
             raise ValueError("content_digest_mismatch")
         return body
 
     async def stat(self, ref: ResourceRef) -> ContentStat | None:
-        digest = (ref.version_or_digest or ref.resource_id.rsplit("/", 1)[-1]).lower()
+        digest = (ref.digest or ref.resource_id.rsplit("/", 1)[-1]).lower()
         value = self.values.get(digest)
         if value is None:
             return None

@@ -86,7 +86,6 @@ class DynamicToolProvider:
                     "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
                     "capability_package_ref": {"resource_id": "capability-package://remote-run-code/v1"},
                     "target_resource_ref": {"resource_id": "slave-a"},
-                    "realization_digest": program["resource_ref"]["version_or_digest"],
                 }}, {"kind": "set_execution_payload", "value": {"node_id": operation_ref, "input_ref": input_content["resource_ref"]}}]
             },
         )
@@ -123,7 +122,6 @@ class RecordingContentStore:
         digest = "a" * 64
         return ResourceRef(
             resource_id=f"content://sha256/{digest}",
-            version_or_digest=digest,
             identity_criterion="content_digest",
         )
 
@@ -239,12 +237,11 @@ async def test_remote_thread_initialization_failure_marks_claim_failed():
             return None
 
     class ClaimingRepositoryControl(RepositoryControl):
-        async def claim_message(self, request_id, payload_digest, *, conversation_ref=None, claim_token):
+        async def claim_message(self, request_id, *, conversation_ref=None, claim_token):
             return await self.command(
                 "message.claim",
                 {
                     "request_id": request_id,
-                    "payload_digest": payload_digest,
                     "conversation_ref": conversation_ref,
                     "claim_token": claim_token,
                 },
@@ -277,7 +274,7 @@ async def test_remote_thread_initialization_failure_marks_claim_failed():
 
     service = DriverService(control, FailingProvider())
     with pytest.raises(RuntimeError, match="codex_thread_unavailable"):
-        await service.run_prompt(conversation_ref, receipt.prompt, request_id=request_id, payload_digest=receipt.payload_digest)
+        await service.run_prompt(conversation_ref, receipt.prompt, request_id=request_id)
 
     persisted = await repository.get_message_receipt(control.workspace_id, request_id)
     assert persisted is not None

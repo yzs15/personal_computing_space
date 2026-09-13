@@ -23,6 +23,7 @@ from loom_v2.contracts.types import (
     CapabilityPackageActivation,
     CapabilityPackageVersion,
     FunctionCapabilityPackageBody,
+    ServiceCapabilityPackageBody,
     ExecutionContract,
     ClosureContract,
     ClosureVersion,
@@ -40,9 +41,10 @@ from loom_v2.contracts.types import (
 from loom_v2.db.base import Base
 from loom_v2.db.models import DriverRequestRow, DriverThreadRow, IdempotencyRow, MessageReceiptRow, RunRow, RuntimeAgentRow
 from loom_v2.contracts.agents import AgentLease, AgentRegistration, DriverCommand, DriverThreadBinding
-from loom_v2.contracts.messages import MessageReceipt, MessageReceiptState, message_payload_digest
+from loom_v2.contracts.messages import MessageReceipt, MessageReceiptState
 from loom_v2.db.session import make_session_factory
 from loom_v2.content_store import ContentStore, canonical_json_bytes
+from loom_v2.digest import digest_bytes
 from loom_v2.contracts.io_schema import ValidationError as SchemaValidationError, validate, validate_schema
 from loom_v2.settings import Settings
 from loom_v2.slave.executor import default_registry
@@ -259,7 +261,7 @@ class ObserverRepository:
         values = {
             column: getattr(row, column)
             for column in (
-                "workspace_id", "request_id", "conversation_ref", "prompt", "payload_digest", "state",
+                "workspace_id", "request_id", "conversation_ref", "prompt", "state",
                 "run_id", "assistant_text", "outcome", "claim_token", "attempt_count",
                 "next_attempt_at", "created_at", "updated_at",
             )
@@ -338,10 +340,9 @@ class ObserverRepository:
         conversation_ref: str,
         prompt: str,
     ) -> MessageReceipt:
-        digest = message_payload_digest(conversation_ref, prompt)
         existing = await self._load_message_receipt(workspace_id, request_id)
         if existing is not None:
-            if existing.payload_digest != digest or existing.conversation_ref != conversation_ref or existing.prompt != prompt:
+            if existing.conversation_ref != conversation_ref or existing.prompt != prompt:
                 raise ValueError("request_id_reused")
             return existing
         now = datetime.now(timezone.utc)
@@ -350,7 +351,6 @@ class ObserverRepository:
             request_id=request_id,
             conversation_ref=conversation_ref,
             prompt=prompt,
-            payload_digest=digest,
             state="accepted",
             attempt_count=0,
             next_attempt_at=now,
@@ -369,7 +369,7 @@ class ObserverRepository:
                 existing = await self._load_message_receipt(workspace_id, request_id)
                 if existing is None:
                     raise
-                if existing.payload_digest != digest:
+                if existing.conversation_ref != conversation_ref or existing.prompt != prompt:
                     raise ValueError("request_id_reused")
                 return existing
         else:
@@ -490,7 +490,6 @@ class ObserverRepository:
         workspace_id: str,
         request_id: str,
         *,
-        payload_digest: str,
         claim_token: str,
         conversation_ref: str | None = None,
     ) -> MessageReceipt:
@@ -498,7 +497,6 @@ class ObserverRepository:
             return await self._claim_message_receipt(
                 workspace_id,
                 request_id,
-                payload_digest=payload_digest,
                 claim_token=claim_token,
                 conversation_ref=conversation_ref,
             )
@@ -508,15 +506,12 @@ class ObserverRepository:
         workspace_id: str,
         request_id: str,
         *,
-        payload_digest: str,
         claim_token: str,
         conversation_ref: str | None = None,
     ) -> MessageReceipt:
         receipt = await self._load_message_receipt(workspace_id, request_id)
         if receipt is None:
             raise KeyError(request_id)
-        if receipt.payload_digest != payload_digest:
-            raise ValueError("request_id_reused")
         if conversation_ref is not None and receipt.conversation_ref != conversation_ref:
             raise ValueError("request_id_reused")
         if receipt.state in {"completed", "failed", "interrupted"}:
@@ -1236,7 +1231,6 @@ class ObserverRepository:
             receipt = await self.claim_message_receipt(
                 workspace_id,
                 str(args["request_id"]),
-                payload_digest=str(args["payload_digest"]),
                 claim_token=str(args["claim_token"]),
                 conversation_ref=args.get("conversation_ref"),
             )
@@ -1527,7 +1521,6 @@ class ObserverRepository:
                         parent_execution_ref=str(event.get("execution_id") or ""),
                         intent_id=str(event.get("intent_id") or ""),
                         package_ref=package_ref,
-                        package_digest=str(event.get("package_digest") or ""),
                         input_refs=input_refs,
                         state="accepted",
                     )
@@ -1743,7 +1736,8 @@ class ObserverRepository:
             return True
         return (
             reusable.package_version == f"{candidate.package_version}-reusable"
-            and reusable.function_body.program_digest == candidate.function_body.program_digest
+            and reusable.package_type == candidate.package_type
+            and reusable.package_digest == candidate.package_digest
             and reusable.source_run_ref == candidate.source_run_ref
             and reusable.source_closure_version_ref == candidate.source_closure_version_ref
         )
@@ -1767,11 +1761,7 @@ class ObserverRepository:
 
     def _find_package(self, package_ref: str | ResourceRef, *, run_id: str | None = None) -> CapabilityPackageVersion | None:
         resource_id = package_ref.resource_id if isinstance(package_ref, ResourceRef) else package_ref
-        digest = (
-            package_ref.version_or_digest.lower()
-            if isinstance(package_ref, ResourceRef) and package_ref.version_or_digest
-            else None
-        )
+        digest = package_ref.digest if isinstance(package_ref, ResourceRef) and package_ref.digest else None
         candidates: list[CapabilityPackageVersion] = []
         for record in self.runs.values():
             for package in record.capability_packages:
@@ -1784,7 +1774,6 @@ class ObserverRepository:
                     package.package_version,
                     package.package_closure_version_ref,
                     package.package_digest,
-                    package.function_body.program_digest,
                 }:
                     continue
                 if digest is not None and digest != package.package_digest.lower():
@@ -1865,12 +1854,13 @@ class ObserverRepository:
 
             if candidate.publication_state == "abandoned":
                 raise ValueError("capability_package_abandoned")
-            if approved_digest and approved_digest not in {candidate.package_digest, candidate.function_body.program_digest}:
+            if approved_digest and approved_digest != candidate.package_digest:
                 raise ValueError("promotion_digest_mismatch")
-            if not candidate.function_body.semantic_closed:
-                raise ValueError("package_promotion_denied:semantic_not_closed")
-            if candidate.function_body.captures_run_state or candidate.function_body.captured_secret_refs or candidate.function_body.captured_path_refs:
-                raise ValueError("package_captures_run_state")
+            if isinstance(candidate.body, FunctionCapabilityPackageBody):
+                if not candidate.function_body.semantic_closed:
+                    raise ValueError("package_promotion_denied:semantic_not_closed")
+                if candidate.function_body.captures_run_state or candidate.function_body.captured_secret_refs or candidate.function_body.captured_path_refs:
+                    raise ValueError("package_captures_run_state")
             source_record = next(
                 (
                     record
@@ -1935,23 +1925,31 @@ class ObserverRepository:
             raise KeyError(report.package_version_ref)
         activation_ref = package.version_ref
         current = next((item for item in record.capability_activations if item.package_version_ref == activation_ref and item.target_slave == report.target_slave), None)
-        if current is not None and report.session_generation < current.runtime_profile.get("session_generation", report.session_generation):
+        if current is not None and report.session_generation < current.session_generation:
             raise ValueError("stale_session_generation")
         activation = CapabilityPackageActivation(
             package_version_ref=activation_ref,
+            package_digest=package.package_digest,
             target_slave=report.target_slave,
             activation_closure_version_ref=package.package_closure_version_ref,
             compute_binding_ref="",
+            session_generation=report.session_generation,
             evidence_refs=list(report.evidence_refs),
             activation_state=report.activation_state,
-            runtime_profile={**(dict(report.details.get("runtime_profile", {})) if isinstance(report.details, dict) else {}), "session_generation": report.session_generation},
+            runtime_profile=dict(report.details.get("runtime_profile", {})) if isinstance(report.details, dict) else {},
         )
         record.capability_activations = [item for item in record.capability_activations if not (item.package_version_ref == activation_ref and item.target_slave == report.target_slave)]
         record.capability_activations.append(activation)
         if report.activation_state == "ready" and package.scope == "workspace_reusable" and package.publication_state == "published":
-            operation_ref = package.function_body.operation_descriptor_ref
-            operation_name = operation_ref.resource_id if isinstance(operation_ref, ResourceRef) else str(operation_ref)
-            self.slave_capabilities.setdefault(report.target_slave, {}).setdefault("operations", set()).add(self._operation_name(operation_name))
+            operations: list[str] = []
+            if isinstance(package.body, FunctionCapabilityPackageBody):
+                operation_ref = package.body.operation_descriptor_ref
+                operations.append(operation_ref.resource_id if isinstance(operation_ref, ResourceRef) else str(operation_ref))
+            elif isinstance(package.body, ServiceCapabilityPackageBody):
+                operations.extend(endpoint.operation_descriptor_ref.resource_id for endpoint in package.body.endpoints)
+            self.slave_capabilities.setdefault(report.target_slave, {}).setdefault("operations", set()).update(
+                self._operation_name(operation) for operation in operations
+            )
         record.events.append({"phase": "capability_health_report", "package_ref": activation_ref, "target_slave": report.target_slave, "activation_state": report.activation_state, "evidence_refs": report.evidence_refs, "created_at": datetime.now(timezone.utc).isoformat()})
         await self._persist(record)
         return activation
@@ -1965,11 +1963,11 @@ class ObserverRepository:
     def _input_digest_for(cls, snapshot: TaskClosure) -> str | None:
         operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
         binding = cls._input_binding_for(snapshot, operation_ref)
-        return binding.input_ref.version_or_digest if binding is not None else None
+        return binding.input_ref.digest if binding is not None else None
 
     @staticmethod
     def _result_digest(value: Any) -> str:
-        return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+        return digest_bytes(canonical_json_bytes(value))
 
     @staticmethod
     def _check_attempt_budget(record: RunRecord) -> None:
@@ -1990,7 +1988,7 @@ class ObserverRepository:
         if not ref.resource_id.startswith(prefix):
             raise ValueError("content_ref_required")
         resource_digest = ref.resource_id.removeprefix(prefix)
-        digest = ref.version_or_digest or ""
+        digest = ref.digest or ""
         if len(digest) != 64 or any(char not in "0123456789abcdefABCDEF" for char in digest):
             raise ValueError("content_ref_required")
         if resource_digest.lower() != digest.lower():
@@ -2001,11 +1999,11 @@ class ObserverRepository:
     @classmethod
     def _collect_content_ref_digests(cls, value: Any, output: set[str]) -> None:
         if isinstance(value, dict):
-            if "resource_id" in value and "version_or_digest" in value:
+            if "resource_id" in value:
                 try:
                     ref = ResourceRef.model_validate(value)
                     cls._require_content_ref(ref)
-                    output.add((ref.version_or_digest or "").lower())
+                    output.add((ref.digest or "").lower())
                 except (TypeError, ValueError):
                     pass
             for item in value.values():
@@ -2032,7 +2030,7 @@ class ObserverRepository:
     ) -> dict[str, Any]:
         blocker: dict[str, Any] = {
             "code": code,
-            "schema_digest": schema_ref.version_or_digest,
+            "schema_digest": schema_ref.digest,
             "errors": [item.model_dump(mode="json") for item in (errors or [])],
         }
         if input_ref is not None:
@@ -2059,7 +2057,7 @@ class ObserverRepository:
                 {
                     "code": "payload_missing",
                     "node_id": operation_ref or "default",
-                    "schema_digest": schema_ref.version_or_digest,
+                    "schema_digest": schema_ref.digest,
                 }
             )
             return blockers
@@ -2127,8 +2125,8 @@ class ObserverRepository:
         if (
             closure_contract_ref is None
             or package_contract_ref is None
-            or (closure_contract_ref.version_or_digest or closure_contract_ref.resource_id)
-            != (package_contract_ref.version_or_digest or package_contract_ref.resource_id)
+            or (closure_contract_ref.digest or closure_contract_ref.resource_id)
+            != (package_contract_ref.digest or package_contract_ref.resource_id)
         ):
             blockers.append({"code": "io_contract_mismatch", "package_ref": self._package_ref(package)})
         stat = await self.content_store.stat(package.function_body.program_content_ref)
@@ -2255,8 +2253,8 @@ class ObserverRepository:
                 if (
                     closure_contract_ref is None
                     or package_contract_ref is None
-                    or (closure_contract_ref.version_or_digest or closure_contract_ref.resource_id)
-                    != (package_contract_ref.version_or_digest or package_contract_ref.resource_id)
+                    or (closure_contract_ref.digest or closure_contract_ref.resource_id)
+                    != (package_contract_ref.digest or package_contract_ref.resource_id)
                 ):
                     blockers.append(
                         {
@@ -2271,16 +2269,12 @@ class ObserverRepository:
                 stat = await self.content_store.stat(package.function_body.program_content_ref)
                 if stat is None or not stat.integrity_verified or stat.declared_digest != package.function_body.program_digest:
                     blockers.append({"code": "package_content_unavailable", "hole_id": hole.hole_id})
-                if binding.realization_digest and binding.realization_digest not in {package.function_body.program_digest, package.package_digest}:
-                    blockers.append({"code": "capability_package_digest_mismatch", "hole_id": hole.hole_id})
                 if package.function_body.provider_fillable_hole_refs and not binding.runtime_profile:
                     blockers.append({"code": "provider_fillable_hole_unbound", "hole_id": hole.hole_id, "hole_refs": package.function_body.provider_fillable_hole_refs})
                 if "run_code" not in capability.get("operations", set()):
                     blockers.append({"code": "capability_unavailable", "operation": "run_code", "target_resource_ref": target})
                 try:
-                    expected_executor_digest = default_registry.get(package.execution).descriptor.digest
-                    if binding.executor_descriptor_digest and binding.executor_descriptor_digest != expected_executor_digest:
-                        blockers.append({"code": "executor_descriptor_mismatch", "hole_id": hole.hole_id})
+                    default_registry.get(package.execution)
                 except ValueError:
                     blockers.append({"code": "executor_unavailable", "execution_kind": package.execution.kind})
                 descriptor_ref = package.function_body.operation_descriptor_ref
@@ -2718,10 +2712,6 @@ class ObserverRepository:
                 else:
                     raise ValueError("program_content_ref_required")
                 self._require_content_ref(program_ref)
-                expected_digest = str(value.get("program_digest") or "")
-                actual_digest = program_ref.version_or_digest or ""
-                if expected_digest and expected_digest != actual_digest:
-                    raise ValueError("program_digest_mismatch")
                 operation_ref = value.get("operation_descriptor_ref") or snapshot.program.operation_ref or snapshot.compute.operation_ref
                 if isinstance(operation_ref, dict):
                     operation_ref = ResourceRef.model_validate(operation_ref)
@@ -2730,7 +2720,6 @@ class ObserverRepository:
                 descriptor_identity = operation_ref.resource_id if isinstance(operation_ref, ResourceRef) else str(operation_ref)
                 if not descriptor_identity:
                     raise ValueError("operation_descriptor_required")
-                descriptor_digest = str(value.get("operation_descriptor_digest") or hashlib.sha256(descriptor_identity.encode()).hexdigest())
                 allowed_node_package_refs = [ResourceRef.model_validate(item) for item in value.get("allowed_node_package_refs", [])]
                 max_nodes = value.get("max_nodes")
                 max_live_nodes = value.get("max_live_nodes")
@@ -2746,9 +2735,7 @@ class ObserverRepository:
                     execution=execution,
                     body=FunctionCapabilityPackageBody(
                         operation_descriptor_ref=operation_ref,
-                        operation_descriptor_digest=descriptor_digest,
                         program_content_ref=program_ref,
-                        program_digest=actual_digest,
                         io_contract_ref=io_contract_ref,
                         effective_constraint_refs=[Constraint.model_validate(item).ref() if isinstance(item, dict) else ConstraintRef.model_validate(item) for item in value.get("effective_constraint_refs", [])],
                         provider_fillable_hole_refs=[str(item) for item in value.get("provider_fillable_hole_refs", [])],
@@ -2982,18 +2969,18 @@ class ObserverRepository:
         if result.get("execution_id") != record.execution_id:
             raise ValueError("stale_execution_id")
 
-        if "value" not in result or "digest" not in result:
+        if "value" not in result:
             raise ValueError("output_missing")
+        if "digest" in result:
+            raise ValueError("redundant_result_digest")
         expected_digest = self._result_digest(result["value"])
-        if result.get("digest") != expected_digest:
-            raise ValueError("output_digest_mismatch")
         raw_resource_ref = result.get("resource_ref")
         if raw_resource_ref is not None:
             try:
                 resource_ref = ResourceRef.model_validate(raw_resource_ref)
             except Exception as exc:
                 raise ValueError("invalid_resource_ref") from exc
-            if resource_ref.version_or_digest != expected_digest:
+            if resource_ref.digest != expected_digest:
                 raise ValueError("resource_ref_digest_mismatch")
 
         # Validate Slave-produced evidence before accepting it.  Evidence is
@@ -3012,7 +2999,7 @@ class ObserverRepository:
                 raise ValueError("stale_validation_evidence")
             if parsed.issuer != "slave":
                 raise ValueError("invalid_validation_evidence")
-            output_digest = result.get("digest")
+            output_digest = expected_digest
             if parsed.output_digest is not None and output_digest is not None and parsed.output_digest != output_digest:
                 raise ValueError("validation_evidence_digest_mismatch")
             evidence.append(parsed.model_dump(mode="json"))
@@ -3032,7 +3019,7 @@ class ObserverRepository:
         def _same_ref(left: ResourceRef | None, right: ResourceRef | None) -> bool:
             if left is None or right is None:
                 return left is right
-            return (left.version_or_digest or left.resource_id) == (right.version_or_digest or right.resource_id)
+            return (left.digest or left.resource_id) == (right.digest or right.resource_id)
 
         for item in evidence:
             parsed_schema = ResourceRef.model_validate(item["schema_ref"]) if item.get("schema_ref") is not None else None
@@ -3070,7 +3057,7 @@ class ObserverRepository:
                 validator_ref=contract.success_validator_ref if contract else None,
                 schema_ref=output_schema_ref,
                 input_digest=self._input_digest_for(snapshot) if snapshot is not None else None,
-                output_digest=result.get("digest"),
+                output_digest=expected_digest,
                 result="fail" if schema_errors else "pass",
                 errors=[item.model_dump(mode="json") for item in schema_errors],
                 issuer="observer",
@@ -3141,7 +3128,7 @@ class ObserverRepository:
                 validator_ref=expected_validator_ref,
                 schema_ref=output_schema_ref,
                 input_digest=expected_input_digest,
-                output_digest=result.get("digest"),
+                output_digest=expected_digest,
                 result="pass" if validator_status == "pass" else "fail",
                 errors=validator_errors,
                 issuer="observer",
@@ -3288,9 +3275,7 @@ class ObserverRepository:
             "parent_execution_ref": record.execution_id,
             "closure_version_ref": record.committed.version_id if record.committed is not None else record.draft.version_id,
             "orchestration_package_ref": package_ref.model_dump(mode="json") if package_ref is not None else None,
-            "orchestration_package_digest": package.package_digest if package is not None else None,
             "orchestration_program_ref": package.function_body.program_content_ref.model_dump(mode="json") if package is not None else None,
-            "orchestration_program_digest": package.function_body.program_digest if package is not None else None,
         }
 
     async def accept_node_intent(
@@ -3369,8 +3354,8 @@ class ObserverRepository:
             raise ValueError("orchestration_live_node_limit_exceeded")
 
         def same_ref(left: ResourceRef, right: ResourceRef) -> bool:
-            left_digest = (left.version_or_digest or "").lower()
-            right_digest = (right.version_or_digest or "").lower()
+            left_digest = (left.digest or "").lower()
+            right_digest = (right.digest or "").lower()
             return left.resource_id == right.resource_id and left_digest == right_digest
 
         if not any(same_ref(intent.package_ref, allowed) for allowed in orchestration_package.function_body.allowed_node_package_refs):
@@ -3379,7 +3364,7 @@ class ObserverRepository:
             node_package = await self.get_capability_package(intent.package_ref, run_id=run_id)
         except KeyError as exc:
             raise ValueError("node_package_not_found") from exc
-        if (intent.package_ref.version_or_digest or "").lower() != node_package.package_digest.lower():
+        if (intent.package_ref.digest or "").lower() != node_package.package_digest.lower():
             raise ValueError("node_package_digest_mismatch")
         if not self._package_visible_to_run(node_package, record.run_id):
             raise ValueError("capability_package_scope_mismatch")
@@ -3423,7 +3408,7 @@ class ObserverRepository:
         for binding in snapshot.node_input_bindings:
             try:
                 self._require_content_ref(binding.input_ref)
-                authorized_digests.add((binding.input_ref.version_or_digest or "").lower())
+                authorized_digests.add((binding.input_ref.digest or "").lower())
                 root_value = await self._load_json_content(binding.input_ref)
             except (FileNotFoundError, TypeError, ValueError):
                 continue
@@ -3434,7 +3419,7 @@ class ObserverRepository:
             try:
                 result_ref = ResourceRef.model_validate(attempt["result_ref"])
                 self._require_content_ref(result_ref)
-                authorized_digests.add((result_ref.version_or_digest or "").lower())
+                authorized_digests.add((result_ref.digest or "").lower())
             except (TypeError, ValueError):
                 continue
         for input_ref in intent.input_refs:
@@ -3443,7 +3428,7 @@ class ObserverRepository:
                 await self._load_json_content(input_ref)
             except (FileNotFoundError, TypeError, ValueError) as exc:
                 raise ValueError("node_input_unavailable") from exc
-            if (input_ref.version_or_digest or "").lower() not in authorized_digests:
+            if (input_ref.digest or "").lower() not in authorized_digests:
                 raise ValueError("node_input_not_allowed")
 
         if not isinstance(selected_target, str) or not selected_target:
@@ -3477,7 +3462,6 @@ class ObserverRepository:
             parent_execution_ref=record.execution_id,
             intent_id=intent.intent_id,
             package_ref=intent.package_ref,
-            package_digest=node_package.package_digest,
             input_refs=intent.input_refs,
             state="accepted",
         )
@@ -3493,14 +3477,12 @@ class ObserverRepository:
                     "node_id": node.node_id,
                     "intent_id": intent.intent_id,
                     "package_ref": intent.package_ref.model_dump(mode="json"),
-                    "package_digest": node.package_digest,
                     "input_refs": [item.model_dump(mode="json") for item in intent.input_refs],
                     "selected_target": target,
                     "reason": "capability_match",
                     "provenance": {
                         **provenance,
                         "node_package_ref": node.package_ref.model_dump(mode="json"),
-                        "node_package_digest": node.package_digest,
                     },
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 },
@@ -3566,12 +3548,10 @@ class ObserverRepository:
                 "target_instance_id": attempt["target_instance_id"],
                 "target_agent_epoch": attempt["target_agent_epoch"],
                 "package_ref": node.package_ref.model_dump(mode="json"),
-                "package_digest": node.package_digest,
                 "input_refs": [item.model_dump(mode="json") for item in node.input_refs],
                 "provenance": {
                     **self._orchestration_provenance(record),
                     "node_package_ref": node.package_ref.model_dump(mode="json"),
-                    "node_package_digest": node.package_digest,
                 },
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -3730,7 +3710,6 @@ class ObserverRepository:
                         "origin_conversation_ref": contract.origin_conversation_ref if contract is not None else updated.task_ref,
                     },
                     "package_ref": updated_node.package_ref.model_dump(mode="json"),
-                    "package_digest": updated_node.package_digest,
                     "package_replay_safety": package.function_body.replay_safety,
                     "input_refs": [item.model_dump(mode="json") for item in updated_node.input_refs],
                     "created_at": datetime.now(timezone.utc).isoformat(),
@@ -3770,12 +3749,12 @@ class ObserverRepository:
             raise ValueError("stale_attempt")
         if attempt.get("state") not in {"created", "running"}:
             raise ValueError("stale_attempt")
-        if "value" not in result or "digest" not in result:
+        if "value" not in result:
             raise ValueError("output_missing")
+        if "digest" in result:
+            raise ValueError("redundant_result_digest")
         value = result["value"]
         expected_digest = self._result_digest(value)
-        if result.get("digest") != expected_digest:
-            raise ValueError("output_digest_mismatch")
         reported_terminal_state = str(result.get("terminal_state") or "completed")
         if reported_terminal_state not in {"completed", "failed", "decision_required"}:
             raise ValueError("invalid_terminal_state")
@@ -3805,7 +3784,7 @@ class ObserverRepository:
             node_package = await self.get_capability_package(node.package_ref, run_id=run_id)
         except KeyError as exc:
             raise ValueError("node_package_not_found") from exc
-        if node_package.package_digest != node.package_digest:
+        if node_package.package_digest != (node.package_ref.digest or ""):
             raise ValueError("node_package_digest_mismatch")
         if node_package.function_body.io_contract_ref is None:
             raise ValueError("node_io_contract_unavailable")
@@ -3815,7 +3794,7 @@ class ObserverRepository:
             def same_ref(left: ResourceRef | None, right: ResourceRef | None) -> bool:
                 if left is None or right is None:
                     return left is right
-                return (left.version_or_digest or left.resource_id) == (right.version_or_digest or right.resource_id)
+                return (left.digest or left.resource_id) == (right.digest or right.resource_id)
 
             for item in validation_evidence:
                 evidence_schema = ResourceRef.model_validate(item["schema_ref"]) if item.get("schema_ref") is not None else None
@@ -3898,7 +3877,6 @@ class ObserverRepository:
         attempt["state"] = terminal_state
         attempt["result_ref"] = result_ref.model_dump(mode="json")
         attempt["value"] = value
-        attempt["digest"] = expected_digest
         attempt["terminal_error"] = terminal_error
         attempt["validation_evidence"] = validation_evidence
         node.state = terminal_state
@@ -3911,7 +3889,6 @@ class ObserverRepository:
                 "terminal_error": terminal_error,
                 "resource_ref": result_ref.model_dump(mode="json") if decision == "attestation" else None,
                 "value": value,
-                "digest": expected_digest,
                 "node_id": node_id,
                 "attempt_id": attempt_id,
                 "execution_id": record.execution_id,
@@ -3928,17 +3905,14 @@ class ObserverRepository:
                 "target": attempt.get("target"),
                 "execution_epoch": execution_epoch,
                 "package_ref": node.package_ref.model_dump(mode="json"),
-                "package_digest": node.package_digest,
                 "input_refs": [item.model_dump(mode="json") for item in node.input_refs],
                 "result_ref": result_ref.model_dump(mode="json"),
-                "digest": expected_digest,
                 "terminal_state": terminal_state,
                 "terminal_error": terminal_error,
                 "validation_evidence": validation_evidence,
                 "provenance": {
                     **self._orchestration_provenance(record),
                     "node_package_ref": node.package_ref.model_dump(mode="json"),
-                    "node_package_digest": node.package_digest,
                     "attempt_id": attempt_id,
                     "target": attempt.get("target"),
                     "slave_id": attempt.get("target"),
@@ -4003,14 +3977,12 @@ class ObserverRepository:
                 "target": failed_attempt.get("target") if failed_attempt is not None else None,
                 "execution_epoch": record.execution_epoch,
                 "package_ref": node.package_ref.model_dump(mode="json"),
-                "package_digest": node.package_digest,
                 "input_refs": [item.model_dump(mode="json") for item in node.input_refs],
                 "terminal_state": "failed",
                 "terminal_error": reason,
                 "provenance": {
                     **self._orchestration_provenance(record),
                     "node_package_ref": node.package_ref.model_dump(mode="json"),
-                    "node_package_digest": node.package_digest,
                     "attempt_id": attempt_id,
                     "target": failed_attempt.get("target") if failed_attempt is not None else None,
                 },
@@ -4069,14 +4041,14 @@ class ObserverRepository:
                 )
             ]
         digest = self._result_digest(value) if final_loaded else ""
-        if final_loaded and (final_ref.version_or_digest or "").lower() != digest:
+        if final_loaded and (final_ref.digest or "").lower() != digest:
             schema_errors.append(
                 SchemaValidationError(
                     path="$",
                     keyword="digest",
                     message="final ref digest mismatch",
                     expected=digest,
-                    observed=final_ref.version_or_digest,
+                    observed=final_ref.digest,
                 )
             )
         orchestration_package = self._find_package(snapshot.program_systems.package_ref, run_id=run_id) if snapshot.program_systems.package_ref else None
@@ -4097,13 +4069,12 @@ class ObserverRepository:
             if attempt is None:
                 continue
             result_ref = ResourceRef.model_validate(attempt["result_ref"])
-            completed_digests.add((result_ref.version_or_digest or "").lower())
+            completed_digests.add((result_ref.digest or "").lower())
             lineage.append(
                 {
                     "node_id": node.node_id,
                     "intent_id": node.intent_id,
                     "package_ref": node.package_ref.model_dump(mode="json"),
-                    "package_digest": node.package_digest,
                     "input_refs": [item.model_dump(mode="json") for item in node.input_refs],
                     "attempt_id": attempt.get("attempt_id"),
                     "target": attempt.get("target"),
@@ -4112,7 +4083,6 @@ class ObserverRepository:
                     "provenance": {
                         **orchestration_provenance,
                         "node_package_ref": node.package_ref.model_dump(mode="json"),
-                        "node_package_digest": node.package_digest,
                         "attempt_id": attempt.get("attempt_id"),
                         "target": attempt.get("target"),
                         "slave_id": attempt.get("target"),
@@ -4198,7 +4168,6 @@ class ObserverRepository:
                 "terminal_error": None,
                 "resource_ref": final_ref.model_dump(mode="json"),
                 "value": value,
-                "digest": digest,
                 "execution_id": record.execution_id,
                 "execution_epoch": record.execution_epoch,
                 "provenance": orchestration_provenance,
@@ -4224,12 +4193,11 @@ class ObserverRepository:
             "decision": None,
             "resource_ref": final_ref.model_dump(mode="json"),
             "value": value,
-                "digest": digest,
-                "execution_id": record.execution_id,
-                "execution_epoch": record.execution_epoch,
-                "lineage": lineage,
-                "provenance": orchestration_provenance,
-            }
+            "execution_id": record.execution_id,
+            "execution_epoch": record.execution_epoch,
+            "lineage": lineage,
+            "provenance": orchestration_provenance,
+        }
         record.events.append(
             {
                 "phase": "orchestration_completed",

@@ -14,7 +14,6 @@ class _PendingTurn:
     request_id: str
     conversation_ref: str
     prompt: str
-    payload_digest: str
     claim_token: str
     future: asyncio.Future[Any]
     cancelled: bool = False
@@ -58,7 +57,6 @@ class DriverTurnCoordinator:
         request_id = str(self._value(receipt, "request_id"))
         conversation_ref = str(self._value(receipt, "conversation_ref"))
         prompt = str(prompt if prompt is not None else self._value(receipt, "prompt", self._value(receipt, "text", "")))
-        payload_digest = str(self._value(receipt, "payload_digest", ""))
         submit_lock = self._submit_locks.setdefault(request_id, asyncio.Lock())
         async with submit_lock:
             completed = self._completed.get(request_id)
@@ -70,7 +68,6 @@ class DriverTurnCoordinator:
                 if self.control_client is not None:
                     claim = await self.control_client.claim_message(
                         request_id,
-                        payload_digest,
                         conversation_ref=conversation_ref,
                         claim_token=claim_token,
                     )
@@ -86,7 +83,7 @@ class DriverTurnCoordinator:
                     claim_token = str(claim.get("claim_token") or claim_token)
                 loop = asyncio.get_running_loop()
                 future: asyncio.Future[Any] = loop.create_future()
-                pending = _PendingTurn(request_id, conversation_ref, prompt, payload_digest, claim_token, future)
+                pending = _PendingTurn(request_id, conversation_ref, prompt, claim_token, future)
                 self._pending_by_request[request_id] = future
                 self._queues[conversation_ref].append(pending)
                 worker = self._workers.get(conversation_ref)

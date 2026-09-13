@@ -169,7 +169,6 @@ class FakeCodingAgentProvider:
                         "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
                         "capability_package_ref": {"resource_id": "capability-package://fake-run-code/v1"},
                         "target_resource_ref": {"resource_id": "slave-a"},
-                        "realization_digest": program_ref.get("version_or_digest", ""),
                         "bound_by": "fake-driver",
                     },
                 },

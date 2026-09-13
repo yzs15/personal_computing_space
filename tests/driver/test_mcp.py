@@ -150,7 +150,6 @@ async def test_bind_compute_hole_accepts_capability_uri_target_for_registered_sl
                         "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
                         "capability_package_ref": {"resource_id": "capability-package://mcp-binding-package/v1"},
                         "target_resource_ref": {"resource_id": "loom://compute/slave-a"},
-                        "realization_digest": program["resource_ref"]["version_or_digest"],
                     },
                 }
             ]
@@ -207,13 +206,11 @@ async def test_start_run_returns_repair_outcome_as_successful_tool_call():
         digest = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
         return ExecutionResult(
             resource_ref=ResourceRef(
-                resource_id=f"result-{digest[:16]}",
-                version_or_digest=digest,
+                resource_id=f"content://sha256/{digest}",
                 identity_criterion="content_digest",
             ),
             value=payload,
             replay_safety="Idempotent",
-            digest=digest,
             terminal_state="failed",
             terminal_error={"code": "worker_failed"},
         )

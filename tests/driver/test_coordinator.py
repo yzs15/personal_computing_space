@@ -38,9 +38,9 @@ async def test_coordinator_fifo_and_global_lane():
 
     coordinator = DriverTurnCoordinator(provider, turn_executor=execute)
     receipts = [
-        {"request_id": "a1", "conversation_ref": "a", "prompt": "one", "payload_digest": "d1"},
-        {"request_id": "a2", "conversation_ref": "a", "prompt": "two", "payload_digest": "d2"},
-        {"request_id": "b1", "conversation_ref": "b", "prompt": "three", "payload_digest": "d3"},
+        {"request_id": "a1", "conversation_ref": "a", "prompt": "one"},
+        {"request_id": "a2", "conversation_ref": "a", "prompt": "two"},
+        {"request_id": "b1", "conversation_ref": "b", "prompt": "three"},
     ]
     results = await asyncio.gather(*(coordinator.submit(item) for item in receipts))
     assert [context.request_id for context in provider.contexts] == ["a1", "a2", "b1"] or [context.request_id for context in provider.contexts] == ["a1", "b1", "a2"]
@@ -58,9 +58,8 @@ async def test_duplicate_request_id_uses_one_context():
         return {"request_id": context.request_id}
 
     coordinator = DriverTurnCoordinator(provider, turn_executor=execute)
-    receipt = {"request_id": "same", "conversation_ref": "a", "prompt": "one", "payload_digest": "d"}
+    receipt = {"request_id": "same", "conversation_ref": "a", "prompt": "one"}
     first, second = await asyncio.gather(coordinator.submit(receipt), coordinator.submit(receipt))
     assert first == second
     assert len(provider.contexts) == 1
     await coordinator.shutdown()
-

@@ -109,7 +109,6 @@ async def test_observer_record_result_projects_schema_failure_to_awaiting_decisi
             "execution_id": record.execution_id,
             "execution_epoch": 1,
             "resource_ref": {"resource_id": f"result-{digest[:16]}", "version_or_digest": digest, "identity_criterion": "content_digest"},
-            "digest": digest,
             "value": value,
         },
     )
@@ -129,7 +128,7 @@ async def test_observer_recomputes_output_digest_and_resource_ref_identity():
     await repo.start(record.run_id, committed.version_id)
     attempt_id = (await repo.get_run(record.run_id)).attempts[0]["attempt_id"]
 
-    with pytest.raises(ValueError, match="output_digest_mismatch"):
+    with pytest.raises(ValueError, match="resource_ref_digest_mismatch"):
         await repo.record_result(
             record.run_id,
             {
@@ -137,7 +136,6 @@ async def test_observer_recomputes_output_digest_and_resource_ref_identity():
                 "execution_id": record.execution_id,
                 "execution_epoch": 1,
                 "resource_ref": {"resource_id": "result-forged", "version_or_digest": "f" * 64},
-                "digest": "f" * 64,
                 "value": {"text": "hello"},
             },
         )
@@ -155,7 +153,7 @@ async def test_observer_requires_execution_id_on_terminal_report():
     with pytest.raises(ValueError, match="stale_execution_id"):
         await repo.record_result(
             record.run_id,
-            {"attempt_id": attempt_id, "execution_epoch": 1, "value": {"text": "hello"}, "digest": "d"},
+            {"attempt_id": attempt_id, "execution_epoch": 1, "value": {"text": "hello"}},
         )
 
 
@@ -171,12 +169,12 @@ async def test_observer_rejects_stale_attempt_and_epoch_terminal_reports():
     with pytest.raises(ValueError, match="stale_attempt"):
         await repo.record_result(
             record.run_id,
-            {"attempt_id": "other-attempt", "execution_id": record.execution_id, "execution_epoch": 1, "value": {"text": "hello"}, "digest": "d"},
+            {"attempt_id": "other-attempt", "execution_id": record.execution_id, "execution_epoch": 1, "value": {"text": "hello"}},
         )
     with pytest.raises(ValueError, match="stale_execution_epoch"):
         await repo.record_result(
             record.run_id,
-            {"attempt_id": attempt_id, "execution_id": record.execution_id, "execution_epoch": 2, "value": {"text": "hello"}, "digest": "d"},
+            {"attempt_id": attempt_id, "execution_id": record.execution_id, "execution_epoch": 2, "value": {"text": "hello"}},
         )
 
 
@@ -221,7 +219,6 @@ async def test_observer_reexecutes_validator_instead_of_trusting_slave_evidence(
             "execution_id": current.execution_id,
             "execution_epoch": current.execution_epoch,
             "resource_ref": {"resource_id": f"result-{digest[:16]}", "version_or_digest": digest, "identity_criterion": "content_digest"},
-            "digest": digest,
             "value": value,
             "validation_evidence": [
                 {

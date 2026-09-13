@@ -113,7 +113,6 @@ class MessageReceiptRow(Base):
     request_id: Mapped[str] = mapped_column(String(256), primary_key=True)
     conversation_ref: Mapped[str] = mapped_column(String(256), nullable=False)
     prompt: Mapped[str] = mapped_column(Text, nullable=False)
-    payload_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     run_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     assistant_text: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -147,4 +146,3 @@ class SlaveReplicaRow(SlaveBase):
     slave_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False)
-    digest: Mapped[str] = mapped_column(String(256), nullable=False, default="")

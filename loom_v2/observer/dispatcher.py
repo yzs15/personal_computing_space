@@ -75,7 +75,6 @@ class ObserverMessageDispatcher:
             "request_id": queued.request_id,
             "conversation_ref": queued.conversation_ref,
             "text": queued.prompt,
-            "payload_digest": queued.payload_digest,
         }
         try:
             await self.gateway.forward(

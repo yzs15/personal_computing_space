@@ -16,7 +16,7 @@ from loom_v2.contracts.types import (
 )
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.driver.worker import WorkerSession, WorkerUnavailableError
-from loom_v2.slave.executor import ExecutionResult, default_registry
+from loom_v2.slave.executor import ExecutionResult
 from loom_v2.slave.service import SlaveService
 
 from .orchestrator import DockerOrchestrationExecutor, OrchestrationExecutorError, OrchestrationProgramError
@@ -107,7 +107,7 @@ class DynamicOrchestrationRuntime:
                     except KeyError:
                         raise RuntimeError("node_package_not_found") from exc
                     raise RuntimeError("capability_package_scope_mismatch") from exc
-                if package_ref.version_or_digest and package_ref.version_or_digest.lower() != candidate.package_digest.lower():
+                if package_ref.digest and package_ref.digest.lower() != candidate.package_digest.lower():
                     raise RuntimeError("node_package_digest_mismatch") from exc
                 node_package = candidate
             existing = next((node for node in record.dynamic_nodes if node.intent_id == intent_id), None)
@@ -215,7 +215,6 @@ class DynamicOrchestrationRuntime:
             resource_ref=final_ref,
             value=value,
             replay_safety=orchestration_package.function_body.replay_safety,
-            digest=final_ref.version_or_digest or "",
             terminal_state=terminal_state,
             terminal_error=completed.outcome.get("terminal_error") if completed.outcome else None,
         )
@@ -384,8 +383,6 @@ class DynamicOrchestrationRuntime:
             capability_descriptor_ref=ResourceRef(resource_id=operation_ref, identity_criterion="descriptor_digest"),
             capability_package_ref=node.package_ref,
             target_resource_ref=ResourceRef(resource_id=target),
-            realization_digest=node.package_digest,
-            executor_descriptor_digest=default_registry.get(package.execution).descriptor.digest,
         )
         closure = TaskClosure(
             closure_id=node.node_id,
@@ -402,7 +399,6 @@ class DynamicOrchestrationRuntime:
             workspace_id=record.closure_contract.workspace_id if record.closure_contract else "workspace-default",
             activation_closure_version_ref=record.committed.version_id if record.committed else package.package_closure_version_ref,
             compute_binding=binding,
-            program_content_ref=package.function_body.program_content_ref,
             idempotency_key=f"{record.execution_id}-{node.node_id}-{package.package_digest}",
         )
         operation = self.repository._operation_name(operation_ref)
@@ -444,7 +440,6 @@ class DynamicOrchestrationRuntime:
                 "execution_id": record.execution_id,
                 "execution_epoch": record.execution_epoch,
                 "value": result.value,
-                "digest": result.digest,
                 "terminal_state": result.terminal_state,
                 "terminal_error": result.terminal_error,
                 "validation_evidence": result.validation_evidence,

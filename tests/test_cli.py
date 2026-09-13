@@ -5,4 +5,4 @@ import sys
 def test_cli_self_test_runs_fake_vertical_slice():
     result = subprocess.run([sys.executable, "-m", "loom_v2.cli", "--self-test"], check=True, capture_output=True, text=True)
     assert '"state": "completed"' in result.stdout
-    assert '"resource_ref": "result-' in result.stdout
+    assert '"resource_ref": "content://sha256/' in result.stdout

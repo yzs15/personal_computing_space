@@ -372,7 +372,7 @@ class DockerOrchestrationExecutor:
     @staticmethod
     def _content_ref(value: Any, *, error_code: str) -> ResourceRef:
         ref = DockerOrchestrationExecutor._resource_ref(value, error_code=error_code)
-        digest = ref.version_or_digest or ""
+        digest = ref.digest or ""
         resource_digest = ref.resource_id.removeprefix("content://sha256/")
         if (
             not ref.resource_id.startswith("content://sha256/")

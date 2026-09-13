@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 
 from loom_v2.content_store import canonical_json_bytes
@@ -16,7 +15,6 @@ from loom_v2.contracts.types import (
     TypedHole,
 )
 from loom_v2.slave.service import SlaveService
-from loom_v2.slave.executor import default_registry
 
 
 DEFAULT_PROGRAM = b"""import json\nimport sys\n\npayload = json.load(sys.stdin)\nvalue = payload.get(\"value\", 0)\nprint(json.dumps({\"value\": value * 2}))\n"""
@@ -93,13 +91,10 @@ async def make_run_code_fixture(
         execution={"kind": "process:json_stdio", "version": "1"},
         body={
             "operation_descriptor_ref": operation_ref,
-            "operation_descriptor_digest": hashlib.sha256(operation_ref.resource_id.encode()).hexdigest(),
             "program_content_ref": program_ref,
-            "program_digest": program_ref.version_or_digest or "",
             "io_contract_ref": contract_ref,
         },
     )
-    descriptor_digest = default_registry.get(package.execution).descriptor.digest
     binding = ComputeBinding(
         binding_id=f"binding-{operation}",
         hole_id=f"hole-{operation}",
@@ -111,8 +106,6 @@ async def make_run_code_fixture(
             version_or_digest=package.package_digest,
         ),
         target_resource_ref=ResourceRef(resource_id=service.slave_id),
-        realization_digest=package.function_body.program_digest,
-        executor_descriptor_digest=descriptor_digest,
     )
     return RunCodeFixture(
         package=package,
@@ -132,7 +125,6 @@ async def provision_run_code_fixture(
             package_version_ref=fixture.package.version_ref,
             package_digest=fixture.package.package_digest,
             target_slave=service.slave_id,
-            program_content_ref=fixture.program_ref,
         ),
         fixture.package,
     )

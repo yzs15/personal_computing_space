@@ -149,10 +149,10 @@ class ObserverControlClient:
         command_request_id = f"turn-state:{conversation_ref}:{turn_state}:{request_id or uuid4().hex}"
         return await self.command("turn.state", {"conversation_ref": conversation_ref, "turn_state": turn_state, "request_id": request_id, "turn_id": turn_id}, request_id=command_request_id)
 
-    async def claim_message(self, request_id: str, payload_digest: str, *, conversation_ref: str | None = None, claim_token: str) -> dict[str, Any]:
+    async def claim_message(self, request_id: str, *, conversation_ref: str | None = None, claim_token: str) -> dict[str, Any]:
         return await self.command(
             "message.claim",
-            {"request_id": request_id, "conversation_ref": conversation_ref, "payload_digest": payload_digest, "claim_token": claim_token},
+            {"request_id": request_id, "conversation_ref": conversation_ref, "claim_token": claim_token},
             request_id=f"message-claim:{request_id}:{claim_token}",
         )
 

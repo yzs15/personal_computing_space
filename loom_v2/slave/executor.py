@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import signal
@@ -10,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from loom_v2.contracts.types import ExecutionContract, ResourceRef
-from loom_v2.content_store import canonical_json_bytes
+from loom_v2.digest import canonical_json_bytes, digest_bytes, digest_json
 
 
 @dataclass
@@ -18,11 +17,14 @@ class ExecutionResult:
     resource_ref: ResourceRef
     value: Any
     replay_safety: str
-    digest: str
     terminal_state: str = "completed"
     terminal_error: dict[str, Any] | None = None
     validation_evidence: list[dict[str, Any]] = field(default_factory=list)
     provenance: dict[str, Any] | None = None
+
+    @property
+    def digest(self) -> str:
+        return self.resource_ref.digest or ""
 
 
 @dataclass(frozen=True)
@@ -39,8 +41,10 @@ class ExecutorDescriptor:
 
     @property
     def digest(self) -> str:
-        payload = json.dumps({"kind": self.kind, "version": self.version, "operations": sorted(self.operations), "replay_safety": self.replay_safety, "effect_class": self.effect_class}, sort_keys=True, separators=(",", ":")).encode()
-        return hashlib.sha256(payload).hexdigest()
+        return digest_json(
+            {"kind": self.kind, "version": self.version, "operations": sorted(self.operations), "replay_safety": self.replay_safety, "effect_class": self.effect_class},
+            domain="loom/executor-descriptor/v1",
+        )
 
 
 class ExecutorAdapter(Protocol):
@@ -50,12 +54,11 @@ class ExecutorAdapter(Protocol):
 
 
 def _result(value: Any, replay_safety: str = "Idempotent") -> ExecutionResult:
-    digest = hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+    digest = digest_bytes(canonical_json_bytes(value))
     return ExecutionResult(
-        resource_ref=ResourceRef(resource_id=f"result-{digest[:16]}", version_or_digest=digest, identity_criterion="content_digest"),
+        resource_ref=ResourceRef(resource_id=f"content://sha256/{digest}", identity_criterion="content_digest"),
         value=value,
         replay_safety=replay_safety,
-        digest=digest,
     )
 
 

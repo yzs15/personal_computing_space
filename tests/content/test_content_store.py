@@ -37,7 +37,7 @@ async def test_put_is_content_addressed_and_idempotent(aws_store: ContentStore) 
 
     digest = hashlib.sha256(body).hexdigest()
     assert first.resource_id == f"content://sha256/{digest}"
-    assert first.version_or_digest == digest
+    assert first.digest == digest
     assert second == first
     assert first.identity_criterion == "content_digest"
     assert "endpoint_url" not in first.access_binding
@@ -67,14 +67,14 @@ async def test_get_exists_and_stat_verify_digest(aws_store: ContentStore) -> Non
     ref = await aws_store.put(body, media_type="application/octet-stream")
 
     assert await aws_store.exists(ref)
-    assert await aws_store.exists("sha256:" + ref.version_or_digest)
+    assert await aws_store.exists("sha256:" + (ref.digest or ""))
     stat = await aws_store.stat(ref)
     assert isinstance(stat, ContentStat)
     assert stat.size == len(body)
-    assert stat.declared_digest == ref.version_or_digest
+    assert stat.declared_digest == ref.digest
     assert stat.media_type == "application/octet-stream"
     assert stat.integrity_verified is True
-    assert await aws_store.get(ref, expected_digest=ref.version_or_digest) == body
+    assert await aws_store.get(ref, expected_digest=ref.digest) == body
 
 
 @pytest.mark.asyncio
@@ -90,13 +90,13 @@ async def test_get_detects_expected_digest_and_body_mismatch(aws_store: ContentS
         aws_secret_access_key=SECRET_KEY,
         region_name="us-east-1",
     )
-    client.delete_object(Bucket=BUCKET, Key=f"objects/{ref.version_or_digest}")
+    client.delete_object(Bucket=BUCKET, Key=f"objects/{ref.digest}")
     client.put_object(
         Bucket=BUCKET,
-        Key=f"objects/{ref.version_or_digest}",
+        Key=f"objects/{ref.digest}",
         Body=b"tampered",
         ContentType="text/plain",
-        Metadata={"sha256": ref.version_or_digest},
+        Metadata={"sha256": ref.digest},
     )
     with pytest.raises(ValueError, match="content_digest_mismatch"):
         await aws_store.get(ref)

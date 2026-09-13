@@ -184,5 +184,5 @@ async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> 
     assert {node.package_ref.resource_id for node in record.dynamic_nodes} == {summarize_package.version_ref, merge_package.version_ref}
     accepted = [event for event in record.events if event["phase"] == "node_accepted"]
     assert {event["selected_target"] for event in accepted[:2]} == {"slave-a", "slave-b"}
-    assert all(event.get("package_digest") for event in accepted)
+    assert all((event.get("package_ref") or {}).get("version_or_digest") for event in accepted)
     assert record.outcome["resource_ref"]["resource_id"].startswith("content://sha256/")

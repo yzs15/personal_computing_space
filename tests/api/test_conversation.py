@@ -30,7 +30,7 @@ def test_message_runs_fake_driver_and_sse_exposes_events(monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload["state"] == "completed"
-    assert payload["resource_ref"].startswith("result-")
+    assert payload["resource_ref"].startswith("content://sha256/")
     assert payload["conversation_ref"] == "conversation-ui"
     assert payload["assistant_text"] == "I will refine the closure in multiple patches."
     history = client.get("/api/v1/conversations/conversation-ui")

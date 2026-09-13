@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from loom_v2.digest import digest_json
+
 
 class UnknownRequiredTerm(ValueError):
     """Raised when a required term is not present in the registry."""
@@ -24,7 +26,10 @@ class TypedTerm(BaseModel):
     @field_validator("term_id", mode="before")
     @classmethod
     def default_term_id(cls, value: str | None) -> str:
-        return value or "term-" + __import__("hashlib").sha256(str(id(value)).encode()).hexdigest()[:12]
+        # The Python object id is process-local and is not a content identity.
+        # Callers should provide a stable term_id; this fallback is only a
+        # deterministic marker for legacy callers.
+        return value or "term-anonymous"
 
 
 class TermSupport(BaseModel):
@@ -65,11 +70,8 @@ class VocabularyRegistry(BaseModel):
 
     def model_post_init(self, __context: Any) -> None:
         if not self.digest:
-            import hashlib
-            import json
-
-            payload = json.dumps({key: value.model_dump(mode="json") for key, value in sorted(self.entries.items())}, sort_keys=True, separators=(",", ":")).encode()
-            self.digest = hashlib.sha256(payload).hexdigest()
+            payload = {key: value.model_dump(mode="json") for key, value in sorted(self.entries.items())}
+            self.digest = digest_json(payload, domain="loom/vocabulary-registry/v1")
 
     def validate(self, term: TypedTerm) -> TypedTerm:
         entry = self.entries.get(term.kind)

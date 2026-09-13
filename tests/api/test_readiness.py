@@ -14,7 +14,6 @@ def _binding(operation: str = "run_code", target: str = "slave-a", *, package_re
         "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
         "capability_package_ref": package_ref,
         "target_resource_ref": {"resource_id": target},
-        "realization_digest": f"realization-{target}-{operation}",
         "bound_by": "test-driver",
     }
 
@@ -134,7 +133,6 @@ def test_run_code_binding_requires_package_and_then_allows_start():
                                 "resource_id": "capability-package://readiness-run-code/v1",
                             }
                         ),
-                        "realization_digest": program_ref["version_or_digest"],
                     },
                 }
             ],
@@ -191,7 +189,7 @@ async def test_input_schema_requires_bound_ref_and_rejects_wrapped_payload() -> 
         [{"kind": "set_execution_payload", "value": {"node_id": "loom://test_input_validation", "input_ref": wrapped_ref.model_dump(mode="json")}}],
     )
     mismatch = next(item for item in wrapped.readiness["blockers"] if item["code"] == "payload_schema_mismatch")
-    assert mismatch["schema_digest"] == schema_ref.version_or_digest
+    assert mismatch["schema_digest"] == schema_ref.digest
     assert mismatch["errors"][0]["keyword"] == "required"
 
     input_ref = await repo.put_content({"scores": [80]}, media_type="application/json")

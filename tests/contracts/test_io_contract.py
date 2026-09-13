@@ -13,7 +13,6 @@ def test_io_contract_round_trips_nullable_schema_refs() -> None:
     contract = IoContract(
         input_schema_ref=ResourceRef(
             resource_id="content://sha256/" + "1" * 64,
-            version_or_digest="1" * 64,
         ),
         output_schema_ref=None,
         success_semantics={"criterion": "non_empty"},
@@ -22,7 +21,7 @@ def test_io_contract_round_trips_nullable_schema_refs() -> None:
 
     dumped = contract.model_dump(mode="json")
 
-    assert dumped["input_schema_ref"]["version_or_digest"] == "1" * 64
+    assert ResourceRef.model_validate(dumped["input_schema_ref"]).digest == "1" * 64
     assert dumped["output_schema_ref"] is None
     assert dumped["success_semantics"] == {"criterion": "non_empty"}
 
@@ -35,11 +34,9 @@ def test_io_contract_rejects_unknown_fields() -> None:
 def test_package_and_node_binding_carry_semantic_refs() -> None:
     contract_ref = ResourceRef(
         resource_id="content://sha256/" + "2" * 64,
-        version_or_digest="2" * 64,
     )
     input_ref = ResourceRef(
         resource_id="content://sha256/" + "3" * 64,
-        version_or_digest="3" * 64,
     )
 
     package_fields = CapabilityPackageVersion.model_fields
