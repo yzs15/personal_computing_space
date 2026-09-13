@@ -8,6 +8,7 @@ import httpx
 
 from loom_v2.contracts.types import (
     CapabilityHealthReport,
+    CapabilityDeprovisionCommand,
     CapabilityPackageVersion,
     CapabilityProvisionCommand,
     ComputeBinding,
@@ -118,6 +119,27 @@ class WorkerSession:
         response = await self._post("/worker/v1/provision", payload)
         if response.status_code >= 400:
             detail = response.json().get("detail", "worker_provision_failed")
+            raise RuntimeError(str(detail))
+        return CapabilityHealthReport.model_validate(response.json().get("health_report") or response.json())
+
+    async def deprovision(
+        self,
+        *,
+        command: CapabilityDeprovisionCommand,
+        package: CapabilityPackageVersion | None = None,
+        driver_id: str | None = None,
+        driver_epoch: int | None = None,
+    ) -> CapabilityHealthReport:
+        payload: dict[str, Any] = {"command": command.model_dump(mode="json")}
+        if package is not None:
+            payload["package"] = package.model_dump(mode="json")
+        if driver_id is not None:
+            payload["driver_id"] = driver_id
+        if driver_epoch is not None:
+            payload["driver_epoch"] = driver_epoch
+        response = await self._post("/worker/v1/deprovision", payload)
+        if response.status_code >= 400:
+            detail = response.json().get("detail", "worker_deprovision_failed")
             raise RuntimeError(str(detail))
         return CapabilityHealthReport.model_validate(response.json().get("health_report") or response.json())
 

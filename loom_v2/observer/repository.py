@@ -44,7 +44,7 @@ from loom_v2.contracts.agents import AgentLease, AgentRegistration, DriverComman
 from loom_v2.contracts.messages import MessageReceipt, MessageReceiptState
 from loom_v2.db.session import make_session_factory
 from loom_v2.content_store import ContentStore, canonical_json_bytes
-from loom_v2.digest import digest_bytes
+from loom_v2.digest import digest_bytes, digest_json
 from loom_v2.contracts.io_schema import ValidationError as SchemaValidationError, validate, validate_schema
 from loom_v2.settings import Settings
 from loom_v2.slave.executor import default_registry
@@ -193,6 +193,7 @@ class ObserverRepository:
         content_store: ContentStore | None = None,
         *,
         orchestrator_runtime_available: bool | None = None,
+        operation_descriptor_registry: dict[tuple[str, str], Any] | None = None,
     ) -> None:
         self.runs: dict[str, RunRecord] = {}
         self.idempotency: dict[str, PatchReceipt] = {}
@@ -205,6 +206,12 @@ class ObserverRepository:
             settings = Settings()
             content_store = ContentStore.from_settings(settings)
         self.content_store = content_store
+        # Optional authoritative operation-descriptor registry.  Deployments
+        # may populate it from their existing registry; content-addressed
+        # descriptor refs are verified directly from ContentStore below.
+        self.operation_descriptor_registry = {
+            key: deepcopy(value) for key, value in (operation_descriptor_registry or {}).items()
+        }
         # A deployed Observer deliberately has no Docker CLI/socket.  The
         # legacy in-process test profile can retain the local preflight check;
         # production Driver readiness is responsible for its own runtime.
@@ -255,6 +262,42 @@ class ObserverRepository:
         self.message_receipts: dict[tuple[str, str], MessageReceipt] = {}
         self.message_receipt_events: list[dict[str, Any]] = []
         self._message_receipt_lock = asyncio.Lock()
+
+    def register_operation_descriptor(self, resource_id: str, descriptor: Any, *, digest: str | None = None) -> str:
+        """Register an immutable descriptor and return its canonical digest."""
+        descriptor_payload = descriptor.model_dump(mode="json") if hasattr(descriptor, "model_dump") else deepcopy(descriptor)
+        computed = digest_json(descriptor_payload, domain="loom/operation-descriptor/v1")
+        if digest is not None and digest.lower() != computed:
+            raise ValueError("operation_descriptor_digest_mismatch")
+        self.operation_descriptor_registry[(resource_id, computed)] = descriptor_payload
+        return computed
+
+    async def _validate_operation_descriptor_ref(self, ref: ResourceRef) -> None:
+        digest = (ref.digest or "").lower()
+        if not digest:
+            raise ValueError("operation_descriptor_unavailable")
+        # Content-addressed descriptor refs can be self-verified without a
+        # separate service.  ContentStore treats ``descriptor_digest`` as a
+        # different identity criterion, so use a temporary content ref for
+        # the read while retaining the descriptor digest for verification.
+        if ref.resource_id.startswith("content://sha256/"):
+            content_ref = ResourceRef(resource_id=ref.resource_id, identity_criterion="content_digest")
+            raw = await self.content_store.get(content_ref)
+            try:
+                payload = json.loads(raw)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("operation_descriptor_unavailable") from exc
+            if digest_json(payload, domain="loom/operation-descriptor/v1") != digest:
+                raise ValueError("operation_descriptor_digest_mismatch")
+            return
+        # Symbolic refs require an authoritative registry entry.  A bare
+        # 64-hex placeholder is not enough to establish descriptor identity.
+        if not self.operation_descriptor_registry or (ref.resource_id, digest) not in self.operation_descriptor_registry:
+            raise ValueError("operation_descriptor_unavailable")
+        descriptor = self.operation_descriptor_registry[(ref.resource_id, digest)]
+        descriptor_payload = descriptor.model_dump(mode="json") if hasattr(descriptor, "model_dump") else descriptor
+        if digest_json(descriptor_payload, domain="loom/operation-descriptor/v1") != digest:
+            raise ValueError("operation_descriptor_digest_mismatch")
 
     @staticmethod
     def _message_receipt_from_row(row: MessageReceiptRow) -> MessageReceipt:
@@ -1275,6 +1318,7 @@ class ObserverRepository:
                     "available": agent.get("lease_state") == "active",
                     "operations": sorted((agent.get("capabilities") or {}).get("operations", [])),
                     "executor_descriptors": (agent.get("capabilities") or {}).get("executor_descriptors", []),
+                    "runtime_plugin_descriptors": (agent.get("capabilities") or {}).get("runtime_plugin_descriptors", (agent.get("capabilities") or {}).get("runtime_plugins", [])),
                     "term_support": (agent.get("capabilities") or {}).get("term_support", []),
                 }
                 for agent in slave_agents
@@ -1697,13 +1741,29 @@ class ObserverRepository:
             or details.get("executors")
             or details.get("executor_descriptors")
         )
-        if declared_executors:
+        package_type = getattr(package, "package_type", "function")
+        if package_type != "service" and declared_executors:
             raw_executors = [declared_executors] if isinstance(declared_executors, str) else declared_executors
             return any(
                 (str(item.get("kind")), str(item.get("version", "1"))) == (package.execution.kind, package.execution.version)
                 if isinstance(item, dict) else str(item) == package.execution.kind
                 for item in raw_executors
             )
+        if package_type == "service":
+            descriptors = details.get("runtime_plugin_descriptors") or details.get("runtime_plugins") or []
+            for descriptor in descriptors if isinstance(descriptors, list) else []:
+                supports = descriptor.get("supports", []) if isinstance(descriptor, dict) else []
+                for support in supports if isinstance(supports, list) else []:
+                    if not isinstance(support, dict):
+                        continue
+                    execution = support.get("execution") if isinstance(support.get("execution"), dict) else support
+                    if (
+                        str(support.get("package_type") or "") == package.package_type
+                        and str(support.get("execution_kind") or execution.get("kind") or "") == package.execution.kind
+                        and str(support.get("execution_version") or execution.get("version") or "1") == package.execution.version
+                    ):
+                        return True
+            return False
         return True
 
     def _slave_is_active(self, slave_id: str) -> bool:
@@ -1861,6 +1921,24 @@ class ObserverRepository:
                     raise ValueError("package_promotion_denied:semantic_not_closed")
                 if candidate.function_body.captures_run_state or candidate.function_body.captured_secret_refs or candidate.function_body.captured_path_refs:
                     raise ValueError("package_captures_run_state")
+            elif isinstance(candidate.body, ServiceCapabilityPackageBody):
+                try:
+                    for endpoint in candidate.body.endpoints:
+                        # Keep descriptor registry failures distinguishable
+                        # from malformed/missing IO contracts.
+                        await self._validate_operation_descriptor_ref(endpoint.operation_descriptor_ref)
+                except (FileNotFoundError, TypeError, ValueError) as exc:
+                    if str(exc) in {"operation_descriptor_unavailable", "operation_descriptor_digest_mismatch"}:
+                        raise
+                    raise ValueError("io_contract_invalid") from exc
+                try:
+                    for endpoint in candidate.body.endpoints:
+                        contract = IoContract.model_validate(await self._load_json_content(endpoint.io_contract_ref))
+                        for schema_ref in (contract.input_schema_ref, contract.output_schema_ref):
+                            if schema_ref is not None:
+                                validate_schema(await self._load_json_content(schema_ref))
+                except (FileNotFoundError, TypeError, ValueError) as exc:
+                    raise ValueError("io_contract_invalid") from exc
             source_record = next(
                 (
                     record
@@ -1950,6 +2028,29 @@ class ObserverRepository:
             self.slave_capabilities.setdefault(report.target_slave, {}).setdefault("operations", set()).update(
                 self._operation_name(operation) for operation in operations
             )
+        elif report.activation_state == "stopped" and isinstance(package.body, ServiceCapabilityPackageBody):
+            # Remove only operations no longer backed by another ready
+            # activation on this target.  ``operations`` also contains the
+            # built-in function capability, so avoid replacing the set.
+            projected = self.slave_capabilities.setdefault(report.target_slave, {}).setdefault("operations", set())
+            for endpoint in package.body.endpoints:
+                operation_name = self._operation_name(endpoint.operation_descriptor_ref.resource_id)
+                still_ready = False
+                for other_record in self.runs.values():
+                    for activation in other_record.capability_activations:
+                        if activation.target_slave != report.target_slave or activation.activation_state != "ready":
+                            continue
+                        other_package = self._find_package(activation.package_version_ref)
+                        if other_package is not None and isinstance(other_package.body, ServiceCapabilityPackageBody) and any(
+                            self._operation_name(item.operation_descriptor_ref.resource_id) == operation_name
+                            for item in other_package.body.endpoints
+                        ):
+                            still_ready = True
+                            break
+                    if still_ready:
+                        break
+                if not still_ready:
+                    projected.discard(operation_name)
         record.events.append({"phase": "capability_health_report", "package_ref": activation_ref, "target_slave": report.target_slave, "activation_state": report.activation_state, "evidence_refs": report.evidence_refs, "created_at": datetime.now(timezone.utc).isoformat()})
         await self._persist(record)
         return activation
@@ -2248,39 +2349,53 @@ class ObserverRepository:
             elif package is not None:
                 if run_id is not None and not self._package_visible_to_run(package, run_id):
                     blockers.append({"code": "capability_package_scope_mismatch", "hole_id": hole.hole_id, "source_run_ref": package.source_run_ref})
-                closure_contract_ref = snapshot.program.io_contract_ref
-                package_contract_ref = package.function_body.io_contract_ref
-                if (
-                    closure_contract_ref is None
-                    or package_contract_ref is None
-                    or (closure_contract_ref.digest or closure_contract_ref.resource_id)
-                    != (package_contract_ref.digest or package_contract_ref.resource_id)
-                ):
-                    blockers.append(
-                        {
-                            "code": "io_contract_mismatch",
-                            "hole_id": hole.hole_id,
-                            "closure_io_contract_ref": closure_contract_ref.resource_id if closure_contract_ref else None,
-                            "package_io_contract_ref": package_contract_ref.resource_id if package_contract_ref else None,
-                        }
-                    )
                 if package.publication_state == "abandoned":
                     blockers.append({"code": "capability_package_abandoned", "package_ref": self._package_ref(package)})
-                stat = await self.content_store.stat(package.function_body.program_content_ref)
-                if stat is None or not stat.integrity_verified or stat.declared_digest != package.function_body.program_digest:
-                    blockers.append({"code": "package_content_unavailable", "hole_id": hole.hole_id})
-                if package.function_body.provider_fillable_hole_refs and not binding.runtime_profile:
-                    blockers.append({"code": "provider_fillable_hole_unbound", "hole_id": hole.hole_id, "hole_refs": package.function_body.provider_fillable_hole_refs})
-                if "run_code" not in capability.get("operations", set()):
-                    blockers.append({"code": "capability_unavailable", "operation": "run_code", "target_resource_ref": target})
-                try:
-                    default_registry.get(package.execution)
-                except ValueError:
-                    blockers.append({"code": "executor_unavailable", "execution_kind": package.execution.kind})
-                descriptor_ref = package.function_body.operation_descriptor_ref
-                descriptor_name = descriptor_ref.resource_id if isinstance(descriptor_ref, ResourceRef) else str(descriptor_ref)
-                if operation and self._operation_name(descriptor_name) != operation:
-                    blockers.append({"code": "operation_descriptor_mismatch", "operation": operation})
+                if package.package_type == "service":
+                    endpoints = list(package.body.endpoints) if isinstance(package.body, ServiceCapabilityPackageBody) else []
+                    matching = [item for item in endpoints if self._operation_name(item.operation_descriptor_ref.resource_id) == operation or item.endpoint_id == operation or item.path == operation]
+                    if operation and len(matching) != 1:
+                        blockers.append({"code": "operation_descriptor_mismatch", "operation": operation})
+                    if not self._slave_supports_package(target, package):
+                        blockers.append({"code": "runtime_plugin_unavailable", "execution_kind": package.execution.kind})
+                    if matching:
+                        endpoint = matching[0]
+                        descriptor = binding.capability_descriptor_ref
+                        endpoint_descriptor = endpoint.operation_descriptor_ref
+                        if (
+                            descriptor.resource_id != endpoint_descriptor.resource_id
+                            or descriptor.digest != endpoint_descriptor.digest
+                        ):
+                            blockers.append({"code": "operation_descriptor_mismatch", "operation": operation})
+                        endpoint_contract = endpoint.io_contract_ref
+                        closure_contract_ref = snapshot.program.io_contract_ref
+                        if closure_contract_ref is not None and (closure_contract_ref.digest or closure_contract_ref.resource_id) != (endpoint_contract.digest or endpoint_contract.resource_id):
+                            blockers.append({"code": "io_contract_mismatch", "hole_id": hole.hole_id, "closure_io_contract_ref": closure_contract_ref.resource_id, "package_io_contract_ref": endpoint_contract.resource_id})
+                else:
+                    closure_contract_ref = snapshot.program.io_contract_ref
+                    package_contract_ref = package.function_body.io_contract_ref
+                    if (
+                        closure_contract_ref is None
+                        or package_contract_ref is None
+                        or (closure_contract_ref.digest or closure_contract_ref.resource_id)
+                        != (package_contract_ref.digest or package_contract_ref.resource_id)
+                    ):
+                        blockers.append({"code": "io_contract_mismatch", "hole_id": hole.hole_id, "closure_io_contract_ref": closure_contract_ref.resource_id if closure_contract_ref else None, "package_io_contract_ref": package_contract_ref.resource_id if package_contract_ref else None})
+                    stat = await self.content_store.stat(package.function_body.program_content_ref)
+                    if stat is None or not stat.integrity_verified or stat.declared_digest != package.function_body.program_digest:
+                        blockers.append({"code": "package_content_unavailable", "hole_id": hole.hole_id})
+                    if package.function_body.provider_fillable_hole_refs and not binding.runtime_profile:
+                        blockers.append({"code": "provider_fillable_hole_unbound", "hole_id": hole.hole_id, "hole_refs": package.function_body.provider_fillable_hole_refs})
+                    if "run_code" not in capability.get("operations", set()):
+                        blockers.append({"code": "capability_unavailable", "operation": "run_code", "target_resource_ref": target})
+                    try:
+                        default_registry.get(package.execution)
+                    except ValueError:
+                        blockers.append({"code": "executor_unavailable", "execution_kind": package.execution.kind})
+                    descriptor_ref = package.function_body.operation_descriptor_ref
+                    descriptor_name = descriptor_ref.resource_id if isinstance(descriptor_ref, ResourceRef) else str(descriptor_ref)
+                    if operation and self._operation_name(descriptor_name) != operation:
+                        blockers.append({"code": "operation_descriptor_mismatch", "operation": operation})
             elif operation == "run_code":
                 # ``run_code`` is the generic subprocess executor, not an
                 # executable builtin.  A concrete capability package is the
@@ -2681,8 +2796,57 @@ class ObserverRepository:
                 snapshot.compute.typed_holes.append(hole)
             elif kind == "materialize_capability_package_candidate":
                 header = dict(operation.get("value") or {})
-                if set(header) - {"package_id", "package_version", "package_type", "execution", "body"}:
+                if set(header) - {"package_id", "package_version", "package_type", "execution", "body", "package_digest"}:
                     raise ValueError("capability_package_header_invalid")
+                if header.get("package_type") == "service":
+                    if not isinstance(header.get("body"), dict):
+                        raise ValueError("capability_package_body_required")
+                    try:
+                        execution = ExecutionContract.model_validate(header.get("execution") or {"kind": "container:http", "version": "1"})
+                        body = ServiceCapabilityPackageBody.model_validate(header["body"])
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(str(exc) or "service_package_body_invalid") from exc
+                    if execution.kind != "container:http" or execution.version != "1":
+                        raise ValueError("unsupported_execution_contract")
+                    # Resolve every IoContract and schema while the candidate
+                    # is created, so an unresolvable ref cannot be promoted or
+                    # provisioned later.
+                    for endpoint in body.endpoints:
+                        # Descriptor resolution has its own stable error
+                        # codes; do not hide an unavailable/mismatched
+                        # descriptor behind the generic IO-contract error.
+                        await self._validate_operation_descriptor_ref(endpoint.operation_descriptor_ref)
+                        try:
+                            contract = IoContract.model_validate(await self._load_json_content(endpoint.io_contract_ref))
+                            for schema_ref in (contract.input_schema_ref, contract.output_schema_ref):
+                                if schema_ref is not None:
+                                    validate_schema(await self._load_json_content(schema_ref))
+                            if contract.success_validator_ref is not None:
+                                self._require_content_ref(contract.success_validator_ref)
+                                await self.content_store.get(contract.success_validator_ref)
+                        except (FileNotFoundError, TypeError, ValueError) as exc:
+                            raise ValueError("io_contract_invalid") from exc
+                    package = CapabilityPackageVersion(
+                        package_type="service",
+                        package_id=str(header.get("package_id") or f"package-{uuid4().hex[:12]}"),
+                        package_version=str(header.get("package_version") or "v1"),
+                        package_closure_version_ref=f"package-closure-{uuid4().hex[:12]}",
+                        source_run_ref=record.run_id,
+                        source_closure_version_ref=record.draft.version_id,
+                        execution=execution,
+                        body=body,
+                        package_digest=str(header.get("package_digest") or ""),
+                        provenance=[{"source": "coding_agent", "run_id": record.run_id}],
+                    )
+                    existing = next((item for item in record.capability_packages if item.package_id == package.package_id and item.package_version == package.package_version), None)
+                    if existing is None:
+                        record.capability_packages.append(package)
+                    elif existing.package_digest != package.package_digest:
+                        raise ValueError("capability_package_identity_conflict")
+                    else:
+                        package = existing
+                    snapshot.metadata.setdefault("capability_package_refs", []).append(self._package_ref(package))
+                    continue
                 if header.get("package_type", "function") != "function":
                     raise ValueError(f"unsupported_package_type:{header['package_type']}")
                 if not isinstance(header.get("body"), dict):
@@ -2750,6 +2914,7 @@ class ObserverRepository:
                         max_nodes=int(max_nodes) if max_nodes is not None else None,
                         max_live_nodes=int(max_live_nodes) if max_live_nodes is not None else None,
                     ),
+                    package_digest=str(header.get("package_digest") or ""),
                     provenance=[{"source": "coding_agent", "run_id": record.run_id}],
                 )
                 # Re-materializing the exact immutable package is idempotent,

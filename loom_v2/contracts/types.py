@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Literal
 
@@ -198,10 +199,10 @@ class HttpServiceEndpoint(ContractModel):
     @model_validator(mode="after")
     def validate_refs(self) -> "HttpServiceEndpoint":
         descriptor_digest = self.operation_descriptor_ref.digest
-        if self.operation_descriptor_ref.identity_criterion != "descriptor_digest" or not _is_sha256(descriptor_digest):
+        if not self.operation_descriptor_ref.resource_id or self.operation_descriptor_ref.identity_criterion != "descriptor_digest" or not _is_sha256(descriptor_digest):
             raise ValueError("service_operation_descriptor_invalid")
         if (
-            self.io_contract_ref.identity_criterion not in {None, "content_digest"}
+            self.io_contract_ref.identity_criterion != "content_digest"
             or not self.io_contract_ref.resource_id.startswith("content://sha256/")
             or not _is_sha256(self.io_contract_ref.digest)
         ):
@@ -225,7 +226,7 @@ class ServiceCapabilityPackageBody(CapabilityPackageBody):
         _validate_http_path(self.health_path, "service_health_path_invalid")
         ids = [endpoint.endpoint_id for endpoint in self.endpoints]
         paths = [endpoint.path for endpoint in self.endpoints]
-        descriptors = [endpoint.operation_descriptor_ref.digest for endpoint in self.endpoints]
+        descriptors = [(endpoint.operation_descriptor_ref.digest or "").lower() for endpoint in self.endpoints]
         if len(set(ids)) != len(ids) or len(set(paths)) != len(paths) or len(set(descriptors)) != len(descriptors):
             raise ValueError("service_endpoint_duplicate")
         if self.health_path in paths:
@@ -240,7 +241,14 @@ def _is_sha256(value: str | None) -> bool:
 def _validate_http_path(value: str, error: str) -> None:
     # v1 paths are origin-form paths only; query, fragment, host and scheme
     # are not part of an endpoint identity.
-    if not value.startswith("/") or "?" in value or "#" in value or "://" in value:
+    if (
+        not value.startswith("/")
+        or "?" in value
+        or "#" in value
+        or "://" in value
+        or "\\" in value
+        or any(ord(char) <= 0x20 or ord(char) == 0x7F for char in value)
+    ):
         raise ValueError(error)
 
 
@@ -343,19 +351,34 @@ class CapabilityPackageVersion(ContractModel):
         """Immutable execution identity; lifecycle/provenance are excluded."""
         payload = self.model_dump(mode="json", include={"package_type", "execution", "body"})
 
-        def normalize(value: Any) -> Any:
+        def normalize(value: Any, key: str | None = None) -> Any:
             if isinstance(value, dict):
                 # ResourceRef carries deployment-local access/provenance data;
                 # only its immutable identity belongs in package_digest.
                 if "resource_id" in value:
+                    resource_id = str(value.get("resource_id") or "")
+                    version_or_digest = value.get("version_or_digest")
+                    if resource_id.startswith("content://sha256/"):
+                        resource_id = resource_id.lower()
+                        version_or_digest = None
+                    elif isinstance(version_or_digest, str) and re.fullmatch(r"[0-9a-fA-F]{64}", version_or_digest):
+                        version_or_digest = version_or_digest.lower()
                     return {
-                        key: value[key]
-                        for key in ("resource_id", "version_or_digest", "identity_criterion")
-                        if value.get(key) is not None
+                        "resource_id": resource_id,
+                        **({"version_or_digest": version_or_digest} if version_or_digest is not None else {}),
+                        **({"identity_criterion": str(value["identity_criterion"]).lower()} if value.get("identity_criterion") is not None else {}),
                     }
-                return {key: normalize(item) for key, item in value.items()}
+                return {item_key: normalize(item, item_key) for item_key, item in value.items()}
             if isinstance(value, list):
-                return [normalize(item) for item in value]
+                normalized = [normalize(item, key) for item in value]
+                # Endpoint and permission/ref lists have set-like identity in
+                # the service manifest.  Canonical ordering prevents a
+                # harmless input reorder from changing package identity.
+                if key == "endpoints":
+                    normalized.sort(key=lambda item: str(item.get("endpoint_id", "")) if isinstance(item, dict) else str(item))
+                elif key in {"permissions", "provider_fillable_hole_refs", "allowed_node_package_refs", "captured_secret_refs", "captured_path_refs", "effective_constraint_refs"}:
+                    normalized.sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+                return normalized
             return value
 
         return normalize(payload)
@@ -393,6 +416,16 @@ class CapabilityProvisionCommand(ContractModel):
     workspace_id: str = "workspace-default"
     activation_closure_version_ref: str = ""
     compute_binding: ComputeBinding | None = None
+    idempotency_key: str = ""
+    session_generation: int = 1
+
+
+class CapabilityDeprovisionCommand(ContractModel):
+    command_id: str
+    package_version_ref: str
+    package_digest: str
+    target_slave: str
+    workspace_id: str = "workspace-default"
     idempotency_key: str = ""
     session_generation: int = 1
 

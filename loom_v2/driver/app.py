@@ -188,6 +188,30 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"health_reports": reports}
 
+    @app.post("/driver/v1/capability/deprovision")
+    async def deprovision_capability(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+        require_internal(request)
+        target_slaves = payload.get("target_slaves") or ([payload.get("target_slave")] if payload.get("target_slave") else [])
+        if not target_slaves:
+            raise HTTPException(status_code=400, detail="target_slave_required")
+        package_ref = payload.get("package_ref") or payload.get("package_version_ref")
+        if not package_ref:
+            raise HTTPException(status_code=400, detail="package_ref_required")
+        try:
+            package_ref_value = ResourceRef.model_validate(package_ref) if isinstance(package_ref, dict) else str(package_ref)
+            reports = [
+                await app.state.service.deprovision_capability(
+                    package_ref_value,
+                    str(target),
+                    approved_digest=payload.get("approved_digest"),
+                    idempotency_key=payload.get("idempotency_key"),
+                )
+                for target in target_slaves
+            ]
+        except (ValueError, RuntimeError, KeyError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"health_reports": reports}
+
     @app.post("/driver/v1/mcp")
     async def mcp(payload: dict[str, Any], request: Request) -> dict[str, Any]:
         require_internal(request)

@@ -542,6 +542,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
                         "term_support": caps.get("term_support", []),
                         "activations": [activation.model_dump(mode="json") for record in records for activation in record.capability_activations if activation.target_slave == agent["agent_id"] and activation.activation_state == "ready"],
                         "executor_descriptors": caps.get("executor_descriptors", []),
+                        "runtime_plugin_descriptors": caps.get("runtime_plugin_descriptors", caps.get("runtime_plugins", [])),
                     }
                 )
             return result
@@ -557,6 +558,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
                 "term_support": [support.model_dump(mode="json") for support in slave.term_support()],
                 "activations": [activation.model_dump(mode="json") for activation in slave.activations.values()] + [activation.model_dump(mode="json") for record in records for activation in record.capability_activations if activation.target_slave == slave_id and activation.activation_state == "ready"],
                 "executor_descriptors": [{"kind": descriptor.kind, "version": descriptor.version, "operations": sorted(descriptor.operations), "descriptor_ref": descriptor.descriptor_ref, "digest": descriptor.digest} for descriptor in slave.executor_registry.descriptors()],
+                "runtime_plugin_descriptors": [descriptor.__dict__ | {"supports": [support.to_mapping() for support in descriptor.supports]} for descriptor in slave.runtime_plugin_host.descriptors()] if slave.runtime_plugin_host is not None else [],
             }
             for slave_id, slave in app.state.slaves.items()
         ]
@@ -625,7 +627,6 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
                 "target_slave": target,
                 "workspace_id": settings.workspace_id,
                 "activation_closure_version_ref": package.package_closure_version_ref,
-                "program_content_ref": package.function_body.program_content_ref.model_dump(mode="json"),
                 "compute_binding": payload.get("compute_binding"),
                 "idempotency_key": payload.get("idempotency_key") or f"promote-{package.package_digest}-{target}",
             }
@@ -636,6 +637,72 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
                     report = await worker.provision(command=provision_command, package=package)
                 elif slave is not None:
                     report = await slave.provision(provision_command, package)
+                else:
+                    raise RuntimeError("slave_not_found")
+                await app.state.repo.record_capability_health(report)
+                reports.append(report.model_dump(mode="json"))
+            except (RuntimeError, ValueError) as exc:
+                reports.append({"target_slave": target, "activation_state": "failed", "error": str(exc)})
+        return {"package": package.model_dump(mode="json"), "health_reports": reports}
+
+    @app.post("/api/v1/capability-packages/{package_ref:path}/deactivate")
+    async def deactivate_capability_package(package_ref: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        try:
+            package = await app.state.repo.get_capability_package(package_ref)
+            approved_digest = payload.get("approved_digest")
+            if not approved_digest:
+                raise ValueError("approved_digest_required")
+            if str(approved_digest).lower() != package.package_digest.lower():
+                raise ValueError("capability_package_digest_mismatch")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="capability_package_not_found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        targets = payload.get("target_slaves") or []
+        if not targets:
+            raise HTTPException(status_code=400, detail="target_slave_required")
+        if not legacy_embedded:
+            try:
+                return {
+                    "package": package.model_dump(mode="json"),
+                    **await app.state.gateway.forward(
+                        "/driver/v1/capability/deprovision",
+                        {
+                            "package_ref": package.version_ref,
+                            "target_slaves": targets,
+                            "approved_digest": package.package_digest,
+                            "idempotency_key": payload.get("idempotency_key"),
+                        },
+                    ),
+                }
+            except RuntimeError as exc:
+                return {
+                    "package": package.model_dump(mode="json"),
+                    "health_reports": [
+                        {"target_slave": target, "activation_state": "failed", "error": str(exc)}
+                        for target in targets
+                    ],
+                }
+        reports = []
+        for target in targets:
+            worker = app.state.workers.get(target)
+            slave = app.state.slaves.get(target)
+            command = {
+                "command_id": f"deprovision-{package.package_id}-{target}",
+                "package_version_ref": f"{package.package_id}:{package.package_version}",
+                "package_digest": package.package_digest,
+                "target_slave": target,
+                "workspace_id": settings.workspace_id,
+                "idempotency_key": payload.get("idempotency_key") or f"deactivate-{package.package_digest}-{target}",
+            }
+            from loom_v2.contracts.types import CapabilityDeprovisionCommand
+            deprovision_command = CapabilityDeprovisionCommand.model_validate(command)
+            try:
+                if worker is not None:
+                    report = await worker.deprovision(command=deprovision_command, package=package)
+                elif slave is not None:
+                    report = await slave.deprovision(deprovision_command, package)
                 else:
                     raise RuntimeError("slave_not_found")
                 await app.state.repo.record_capability_health(report)

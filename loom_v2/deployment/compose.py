@@ -142,16 +142,30 @@ def _render_slave(config: DeploymentConfig, machine: MachineConfig) -> tuple[dic
                 **_role_environment(config, machine, config.database_url(machine)),
                 "LOOM_OBSERVER_URL": config.urls.observer,
                 "LOOM_SLAVE_ENDPOINT_URL": machine.endpoint_url,
+                "LOOM_RUNTIME_PLUGIN_DIR": "/opt/loom/runtime-plugins",
+                "LOOM_RUNTIME_PLUGIN_SOCKET_DIR": "/run/loom/runtime-plugins",
+                "LOOM_RUNTIME_PLUGIN_NETWORK": "loom-internal",
+                "LOOM_RUNTIME_PLUGIN_MEMORY": "512m",
+                "LOOM_RUNTIME_PLUGIN_CPUS": "1.0",
+                "LOOM_RUNTIME_PLUGIN_PIDS_LIMIT": "128",
+                "LOOM_RUNTIME_PLUGIN_TMPFS_SIZE": "64m",
             },
             "ports": [f"{machine.service_port}:8080"],
             "secrets": ["internal_api_secret"],
             "depends_on": {"postgres": {"condition": "service_healthy"}},
+            "volumes": [
+                "./source/runtime_plugins:/opt/loom/runtime-plugins:ro",
+                f"{machine.name}-runtime-plugin-sockets:/run/loom/runtime-plugins",
+                "/var/run/docker.sock:/var/run/docker.sock",
+            ],
+            "networks": ["default", "loom-internal"],
         }
     )
     document = {
         "services": {"slave": app, "postgres": _postgres_service(f"{machine.name}-postgres-data", database)},
         "secrets": {"internal_api_secret": {"file": "./secrets/internal_api_secret"}},
-        "volumes": {f"{machine.name}-postgres-data": {}},
+        "volumes": {f"{machine.name}-postgres-data": {}, f"{machine.name}-runtime-plugin-sockets": {}},
+        "networks": {"loom-internal": {"name": "loom-internal", "internal": True}},
     }
     env = _common_env(config, database_url=config.database_url(machine))
     env["LOOM_OBSERVER_URL"] = config.urls.observer

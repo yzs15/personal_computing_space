@@ -175,13 +175,29 @@ class RemoteObserverRepository:
             or details.get("executors")
             or details.get("executor_descriptors")
         )
-        if declared_executors:
+        package_type = getattr(package, "package_type", "function")
+        if package_type != "service" and declared_executors:
             raw_executors = [declared_executors] if isinstance(declared_executors, str) else declared_executors
             return any(
                 ((str(item.get("kind")), str(item.get("version", "1"))) == (execution.kind, execution.version))
                 if isinstance(item, dict) else str(item) == execution.kind
                 for item in raw_executors
             )
+        if package_type == "service":
+            descriptors = details.get("runtime_plugin_descriptors") or details.get("runtime_plugins") or []
+            for descriptor in descriptors if isinstance(descriptors, list) else []:
+                supports = descriptor.get("supports", []) if isinstance(descriptor, dict) else []
+                for support in supports if isinstance(supports, list) else []:
+                    if not isinstance(support, dict):
+                        continue
+                    execution = support.get("execution") if isinstance(support.get("execution"), dict) else support
+                    if (
+                        str(support.get("package_type") or "") == package.package_type
+                        and str(support.get("execution_kind") or execution.get("kind") or "") == package.execution.kind
+                        and str(support.get("execution_version") or execution.get("version") or "1") == package.execution.version
+                    ):
+                        return True
+            return False
         return True
 
     async def accept_node_intent(self, run_id: str, intent: NodeIntent, *, selected_target: str) -> DynamicNode:

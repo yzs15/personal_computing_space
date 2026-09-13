@@ -1,0 +1,8 @@
+plugin_id = "container-http-v1"
+protocol_version = "loom.runtime-plugin/1"
+command = ["bin/runtime-plugin"]
+
+[[supports]]
+package_type = "service"
+execution_kind = "container:http"
+execution_version = "1"

@@ -13,7 +13,7 @@ from loom_v2.settings import Settings
 from loom_v2.content_store import ContentStore
 
 from .service import SlaveService
-from loom_v2.contracts.types import CapabilityPackageVersion, CapabilityProvisionCommand, ComputeBinding, TaskClosure
+from loom_v2.contracts.types import CapabilityDeprovisionCommand, CapabilityPackageVersion, CapabilityProvisionCommand, ComputeBinding, TaskClosure
 from loom_v2.contracts.agents import AgentLease, AgentRegistration
 
 
@@ -47,7 +47,8 @@ def create_app(slave_id: str | None = None, *, observer_transport: httpx.AsyncBa
     async def register_loop() -> None:
         instance_id = f"{slave_id}-{uuid4().hex[:12]}"
         endpoint_url = os.getenv("LOOM_SLAVE_ENDPOINT_URL", f"http://{slave_id}:8081" if slave_id == "slave-a" else f"http://{slave_id}:8082")
-        registration = AgentRegistration(role="slave", agent_id=slave_id, instance_id=instance_id, workspace_id=app.state.service.workspace_id, endpoint_url=endpoint_url, protocol_version=settings.agent_protocol_version, capabilities={"operations": sorted(app.state.service.supported_operations), "executor_descriptors": [descriptor.kind for descriptor in app.state.service.executor_registry.descriptors()], "term_support": [item.model_dump(mode="json") for item in app.state.service.term_support()]})
+        runtime_descriptors = [descriptor.__dict__ | {"supports": [support.to_mapping() for support in descriptor.supports]} for descriptor in app.state.service.runtime_plugin_host.descriptors()] if app.state.service.runtime_plugin_host is not None else []
+        registration = AgentRegistration(role="slave", agent_id=slave_id, instance_id=instance_id, workspace_id=app.state.service.workspace_id, endpoint_url=endpoint_url, protocol_version=settings.agent_protocol_version, capabilities={"operations": sorted(app.state.service.supported_operations), "executor_descriptors": [descriptor.kind for descriptor in app.state.service.executor_registry.descriptors()], "runtime_plugin_descriptors": runtime_descriptors, "runtime_plugins": runtime_descriptors, "term_support": [item.model_dump(mode="json") for item in app.state.service.term_support()]})
         while True:
             try:
                 headers = {"X-Loom-Internal-Token": settings.internal_api_secret} if settings.internal_api_secret else {}
@@ -96,6 +97,7 @@ def create_app(slave_id: str | None = None, *, observer_transport: httpx.AsyncBa
                 pass
         if app.state.engine is not None:
             await app.state.engine.dispose()
+        await app.state.service.close()
 
     @app.get("/healthz")
     async def health() -> dict[str, object]:
@@ -199,6 +201,33 @@ def create_app(slave_id: str | None = None, *, observer_transport: httpx.AsyncBa
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"accepted": True, "health_report": report.model_dump(mode="json")}
 
+    @app.post("/worker/v1/deprovision")
+    async def deprovision(payload: dict[str, object], request: Request) -> dict[str, object]:
+        require_internal(request)
+        service: SlaveService = app.state.service
+        try:
+            configured_secret = settings.internal_api_secret.strip()
+            if configured_secret and (not str(payload.get("driver_id") or "").strip() or payload.get("driver_epoch") is None):
+                raise ValueError("driver_identity_required")
+            if configured_secret:
+                driver_id = str(payload["driver_id"])
+                driver_epoch = int(payload["driver_epoch"])
+                previous_epoch = app.state.driver_epochs.get(driver_id)
+                if previous_epoch is not None and driver_epoch < previous_epoch:
+                    raise ValueError("stale_driver_epoch")
+                app.state.driver_epochs[driver_id] = max(driver_epoch, previous_epoch or driver_epoch)
+            command = CapabilityDeprovisionCommand.model_validate(payload.get("command") or {})
+            package_payload = payload.get("package")
+            package = CapabilityPackageVersion.model_validate(package_payload) if package_payload is not None else None
+            if command.workspace_id != service.workspace_id:
+                raise ValueError("workspace_binding_mismatch")
+            if command.target_slave != service.slave_id:
+                raise ValueError("target_slave_mismatch")
+            report = await service.deprovision(command, package)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"accepted": True, "health_report": report.model_dump(mode="json")}
+
     @app.get("/worker/v1/capabilities")
     async def capabilities(request: Request) -> dict[str, object]:
         require_internal(request)
@@ -210,6 +239,8 @@ def create_app(slave_id: str | None = None, *, observer_transport: httpx.AsyncBa
             "replica": service.replica.state,
             "operations": sorted(service.supported_operations),
             "executor_descriptors": [descriptor.__dict__ | {"operations": sorted(descriptor.operations), "digest": descriptor.digest, "descriptor_ref": descriptor.descriptor_ref} for descriptor in service.executor_registry.descriptors()],
+            "runtime_plugin_descriptors": [descriptor.__dict__ | {"supports": [support.to_mapping() for support in descriptor.supports]} for descriptor in service.runtime_plugin_host.descriptors()] if service.runtime_plugin_host is not None else [],
+            "runtime_plugins": [descriptor.__dict__ | {"supports": [support.to_mapping() for support in descriptor.supports]} for descriptor in service.runtime_plugin_host.descriptors()] if service.runtime_plugin_host is not None else [],
             "activations": [activation.model_dump(mode="json") for activation in service.activations.values()],
             "resource_events": [event.model_dump(mode="json") for event in service.resource_events],
             "term_support": [support.model_dump(mode="json") for support in service.term_support()],

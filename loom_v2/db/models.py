@@ -146,3 +146,8 @@ class SlaveReplicaRow(SlaveBase):
     slave_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Runtime-neutral desired/actual activation records.  Keeping the JSON
+    # payload on the existing role-local replica row preserves the strict
+    # SlaveBase metadata boundary while allowing a restart to recover the
+    # complete immutable package manifest without Observer/package-cache I/O.
+    capability_activations: Mapped[list] = mapped_column(JSON, nullable=False, default=list)

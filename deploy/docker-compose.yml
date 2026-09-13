@@ -135,10 +135,22 @@ services:
       LOOM_S3_ACCESS_KEY: loom
       LOOM_S3_SECRET_KEY: loom-content-secret
       LOOM_S3_REGION: us-east-1
+      LOOM_RUNTIME_PLUGIN_DIR: /opt/loom/runtime-plugins
+      LOOM_RUNTIME_PLUGIN_SOCKET_DIR: /run/loom/runtime-plugins
+      LOOM_RUNTIME_PLUGIN_NETWORK: loom-internal
+      LOOM_RUNTIME_PLUGIN_MEMORY: 512m
+      LOOM_RUNTIME_PLUGIN_CPUS: "1.0"
+      LOOM_RUNTIME_PLUGIN_PIDS_LIMIT: "128"
+      LOOM_RUNTIME_PLUGIN_TMPFS_SIZE: 64m
     secrets: [internal_api_secret]
     depends_on:
       slave-a-db: {condition: service_healthy}
       minio-init: {condition: service_completed_successfully}
+    volumes:
+      - ../runtime_plugins:/opt/loom/runtime-plugins:ro
+      - slave-a-runtime-plugin-sockets:/run/loom/runtime-plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [default, loom-internal]
 
   slave-b:
     build:
@@ -154,10 +166,22 @@ services:
       LOOM_S3_ACCESS_KEY: loom
       LOOM_S3_SECRET_KEY: loom-content-secret
       LOOM_S3_REGION: us-east-1
+      LOOM_RUNTIME_PLUGIN_DIR: /opt/loom/runtime-plugins
+      LOOM_RUNTIME_PLUGIN_SOCKET_DIR: /run/loom/runtime-plugins
+      LOOM_RUNTIME_PLUGIN_NETWORK: loom-internal
+      LOOM_RUNTIME_PLUGIN_MEMORY: 512m
+      LOOM_RUNTIME_PLUGIN_CPUS: "1.0"
+      LOOM_RUNTIME_PLUGIN_PIDS_LIMIT: "128"
+      LOOM_RUNTIME_PLUGIN_TMPFS_SIZE: 64m
     secrets: [internal_api_secret]
     depends_on:
       slave-b-db: {condition: service_healthy}
       minio-init: {condition: service_completed_successfully}
+    volumes:
+      - ../runtime_plugins:/opt/loom/runtime-plugins:ro
+      - slave-b-runtime-plugin-sockets:/run/loom/runtime-plugins
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [default, loom-internal]
 
 volumes:
   observer-db-data:
@@ -165,3 +189,10 @@ volumes:
   slave-b-db-data:
   minio-data:
   driver-codex-state:
+  slave-a-runtime-plugin-sockets:
+  slave-b-runtime-plugin-sockets:
+
+networks:
+  loom-internal:
+    name: loom-internal
+    internal: true
