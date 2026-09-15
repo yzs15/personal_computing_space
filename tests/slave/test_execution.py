@@ -1,6 +1,6 @@
 import pytest
 
-from loom_v2.contracts.types import CapabilityPackageVersion, CapabilityProvisionCommand, ComputeSpec, ExecutionContract, FunctionCapabilityPackageBody, NodeInputBinding, ResourceRef, TaskClosure, TypedHole
+from loom_v2.contracts.types import CapabilityPackageVersion, CapabilityProvisionCommand, ComputeSpec, ExecutionContract, NodeInputBinding, ResourceRef, TaskClosure, TypedHole
 from loom_v2.content_store import canonical_json_bytes
 from loom_v2.slave.executor import ProcessJSONStdioV1Adapter, default_registry
 from loom_v2.slave.service import SlaveService
@@ -34,8 +34,12 @@ def test_default_registry_has_only_subprocess_adapter():
 
 
 def test_default_registry_rejects_removed_builtin_executor():
-    with pytest.raises(ValueError, match="unsupported_executor:builtin:function/1"):
-        default_registry.get(ExecutionContract(kind="builtin:function", version="1"))
+    with pytest.raises(
+        ValueError, match="unsupported_executor:function/builtin:function/1"
+    ):
+        default_registry.get_for(
+            "function", ExecutionContract(kind="builtin:function", version="1")
+        )
 
 
 @pytest.mark.asyncio
@@ -83,16 +87,20 @@ async def test_slave_provision_rejects_package_without_io_contract():
         package_closure_version_ref="closure",
         source_run_ref="run",
         source_closure_version_ref="version",
-        body=FunctionCapabilityPackageBody(operation_descriptor_ref=ResourceRef(resource_id="loom://check"), program_content_ref=program_ref, io_contract_ref=None),
+        capability_exports=[],
+        body={"program_content_ref": program_ref.model_dump(mode="json")},
+        package_digest="",
     )
 
-    with pytest.raises(RuntimeError, match="io_contract_required"):
+    with pytest.raises(RuntimeError, match="capability_package_invalid"):
         await service.provision(
             CapabilityProvisionCommand(
                 command_id="command-contract-required",
                 package_version_ref=package.version_ref,
                 package_digest=package.package_digest,
                 target_slave="slave-a",
+                idempotency_key="command-contract-required",
+                activation_revision=1,
             ),
             package,
         )

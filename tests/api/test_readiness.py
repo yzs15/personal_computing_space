@@ -7,11 +7,11 @@ from loom_v2.observer.app import create_app
 from loom_v2.observer.repository import ObserverRepository
 
 
-def _binding(operation: str = "run_code", target: str = "slave-a", *, package_ref: dict | None = None) -> dict:
+def _binding(operation: str = "run_code", target: str = "slave-a", *, package_ref: dict | None = None, descriptor_ref: dict | None = None) -> dict:
     return {
         "binding_id": f"binding-{operation}",
         "hole_id": "h_run_code",
-        "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
+        "capability_descriptor_ref": descriptor_ref or {"resource_id": "executor://process:json_stdio/1"},
         "capability_package_ref": package_ref,
         "target_resource_ref": {"resource_id": target},
         "bound_by": "test-driver",
@@ -93,6 +93,13 @@ def test_run_code_binding_requires_package_and_then_allows_start():
             },
         },
     ).json()
+    descriptor_ref = client.post(
+        "/api/v1/content",
+        json={
+            "media_type": "application/vnd.loom.operation-descriptor+json",
+            "content": {"schema_version": "operation.v1", "resource_id": "loom://run_code", "name": "run_code"},
+        },
+    ).json()
     run2, patch2 = _add_run_code_hole(client, "valid")
     packaged = client.post(
         f"/api/v1/runs/{run2['run_id']}/patches",
@@ -107,11 +114,18 @@ def test_run_code_binding_requires_package_and_then_allows_start():
                     "value": {
                                  "package_id": "readiness-run-code",
                                  "package_version": "v1",
+                                 "package_type": "function",
                                  "execution": {"kind": "process:json_stdio", "version": "1"},
-                                 "body": {
-                                     "operation_descriptor_ref": "loom://run_code",
-                                     "program_content_ref": program_ref,
+                                 "capability_exports": [{
+                                     "capability_descriptor_ref": descriptor_ref,
                                      "io_contract_ref": contract_ref,
+                                     "effect_class": "Sandboxed",
+                                     "permissions": [],
+                                     "replay_safety": "DeclaredByPackage",
+                                     "runtime_binding": {},
+                                 }],
+                                 "body": {
+                                     "program_content_ref": program_ref,
                                  },
                              },
                 },
@@ -131,7 +145,8 @@ def test_run_code_binding_requires_package_and_then_allows_start():
                         **_binding(
                             package_ref={
                                 "resource_id": "capability-package://readiness-run-code/v1",
-                            }
+                            },
+                            descriptor_ref=descriptor_ref,
                         ),
                     },
                 }

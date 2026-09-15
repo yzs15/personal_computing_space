@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from loom_v2.contracts.types import ClosureContract, TaskClosure
 from loom_v2.observer.repository import ObserverRepository
-from loom_v2.content_store import ContentStore
+from loom_v2.content_store import ContentStore, put_typed_content
 
 from .tools import DriverTools
 
@@ -60,10 +60,11 @@ class DriverMCP:
             if self.control is not None:
                 if self.content_store is None:
                     raise RuntimeError("content_store_unavailable")
-                media_type = str(arguments.get("media_type") or "application/json")
-                raw = arguments["content"]
-                body = raw if isinstance(raw, (bytes, bytearray)) else raw.encode("utf-8") if isinstance(raw, str) else json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-                ref = await self.content_store.put(body, media_type=media_type)
+                ref = await put_typed_content(
+                    self.content_store,
+                    arguments["content"],
+                    media_type=str(arguments.get("media_type") or "application/json"),
+                )
                 return {"resource_ref": ref.model_dump(mode="json")}
             ref = await self.repository.put_content(
                 arguments["content"],
@@ -157,8 +158,8 @@ class DriverMCP:
                 "capabilities": result.get("capabilities", []),
                 "packages": result.get("packages", []),
                 "executor_descriptors": [
-                    {"kind": "process:json_stdio", "version": "1", "operations": ["run_code"]},
-                    {"kind": "container:python_orchestrator", "version": "1", "operations": ["orchestrate"]},
+                    {"package_type": "function", "kind": "process:json_stdio", "version": "1", "operations": ["run_code"]},
+                    {"package_type": "function", "kind": "container:python_orchestrator", "version": "1", "operations": ["orchestrate"], "driver_special": True},
                 ],
             }
         await self.repository.refresh_slaves(self.workspace_id)
@@ -173,8 +174,8 @@ class DriverMCP:
                 for resource_id, details in sorted(self.repository.slave_capabilities.items())
             ],
             "executor_descriptors": [
-                {"kind": "process:json_stdio", "version": "1", "operations": ["run_code"]},
-                {"kind": "container:python_orchestrator", "version": "1", "operations": ["orchestrate"]},
+                {"package_type": "function", "kind": "process:json_stdio", "version": "1", "operations": ["run_code"]},
+                {"package_type": "function", "kind": "container:python_orchestrator", "version": "1", "operations": ["orchestrate"], "driver_special": True},
             ],
         }
 
@@ -338,7 +339,13 @@ class DriverMCP:
             {
                 "type": "function",
                 "name": "loom_put_content",
-                "description": "Upload one immutable content object. JSON Schema and IoContract bodies are canonicalized and validated; use media_type to distinguish schemas, contracts, programs, and artifacts.",
+                "description": (
+                    "Upload one immutable content object and use the returned ResourceRef; do not "
+                    "calculate or write a digest. JSON Schema and IoContract bodies are canonicalized "
+                    "and validated. Upload operation descriptors with media type "
+                    "`application/vnd.loom.operation-descriptor+json`; the returned ref carries the "
+                    "authoritative domain-separated descriptor digest."
+                ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -359,8 +366,10 @@ class DriverMCP:
                     "intermediate readiness result or a prior operation's result is required. "
                     "For `set_execution_payload`, provide `value.input_ref` (a ResourceRef "
                     "returned by `loom_put_content`); raw payload values are rejected. "
-                    "Capability package materialization likewise requires pre-uploaded "
-                    "`program_content_ref` and `io_contract_ref`."
+                    "For `materialize_capability_package_candidate`, provide the generic package "
+                    "envelope `package_type`, `execution`, `capability_exports`, and schema-validated "
+                    "`body`; descriptor, IoContract, program, and schema refs must come from "
+                    "`loom_put_content`. Omit `package_digest`; Loom computes it."
                 ),
                 "inputSchema": {
                     "type": "object",

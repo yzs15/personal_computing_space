@@ -69,6 +69,19 @@ class FakeCodingAgentProvider:
         if handler is None:
             raise RuntimeError("fake_mcp_handler_required")
 
+        operation_ref = "loom://test_double"
+        descriptor = await handler(
+            "loom_put_content",
+            {
+                "media_type": "application/vnd.loom.operation-descriptor+json",
+                "content": {
+                    "schema_version": "operation.v1",
+                    "resource_id": operation_ref,
+                    "name": "test_double",
+                },
+            },
+        )
+        yield AgentEvent("tool_call", {"tool": "loom_put_content"})
         program = await handler(
             "loom_put_content",
             {
@@ -104,7 +117,7 @@ class FakeCodingAgentProvider:
         program_ref = program["resource_ref"]
         io_contract_ref = io_contract["resource_ref"]
         input_ref = input_content["resource_ref"]
-        operation_ref = "loom://test_double"
+        capability_descriptor_ref = descriptor["resource_ref"]
         yield AgentEvent(
             "open_run",
             {
@@ -149,10 +162,18 @@ class FakeCodingAgentProvider:
                                  "package_version": "v1",
                                  "package_type": "function",
                                  "execution": {"kind": "process:json_stdio", "version": "1"},
+                                 "capability_exports": [
+                                     {
+                                         "capability_descriptor_ref": capability_descriptor_ref,
+                                         "io_contract_ref": io_contract_ref,
+                                         "effect_class": "Sandboxed",
+                                         "permissions": [],
+                                         "replay_safety": "DeclaredByPackage",
+                                         "runtime_binding": {},
+                                     }
+                                 ],
                                  "body": {
-                                     "operation_descriptor_ref": operation_ref,
                                      "program_content_ref": program_ref,
-                                     "io_contract_ref": io_contract_ref,
                                  },
                              },
                 }
@@ -166,7 +187,7 @@ class FakeCodingAgentProvider:
                     "value": {
                         "binding_id": "binding-h_compute",
                         "hole_id": "h_compute",
-                        "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
+                        "capability_descriptor_ref": capability_descriptor_ref,
                         "capability_package_ref": {"resource_id": "capability-package://fake-run-code/v1"},
                         "target_resource_ref": {"resource_id": "slave-a"},
                         "bound_by": "fake-driver",

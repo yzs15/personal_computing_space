@@ -9,6 +9,7 @@ from loom_v2.driver.service import DriverService
 from loom_v2.driver.worker import WorkerSession, WorkerUnavailableError
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.slave.app import create_app as create_slave_app
+from tests.support.package_fixture import orchestration_package_value, process_package_value
 
 
 FAMILIES = ("perovskite", "rutile", "zincblende")
@@ -238,39 +239,15 @@ async def test_deterministic_bandgap_report_executes_parse_summarize_merge_and_r
             {"kind": "set_execution_payload", "value": {"node_id": "loom://orchestrate", "input_ref": parent_input.model_dump(mode="json")}},
             {
                 "kind": "materialize_capability_package_candidate",
-                "value": {
-                             "package_id": "df_xml_parse",
-                             "package_version": "v1",
-                             "body": {
-                                 "program_content_ref": parse_program.model_dump(mode="json"),
-                                 "io_contract_ref": parse_contract.model_dump(mode="json"),
-                                 "operation_descriptor_ref": "loom://df_xml_parse",
-                             },
-                         },
+                "value": process_package_value(repo, package_id="df_xml_parse", operation_ref="loom://df_xml_parse", program_content_ref=parse_program, io_contract_ref=parse_contract),
             },
             {
                 "kind": "materialize_capability_package_candidate",
-                "value": {
-                             "package_id": "summarize_bandgap",
-                             "package_version": "v1",
-                             "body": {
-                                 "program_content_ref": summarize_program.model_dump(mode="json"),
-                                 "io_contract_ref": summarize_contract.model_dump(mode="json"),
-                                 "operation_descriptor_ref": "loom://summarize_bandgap",
-                             },
-                         },
+                "value": process_package_value(repo, package_id="summarize_bandgap", operation_ref="loom://summarize_bandgap", program_content_ref=summarize_program, io_contract_ref=summarize_contract),
             },
             {
                 "kind": "materialize_capability_package_candidate",
-                "value": {
-                             "package_id": "merge_bandgap_report",
-                             "package_version": "v1",
-                             "body": {
-                                 "program_content_ref": merge_program.model_dump(mode="json"),
-                                 "io_contract_ref": merge_contract.model_dump(mode="json"),
-                                 "operation_descriptor_ref": "loom://merge_bandgap_report",
-                             },
-                         },
+                "value": process_package_value(repo, package_id="merge_bandgap_report", operation_ref="loom://merge_bandgap_report", program_content_ref=merge_program, io_contract_ref=merge_contract),
             },
         ],
     )
@@ -279,19 +256,26 @@ async def test_deterministic_bandgap_report_executes_parse_summarize_merge_and_r
         package.package_id: ResourceRef(resource_id=package.version_ref, version_or_digest=package.package_digest)
         for package in packages
     }
+    descriptor_refs = {
+        package.package_id: package.capability_exports[0].capability_descriptor_ref
+        for package in packages
+    }
     orchestration_source = f"""
 PARSE = {package_refs["df_xml_parse"].model_dump(mode="json")}
+PARSE_DESCRIPTOR = {descriptor_refs["df_xml_parse"].model_dump(mode="json")}
 SUMMARIZE = {package_refs["summarize_bandgap"].model_dump(mode="json")}
+SUMMARIZE_DESCRIPTOR = {descriptor_refs["summarize_bandgap"].model_dump(mode="json")}
 MERGE = {package_refs["merge_bandgap_report"].model_dump(mode="json")}
+MERGE_DESCRIPTOR = {descriptor_refs["merge_bandgap_report"].model_dump(mode="json")}
 
 
 async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> "ResourceRef":
     document = await ctx.read_json(input_ref)
-    parse_handles = [ctx.emit_node(PARSE, [partition]) for partition in document["partitions"]]
+    parse_handles = [ctx.emit_node(PARSE, PARSE_DESCRIPTOR, [partition]) for partition in document["partitions"]]
     parsed = [await ctx.result(handle) for handle in parse_handles]
-    summary_handles = [ctx.emit_node(SUMMARIZE, [parsed_ref]) for parsed_ref in parsed]
+    summary_handles = [ctx.emit_node(SUMMARIZE, SUMMARIZE_DESCRIPTOR, [parsed_ref]) for parsed_ref in parsed]
     summaries = [await ctx.result(handle) for handle in summary_handles]
-    merged = ctx.emit_node(MERGE, summaries)
+    merged = ctx.emit_node(MERGE, MERGE_DESCRIPTOR, summaries)
     return await ctx.result(merged)
 """
     orchestration_program = await _put_content(repo, orchestration_source, "text/x-python")
@@ -303,23 +287,7 @@ async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> 
         [
             {
                 "kind": "materialize_capability_package_candidate",
-                "value": {
-                             "package_id": "orchestrate_bandgap",
-                             "package_version": "v1",
-                             "execution": {"kind": "container:python_orchestrator", "version": "1"},
-                             "body": {
-                                 "program_content_ref": orchestration_program.model_dump(mode="json"),
-                                 "io_contract_ref": parent_contract.model_dump(mode="json"),
-                                 "operation_descriptor_ref": "loom://orchestrate",
-                                 "allowed_node_package_refs": [
-                        package_refs["df_xml_parse"].model_dump(mode="json"),
-                        package_refs["summarize_bandgap"].model_dump(mode="json"),
-                        package_refs["merge_bandgap_report"].model_dump(mode="json"),
-                    ],
-                                 "max_nodes": 6,
-                                 "max_live_nodes": 2,
-                             },
-                         },
+                "value": orchestration_package_value(repo, package_id="orchestrate_bandgap", operation_ref="loom://orchestrate", program_content_ref=orchestration_program, io_contract_ref=parent_contract, allowed_node_package_refs=[package_refs["df_xml_parse"], package_refs["summarize_bandgap"], package_refs["merge_bandgap_report"]], max_nodes=6, max_live_nodes=2),
             },
         ],
     )
@@ -394,15 +362,7 @@ async def test_parse_package_promotion_and_abandon_are_explicit_user_decisions()
             [
                 {
                     "kind": "materialize_capability_package_candidate",
-                    "value": {
-                                 "package_id": f"df_xml_parse_{terminal_action}",
-                                 "package_version": "v1",
-                                 "body": {
-                                     "program_content_ref": program_ref.model_dump(mode="json"),
-                                     "io_contract_ref": contract_ref.model_dump(mode="json"),
-                                     "operation_descriptor_ref": "loom://df_xml_parse",
-                                 },
-                             },
+                    "value": process_package_value(repo, package_id=f"df_xml_parse_{terminal_action}", operation_ref="loom://df_xml_parse", program_content_ref=program_ref, io_contract_ref=contract_ref),
                 },
             ],
         )
@@ -467,20 +427,13 @@ async def test_lost_slave_a_attempt_is_reassigned_to_slave_b():
             {"kind": "set_execution_payload", "value": {"node_id": "loom://orchestrate", "input_ref": parent_input.model_dump(mode="json")}},
             {
                 "kind": "materialize_capability_package_candidate",
-                "value": {
-                             "package_id": "probe",
-                             "package_version": "v1",
-                             "body": {
-                                 "program_content_ref": node_program.model_dump(mode="json"),
-                                 "io_contract_ref": contract.model_dump(mode="json"),
-                                 "operation_descriptor_ref": "loom://probe",
-                             },
-                         },
+                "value": process_package_value(repo, package_id="probe", operation_ref="loom://probe", program_content_ref=node_program, io_contract_ref=contract),
             },
         ],
     )
     node_package = next(package for package in (await repo.get_run(run.run_id)).capability_packages if package.package_id == "probe")
     node_ref = ResourceRef(resource_id=node_package.version_ref, version_or_digest=node_package.package_digest)
+    node_descriptor_ref = node_package.capability_exports[0].capability_descriptor_ref
     orchestration_patch = await repo.apply_patch(
         run.run_id,
         patched.draft_version,
@@ -489,19 +442,7 @@ async def test_lost_slave_a_attempt_is_reassigned_to_slave_b():
         [
             {
                 "kind": "materialize_capability_package_candidate",
-                "value": {
-                             "package_id": "orchestrate_probe",
-                             "package_version": "v1",
-                             "execution": {"kind": "container:python_orchestrator", "version": "1"},
-                             "body": {
-                                 "program_content_ref": orchestration_program.model_dump(mode="json"),
-                                 "io_contract_ref": contract.model_dump(mode="json"),
-                                 "operation_descriptor_ref": "loom://orchestrate",
-                                 "allowed_node_package_refs": [node_ref.model_dump(mode="json")],
-                                 "max_nodes": 1,
-                                 "max_live_nodes": 1,
-                             },
-                         },
+                "value": orchestration_package_value(repo, package_id="orchestrate_probe", operation_ref="loom://orchestrate", program_content_ref=orchestration_program, io_contract_ref=contract, allowed_node_package_refs=[node_ref], max_nodes=1, max_live_nodes=1),
             },
         ],
     )
@@ -511,7 +452,7 @@ async def test_lost_slave_a_attempt_is_reassigned_to_slave_b():
 
     class SingleNodeExecutor:
         async def run(self, _program, _input_ref, *, read_json, emit_node, result):
-            handle = await emit_node(node_ref, [parent_input])
+            handle = await emit_node(node_ref, node_descriptor_ref, [parent_input])
             return await result(handle)
 
     class LosingWorker:

@@ -151,6 +151,9 @@ def test_live_distributed_statistics_across_both_slaves():
             for i in range(1, 5)
         ]
         input_ref = _put(client, conversation_ref, {"partitions": partition_refs}, "application/json")
+        summarize_descriptor = _put(client, conversation_ref, {"schema_version": "operation.v1", "resource_id": "loom://summarize", "name": "summarize"}, "application/vnd.loom.operation-descriptor+json")
+        merge_descriptor = _put(client, conversation_ref, {"schema_version": "operation.v1", "resource_id": "loom://merge-summaries", "name": "merge-summaries"}, "application/vnd.loom.operation-descriptor+json")
+        orchestration_descriptor = _put(client, conversation_ref, {"schema_version": "operation.v1", "resource_id": "loom://orchestrate", "name": "orchestrate"}, "application/vnd.loom.operation-descriptor+json")
 
         # 4. Open the Run with the high-level closure contract.
         closure = json.loads(_read("closure.json"))
@@ -171,10 +174,11 @@ def test_live_distributed_statistics_across_both_slaves():
                         "value": {
                                      "package_id": "summarize",
                                      "package_version": "v1",
+                                     "package_type": "function",
+                                     "execution": {"kind": "process:json_stdio", "version": "1"},
+                                     "capability_exports": [{"capability_descriptor_ref": summarize_descriptor, "io_contract_ref": summarize_contract, "effect_class": "Sandboxed", "permissions": [], "replay_safety": "DeclaredByPackage", "runtime_binding": {}}],
                                      "body": {
                                          "program_content_ref": summarize_program,
-                                         "io_contract_ref": summarize_contract,
-                                         "operation_descriptor_ref": "loom://summarize",
                                      },
                                  },
                     },
@@ -183,10 +187,11 @@ def test_live_distributed_statistics_across_both_slaves():
                         "value": {
                                      "package_id": "merge-summaries",
                                      "package_version": "v1",
+                                     "package_type": "function",
+                                     "execution": {"kind": "process:json_stdio", "version": "1"},
+                                     "capability_exports": [{"capability_descriptor_ref": merge_descriptor, "io_contract_ref": merge_contract, "effect_class": "Sandboxed", "permissions": [], "replay_safety": "DeclaredByPackage", "runtime_binding": {}}],
                                      "body": {
                                          "program_content_ref": merge_program,
-                                         "io_contract_ref": merge_contract,
-                                         "operation_descriptor_ref": "loom://merge-summaries",
                                      },
                                  },
                     },
@@ -203,7 +208,9 @@ def test_live_distributed_statistics_across_both_slaves():
         orchestration_source = (
             _read("programs/orchestrate.py.tpl")
             .replace("SUMMARIZE_REF_PLACEHOLDER", json.dumps(summarize_ref))
+            .replace("SUMMARIZE_DESCRIPTOR_REF_PLACEHOLDER", json.dumps(summarize_descriptor))
             .replace("MERGE_REF_PLACEHOLDER", json.dumps(merge_ref))
+            .replace("MERGE_DESCRIPTOR_REF_PLACEHOLDER", json.dumps(merge_descriptor))
         )
         orchestration_program = _put(client, conversation_ref, orchestration_source, "text/x-python")
         patched = _mcp_call(
@@ -217,11 +224,11 @@ def test_live_distributed_statistics_across_both_slaves():
                         "value": {
                                      "package_id": "orchestrate",
                                      "package_version": "v1",
+                                     "package_type": "function",
                                      "execution": {"kind": "container:python_orchestrator", "version": "1"},
+                                     "capability_exports": [{"capability_descriptor_ref": orchestration_descriptor, "io_contract_ref": parent_contract, "effect_class": "Sandboxed", "permissions": [], "replay_safety": "DeterministicByEventLog", "runtime_binding": {}}],
                                      "body": {
                                          "program_content_ref": orchestration_program,
-                                         "io_contract_ref": parent_contract,
-                                         "operation_descriptor_ref": "loom://orchestrate",
                                          "allowed_node_package_refs": [summarize_ref, merge_ref],
                                          "max_nodes": 6,
                                          "max_live_nodes": 2,

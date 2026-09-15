@@ -14,7 +14,9 @@ class Settings(BaseSettings):
     worker_operation_timeout_seconds: float = 90.0
     observer_forward_timeout_seconds: float = 86400.0
     capability_operation_timeout_seconds: float = 30.0
+    capability_health_interval_seconds: float = 5.0
     runtime_plugin_dir: str = "/opt/loom/runtime-plugins"
+    package_contract_dir: str = "/opt/loom/package-contracts"
     runtime_plugin_socket_dir: str = "/run/loom/runtime-plugins"
     runtime_plugin_startup_timeout_seconds: float = 10.0
     runtime_plugin_call_timeout_seconds: float = 90.0

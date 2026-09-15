@@ -74,7 +74,13 @@ class MixedControl:
                 "lease_state": "active",
                 "capabilities": {
                     "operations": ["run_code"],
-                    "executor_descriptors": ["process:json_stdio"],
+                    "executor_descriptors": [
+                        {
+                            "package_type": "function",
+                            "kind": "process:json_stdio",
+                            "version": "1",
+                        }
+                    ],
                 },
             },
         ]
@@ -88,8 +94,14 @@ async def test_refresh_slaves_prefers_active_lease_over_stale_registration():
     assert repository.slave_agents["slave-b"]["instance_id"] == "slave-b-new"
     assert repository.slave_instances[("slave-b", "slave-b-expired")]["lease_state"] == "expired"
     assert repository.slave_capabilities["slave-b"]["operations"] == {"run_code"}
-    supported = SimpleNamespace(execution=SimpleNamespace(kind="process:json_stdio"))
-    unsupported = SimpleNamespace(execution=SimpleNamespace(kind="unknown_v1", version="1"))
+    supported = SimpleNamespace(
+        package_type="function",
+        execution=SimpleNamespace(kind="process:json_stdio", version="1"),
+    )
+    unsupported = SimpleNamespace(
+        package_type="function",
+        execution=SimpleNamespace(kind="unknown_v1", version="1"),
+    )
     assert repository._slave_supports_package("slave-b", supported) is True
     assert repository._slave_supports_package("slave-b", unsupported) is False
 

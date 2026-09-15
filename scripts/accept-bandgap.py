@@ -37,6 +37,8 @@ import uuid
 from typing import Any, Callable
 from urllib.parse import urljoin
 
+from loom_v2.digest import digest_json
+
 
 DEFAULT_OBSERVER = "http://localhost:18080"
 WORKSPACE_ID = "workspace-default"
@@ -148,6 +150,20 @@ def mcp_call(observer: str, conversation_ref: str, name: str, arguments: dict, t
 
 def put_content(observer: str, conversation_ref: str, content: Any, media_type: str) -> dict:
     return mcp_call(observer, conversation_ref, "loom_put_content", {"content": content, "media_type": media_type})["resource_ref"]
+
+
+def put_descriptor(observer: str, conversation_ref: str, content: dict[str, Any]) -> dict:
+    content_ref = put_content(
+        observer,
+        conversation_ref,
+        content,
+        "application/vnd.loom.operation-descriptor+json",
+    )
+    return {
+        "resource_id": content_ref["resource_id"],
+        "version_or_digest": digest_json(content, domain="loom/operation-descriptor/v1"),
+        "identity_criterion": "descriptor_digest",
+    }
 
 
 def get_run(observer: str, run_id: str) -> dict:
@@ -267,15 +283,22 @@ MERGE_PROGRAM = (
 )
 
 
-def orchestration_source(summarize_ref: dict, merge_ref: dict) -> str:
+def orchestration_source(
+    summarize_ref: dict,
+    summarize_descriptor_ref: dict,
+    merge_ref: dict,
+    merge_descriptor_ref: dict,
+) -> str:
     return (
         "SUMMARIZE = " + json.dumps(summarize_ref) + "\n"
+        "SUMMARIZE_DESCRIPTOR = " + json.dumps(summarize_descriptor_ref) + "\n"
         "MERGE = " + json.dumps(merge_ref) + "\n"
+        "MERGE_DESCRIPTOR = " + json.dumps(merge_descriptor_ref) + "\n"
         'async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> "ResourceRef":\n'
         "    document = await ctx.read_json(input_ref)\n"
-        "    handles = [ctx.emit_node(SUMMARIZE, [partition]) for partition in document[\"partitions\"]]\n"
+        "    handles = [ctx.emit_node(SUMMARIZE, SUMMARIZE_DESCRIPTOR, [partition]) for partition in document[\"partitions\"]]\n"
         "    summaries = [await ctx.result(handle) for handle in handles]\n"
-        "    merged = ctx.emit_node(MERGE, summaries)\n"
+        "    merged = ctx.emit_node(MERGE, MERGE_DESCRIPTOR, summaries)\n"
         "    return await ctx.result(merged)\n"
     )
 
@@ -317,6 +340,9 @@ def run_mcp_mode(
 
     summarize_program = put_content(observer, conversation_ref, SUMMARIZE_PROGRAM, "text/x-python")
     merge_program = put_content(observer, conversation_ref, MERGE_PROGRAM, "text/x-python")
+    summarize_descriptor = put_descriptor(observer, conversation_ref, {"schema_version": "operation.v1", "resource_id": "loom://summarize-bandgap", "name": "summarize-bandgap"})
+    merge_descriptor = put_descriptor(observer, conversation_ref, {"schema_version": "operation.v1", "resource_id": "loom://merge-bandgap", "name": "merge-bandgap"})
+    orchestration_descriptor = put_descriptor(observer, conversation_ref, {"schema_version": "operation.v1", "resource_id": "loom://orchestrate", "name": "orchestrate"})
 
     chunks = [corpus[i::partitions] for i in range(partitions)]
     partitions_payload = [{"items": chunk} for chunk in chunks]
@@ -348,10 +374,11 @@ def run_mcp_mode(
                     "value": {
                                  "package_id": "summarize-bandgap",
                                  "package_version": "v1",
+                                 "package_type": "function",
+                                 "execution": {"kind": "process:json_stdio", "version": "1"},
+                                 "capability_exports": [{"capability_descriptor_ref": summarize_descriptor, "io_contract_ref": summarize_contract, "effect_class": "Sandboxed", "permissions": [], "replay_safety": "DeclaredByPackage", "runtime_binding": {}}],
                                  "body": {
                                      "program_content_ref": summarize_program,
-                                     "io_contract_ref": summarize_contract,
-                                     "operation_descriptor_ref": "loom://summarize-bandgap",
                                  },
                              },
                 },
@@ -360,10 +387,11 @@ def run_mcp_mode(
                     "value": {
                                  "package_id": "merge-bandgap",
                                  "package_version": "v1",
+                                 "package_type": "function",
+                                 "execution": {"kind": "process:json_stdio", "version": "1"},
+                                 "capability_exports": [{"capability_descriptor_ref": merge_descriptor, "io_contract_ref": merge_contract, "effect_class": "Sandboxed", "permissions": [], "replay_safety": "DeclaredByPackage", "runtime_binding": {}}],
                                  "body": {
                                      "program_content_ref": merge_program,
-                                     "io_contract_ref": merge_contract,
-                                     "operation_descriptor_ref": "loom://merge-bandgap",
                                  },
                              },
                 },
@@ -376,7 +404,7 @@ def run_mcp_mode(
     summarize_ref = {"resource_id": f"capability-package://{summarize_package['package_id']}/{summarize_package['package_version']}", "version_or_digest": summarize_package["package_digest"]}
     merge_ref = {"resource_id": f"capability-package://{merge_package['package_id']}/{merge_package['package_version']}", "version_or_digest": merge_package["package_digest"]}
 
-    orchestration_program = put_content(observer, conversation_ref, orchestration_source(summarize_ref, merge_ref), "text/x-python")
+    orchestration_program = put_content(observer, conversation_ref, orchestration_source(summarize_ref, summarize_descriptor, merge_ref, merge_descriptor), "text/x-python")
     patched = mcp_call(
         observer,
         conversation_ref,
@@ -388,11 +416,11 @@ def run_mcp_mode(
                     "value": {
                                  "package_id": "orchestrate",
                                  "package_version": "v1",
+                                 "package_type": "function",
                                  "execution": {"kind": "container:python_orchestrator", "version": "1"},
+                                 "capability_exports": [{"capability_descriptor_ref": orchestration_descriptor, "io_contract_ref": parent_contract, "effect_class": "Sandboxed", "permissions": [], "replay_safety": "DeterministicByEventLog", "runtime_binding": {}}],
                                  "body": {
                                      "program_content_ref": orchestration_program,
-                                     "io_contract_ref": parent_contract,
-                                     "operation_descriptor_ref": "loom://orchestrate",
                                      "allowed_node_package_refs": [summarize_ref, merge_ref],
                                      "max_nodes": 8,
                                      "max_live_nodes": 2,

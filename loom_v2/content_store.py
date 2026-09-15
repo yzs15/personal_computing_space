@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -11,7 +12,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from loom_v2.contracts.types import ResourceRef
-from loom_v2.digest import canonical_json_bytes, digest_bytes
+from loom_v2.digest import canonical_json_bytes, digest_bytes, digest_json
 
 
 _DIGEST_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -267,4 +268,56 @@ class ContentStore:
             return None
 
 
-__all__ = ["ContentStore", "ContentStat"]
+async def put_typed_content(store: ContentStore, content: Any, *, media_type: str) -> ResourceRef:
+    """Validate and canonicalize uploads shared by local and remote Drivers."""
+
+    normalized_media_type = str(media_type or "").split(";", 1)[0].strip().lower()
+    if not normalized_media_type:
+        raise ValueError("media_type_required")
+    json_media_types = {
+        "application/json",
+        "application/schema+json",
+        "application/vnd.loom.io-contract+json",
+        "application/vnd.loom.operation-descriptor+json",
+    }
+    parsed: Any | None = None
+    if normalized_media_type in json_media_types:
+        if isinstance(content, (bytes, bytearray, str)):
+            try:
+                parsed = json.loads(content)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("invalid_json") from exc
+        else:
+            parsed = content
+        if normalized_media_type == "application/schema+json":
+            from loom_v2.contracts.io_schema import validate_schema
+
+            validate_schema(parsed)
+        elif normalized_media_type == "application/vnd.loom.io-contract+json":
+            from loom_v2.contracts.types import IoContract
+
+            try:
+                IoContract.model_validate(parsed)
+            except Exception as exc:
+                raise ValueError("io_contract_invalid") from exc
+        elif normalized_media_type == "application/vnd.loom.operation-descriptor+json" and not isinstance(parsed, dict):
+            raise ValueError("operation_descriptor_invalid")
+        body = canonical_json_bytes(parsed)
+    elif isinstance(content, str):
+        body = content.encode("utf-8")
+    elif isinstance(content, (bytes, bytearray)):
+        body = bytes(content)
+    else:
+        raise TypeError("content_must_be_string_or_bytes")
+    ref = await store.put(body, media_type=normalized_media_type)
+    if normalized_media_type != "application/vnd.loom.operation-descriptor+json":
+        return ref
+    return ResourceRef(
+        resource_id=ref.resource_id,
+        version_or_digest=digest_json(parsed, domain="loom/operation-descriptor/v1"),
+        identity_criterion="descriptor_digest",
+        access_binding=ref.access_binding,
+    )
+
+
+__all__ = ["ContentStore", "ContentStat", "put_typed_content"]

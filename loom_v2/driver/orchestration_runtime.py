@@ -14,6 +14,7 @@ from loom_v2.contracts.types import (
     ResourceRef,
     TaskClosure,
 )
+from loom_v2.contracts.package_contracts import DRIVER_ORCHESTRATOR_KEY
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.driver.worker import WorkerSession, WorkerUnavailableError
 from loom_v2.slave.executor import ExecutionResult
@@ -55,22 +56,35 @@ class DynamicOrchestrationRuntime:
             raise RuntimeError("execution_not_running")
         snapshot = record.committed.snapshot if record.committed is not None else record.draft.snapshot
         orchestration_ref = snapshot.program_systems.package_ref
-        if orchestration_ref is None or snapshot.program_systems.execution.kind != "container:python_orchestrator":
+        if orchestration_ref is None or (
+            snapshot.program_systems.execution.kind,
+            snapshot.program_systems.execution.version,
+        ) != DRIVER_ORCHESTRATOR_KEY[1:]:
             raise RuntimeError("orchestration_package_not_bound")
         try:
             orchestration_package = await self.repository.get_capability_package(orchestration_ref, run_id=run_id)
             if orchestration_package.publication_state == "abandoned":
                 raise RuntimeError("capability_package_abandoned")
             if (
-                orchestration_package.function_body.replay_safety != "DeterministicByEventLog"
-                or orchestration_package.function_body.captures_run_state
-                or orchestration_package.function_body.captured_secret_refs
-                or orchestration_package.function_body.captured_path_refs
+                orchestration_package.package_type,
+                orchestration_package.execution.kind,
+                orchestration_package.execution.version,
+            ) != DRIVER_ORCHESTRATOR_KEY:
+                raise RuntimeError("orchestration_package_invalid")
+            orchestration_export = self.repository._single_export(orchestration_package)
+            if (
+                orchestration_export.replay_safety != "DeterministicByEventLog"
+                or bool(orchestration_package.body.get("captures_run_state", False))
+                or orchestration_package.body.get("captured_secret_refs")
+                or orchestration_package.body.get("captured_path_refs")
             ):
                 raise RuntimeError("orchestration_not_replayable")
+            if int(orchestration_package.body["max_live_nodes"]) > int(orchestration_package.body["max_nodes"]):
+                raise RuntimeError("orchestration_live_node_limit_exceeded")
+            program_ref = self.repository._package_body_ref(orchestration_package, "program_content_ref")
             program = await self.repository.content_store.get(
-                orchestration_package.function_body.program_content_ref,
-                expected_digest=orchestration_package.function_body.program_digest,
+                program_ref,
+                expected_digest=program_ref.digest,
             )
             operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
             input_binding = self.repository._input_binding_for(snapshot, operation_ref)
@@ -89,7 +103,11 @@ class DynamicOrchestrationRuntime:
         async def read_json(ref: ResourceRef):
             return await self.repository._load_json_content(ref)
 
-        async def emit_node(package_ref: ResourceRef, input_refs: list[ResourceRef]) -> str:
+        async def emit_node(
+            package_ref: ResourceRef,
+            capability_descriptor_ref: ResourceRef,
+            input_refs: list[ResourceRef],
+        ) -> str:
             nonlocal intent_sequence
             intent_sequence += 1
             intent_id = f"intent-{intent_sequence:04d}"
@@ -112,7 +130,11 @@ class DynamicOrchestrationRuntime:
                 node_package = candidate
             existing = next((node for node in record.dynamic_nodes if node.intent_id == intent_id), None)
             if existing is not None and existing.state == "completed":
-                if existing.package_ref != package_ref or existing.input_refs != input_refs:
+                if (
+                    existing.package_ref != package_ref
+                    or existing.capability_descriptor_ref != capability_descriptor_ref
+                    or existing.input_refs != input_refs
+                ):
                     raise RuntimeError("node_intent_conflict")
                 current_record = await self.repository.get_run(run_id)
                 previous = next(
@@ -151,12 +173,17 @@ class DynamicOrchestrationRuntime:
             target = (
                 previous_target
                 if existing is not None and previous_target and not record.allow_reassignment
-                else self._select_target(node_package, current_record)
+                else self._select_target(
+                    node_package,
+                    capability_descriptor_ref,
+                    current_record,
+                )
             )
             intent = NodeIntent(
                 intent_id=intent_id,
                 execution_id=record.execution_id,
                 package_ref=package_ref,
+                capability_descriptor_ref=capability_descriptor_ref,
                 input_refs=input_refs,
             )
             node = await self.repository.accept_node_intent(run_id, intent, selected_target=target)
@@ -214,7 +241,7 @@ class DynamicOrchestrationRuntime:
         execution_result = ExecutionResult(
             resource_ref=final_ref,
             value=value,
-            replay_safety=orchestration_package.function_body.replay_safety,
+            replay_safety=orchestration_export.replay_safety,
             terminal_state=terminal_state,
             terminal_error=completed.outcome.get("terminal_error") if completed.outcome else None,
         )
@@ -223,13 +250,18 @@ class DynamicOrchestrationRuntime:
     def _select_target(
         self,
         package: CapabilityPackageVersion,
+        capability_descriptor_ref: ResourceRef,
         record: Any,
         *,
         exclude_targets: set[str] | None = None,
     ) -> str:
         closure = record.committed.snapshot if getattr(record, "committed", None) is not None else record.draft.snapshot
         allowed_effects = set(record.closure_contract.allowed_effects) if record.closure_contract is not None else set()
-        if package.function_body.permissions and not set(package.function_body.permissions).issubset(allowed_effects):
+        try:
+            capability_export = package.export_for(capability_descriptor_ref)
+        except ValueError as exc:
+            raise RuntimeError("node_capability_export_not_found") from exc
+        if capability_export.permissions and not set(capability_export.permissions).issubset(allowed_effects):
             raise RuntimeError("node_permission_denied")
         available = sorted(
             slave_id
@@ -256,15 +288,14 @@ class DynamicOrchestrationRuntime:
         activation_targets = {
             activation.target_slave
             for activation in record.capability_activations
-            if activation.package_version_ref
-            in {
-                package.version_ref,
-                f"{package.package_id}:{package.package_version}",
-            }
+            if activation.package_version_ref == package.version_ref
             and activation.activation_state == "ready"
         }
         candidates = [slave_id for slave_id in available if slave_id in activation_targets] or available
-        cursor_key = package.version_ref
+        cursor_key = (
+            f"{package.version_ref}#descriptor:"
+            f"{capability_descriptor_ref.digest or capability_descriptor_ref.resource_id}"
+        )
         cursor = self._round_robin_cursor.get(cursor_key, 0)
         target = candidates[cursor % len(candidates)]
         self._round_robin_cursor[cursor_key] = cursor + 1
@@ -342,6 +373,7 @@ class DynamicOrchestrationRuntime:
             try:
                 replacement_target = self._select_target(
                     package,
+                    node.capability_descriptor_ref,
                     record,
                     exclude_targets={source_target},
                 )
@@ -370,8 +402,12 @@ class DynamicOrchestrationRuntime:
         attempt_id = str(attempt["attempt_id"])
         target = str(attempt["target"])
         record = await self.repository.get_run(run_id)
-        operation_ref = package.function_body.operation_descriptor_ref
-        operation_ref = operation_ref.resource_id if isinstance(operation_ref, ResourceRef) else str(operation_ref)
+        try:
+            capability_export = package.export_for(node.capability_descriptor_ref)
+        except ValueError as exc:
+            raise RuntimeError("node_capability_export_not_found") from exc
+        descriptor_ref = node.capability_descriptor_ref
+        operation_ref = descriptor_ref.resource_id
         if len(node.input_refs) == 1:
             execution_input_ref = node.input_refs[0]
         else:
@@ -380,26 +416,41 @@ class DynamicOrchestrationRuntime:
         binding = ComputeBinding(
             binding_id=f"binding-{node.node_id}",
             hole_id=node.node_id,
-            capability_descriptor_ref=ResourceRef(resource_id=operation_ref, identity_criterion="descriptor_digest"),
+            capability_descriptor_ref=descriptor_ref,
             capability_package_ref=node.package_ref,
             target_resource_ref=ResourceRef(resource_id=target),
         )
         closure = TaskClosure(
             closure_id=node.node_id,
-            program={"operation_ref": operation_ref, "io_contract_ref": package.function_body.io_contract_ref.model_dump(mode="json")},
+            program={"operation_ref": operation_ref, "io_contract_ref": capability_export.io_contract_ref.model_dump(mode="json")},
             node_input_bindings=[
                 NodeInputBinding(node_id=operation_ref, input_ref=execution_input_ref)
             ],
         )
+        idempotency_key = f"{record.execution_id}-{node.node_id}-{package.package_digest}"
+        desired = await self.repository.set_capability_desired(
+            node.package_ref,
+            target,
+            desired_state="running",
+            idempotency_key=idempotency_key,
+            run_id=run_id,
+            activation_closure_version_ref=(
+                record.committed.version_id
+                if record.committed
+                else package.package_closure_version_ref
+            ),
+            compute_binding_ref=binding.binding_id,
+        )
         command = CapabilityProvisionCommand(
             command_id=f"provision-{node.node_id}",
-            package_version_ref=f"{package.package_id}:{package.package_version}",
+            package_version_ref=package.version_ref,
             package_digest=package.package_digest,
             target_slave=target,
             workspace_id=record.closure_contract.workspace_id if record.closure_contract else "workspace-default",
             activation_closure_version_ref=record.committed.version_id if record.committed else package.package_closure_version_ref,
             compute_binding=binding,
-            idempotency_key=f"{record.execution_id}-{node.node_id}-{package.package_digest}",
+            idempotency_key=desired.last_idempotency_key,
+            activation_revision=desired.activation_revision,
         )
         operation = self.repository._operation_name(operation_ref)
         worker = self.workers.get(target)

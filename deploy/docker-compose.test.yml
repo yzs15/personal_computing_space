@@ -1,7 +1,22 @@
 services:
+  # The production stack uses a one-shot bucket initializer.  That is
+  # correct for normal `up -d`, but `--abort-on-container-exit` treats the
+  # successful initializer exit as the test's termination signal before the
+  # Fake Driver can finish.  Keep the initializer attached for this profile
+  # and let dependents start once it has run its setup command.
+  minio-init:
+    command: ["mc alias set loom http://minio:9000 loom loom-content-secret && mc mb --ignore-existing loom/loom-content && tail -f /dev/null"]
+    healthcheck:
+      test: ["CMD-SHELL", "mc ls loom/loom-content >/dev/null 2>&1"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
   observer:
     environment:
       LOOM_CODING_AGENT_BACKEND: fake
+    depends_on:
+      minio-init: {condition: service_healthy}
 
   driver:
     build: ..
@@ -10,5 +25,14 @@ services:
       LOOM_CODING_AGENT_BACKEND: fake
       LOOM_OBSERVER_URL: http://observer:8080
     depends_on:
+      minio-init: {condition: service_healthy}
       observer: {condition: service_started}
     profiles: [test]
+
+  slave-a:
+    depends_on:
+      minio-init: {condition: service_healthy}
+
+  slave-b:
+    depends_on:
+      minio-init: {condition: service_healthy}

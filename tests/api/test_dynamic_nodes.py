@@ -9,6 +9,7 @@ from loom_v2.contracts.agents import AgentRegistration
 from loom_v2.contracts.errors import DomainError
 from loom_v2.content_store import canonical_json_bytes
 from loom_v2.observer.repository import ObserverRepository
+from tests.support.package_fixture import orchestration_package_value, process_package_value
 
 
 async def _register_slave(repo: ObserverRepository, slave_id: str, instance_id: str):
@@ -20,7 +21,12 @@ async def _register_slave(repo: ObserverRepository, slave_id: str, instance_id: 
             workspace_id="workspace-default",
             endpoint_url=f"http://{slave_id}",
             protocol_version="loom.v1",
-            capabilities={"operations": ["run_code"]},
+            capabilities={
+                "operations": ["run_code"],
+                "executor_descriptors": [
+                    {"package_type": "function", "kind": "process:json_stdio", "version": "1"}
+                ],
+            },
         )
     )
 
@@ -91,16 +97,7 @@ async def _dynamic_run(
             {"kind": "set_execution_payload", "value": {"node_id": "loom://summarize", "input_ref": node_input_ref.model_dump(mode="json")}},
             {
                 "kind": "materialize_capability_package_candidate",
-                "value": {
-                             "package_id": "summarize",
-                             "package_version": "v1",
-                             "body": {
-                                 "program_content_ref": node_program.model_dump(mode="json"),
-                                 "io_contract_ref": node_contract.model_dump(mode="json"),
-                                 "operation_descriptor_ref": "loom://summarize",
-                                 "replay_safety": node_replay_safety,
-                             },
-                         },
+                "value": process_package_value(repo, package_id="summarize", operation_ref="loom://summarize", program_content_ref=node_program, io_contract_ref=node_contract, replay_safety=node_replay_safety),
             },
         ],
     )
@@ -117,24 +114,16 @@ async def _dynamic_run(
         [
             {
                 "kind": "materialize_capability_package_candidate",
-                "value": {
-                             "package_id": "orchestrate",
-                             "package_version": "v1",
-                             "execution": {"kind": "container:python_orchestrator", "version": "1"},
-                             "body": {
-                                 "program_content_ref": orchestration_program.model_dump(mode="json"),
-                                 "io_contract_ref": parent_contract.model_dump(mode="json"),
-                                 "operation_descriptor_ref": "loom://orchestrate",
-                                 "allowed_node_package_refs": [
-                        ResourceRef(
-                            resource_id=node_package.version_ref,
-                            version_or_digest=node_package.package_digest,
-                        ).model_dump(mode="json")
-                    ],
-                                 "max_nodes": max_nodes,
-                                 "max_live_nodes": max_live_nodes,
-                             },
-                         },
+                "value": orchestration_package_value(
+                    repo,
+                    package_id="orchestrate",
+                    operation_ref="loom://orchestrate",
+                    program_content_ref=orchestration_program,
+                    io_contract_ref=parent_contract,
+                    allowed_node_package_refs=[ResourceRef(resource_id=node_package.version_ref, version_or_digest=node_package.package_digest)],
+                    max_nodes=max_nodes,
+                    max_live_nodes=max_live_nodes,
+                ),
             },
         ],
     )
@@ -179,6 +168,7 @@ async def _dispatched_node(
             intent_id="intent-reassign",
             execution_id=started["execution_id"],
             package_ref=ResourceRef(resource_id=package.version_ref, version_or_digest=package.package_digest),
+            capability_descriptor_ref=package.capability_exports[0].capability_descriptor_ref,
             input_refs=[input_ref],
         ),
         selected_target="slave-a",
@@ -246,6 +236,7 @@ async def test_accept_node_intent_materializes_dynamic_node():
         intent_id="intent-1",
         execution_id=started["execution_id"],
         package_ref=ResourceRef(resource_id=node_package.version_ref, version_or_digest=node_package.package_digest),
+        capability_descriptor_ref=node_package.capability_exports[0].capability_descriptor_ref,
         input_refs=[input_ref],
     )
 
@@ -277,15 +268,16 @@ async def test_accept_node_intent_rejects_unauthorized_package_and_live_limit():
         intent_id="intent-1",
         execution_id=started["execution_id"],
         package_ref=package_ref,
+        capability_descriptor_ref=node_package.capability_exports[0].capability_descriptor_ref,
         input_refs=[input_ref],
     )
 
-    orchestration_package.function_body.allowed_node_package_refs = []
+    unauthorized_intent = intent.model_copy(update={
+        "package_ref": ResourceRef(resource_id="capability-package://unauthorized/v1", version_or_digest="f" * 64)
+    })
     with pytest.raises(ValueError, match="node_package_not_allowed"):
-        await repo.accept_node_intent(run.run_id, intent, selected_target="slave-a")
+        await repo.accept_node_intent(run.run_id, unauthorized_intent, selected_target="slave-a")
 
-    orchestration_package.function_body.allowed_node_package_refs = [package_ref]
-    orchestration_package.function_body.allowed_node_package_refs = [package_ref]
     accepted = await repo.accept_node_intent(run.run_id, intent, selected_target="slave-a")
     second_intent = intent.model_copy(update={"intent_id": "intent-2"})
 
@@ -303,14 +295,13 @@ async def test_accept_node_intent_validates_input_schema():
     started = await repo.start(run.run_id, committed.version_id)
     record = await repo.get_run(run.run_id)
     node_package = next(package for package in record.capability_packages if package.package_id == "summarize")
-    orchestration_package = next(package for package in record.capability_packages if package.execution.kind == "container:python_orchestrator")
     package_ref = ResourceRef(resource_id=node_package.version_ref, version_or_digest=node_package.package_digest)
-    orchestration_package.function_body.allowed_node_package_refs = [package_ref]
     invalid_input = await repo.put_content({"wrong": True}, media_type="application/json")
     intent = NodeIntent(
         intent_id="intent-invalid",
         execution_id=started["execution_id"],
         package_ref=package_ref,
+        capability_descriptor_ref=node_package.capability_exports[0].capability_descriptor_ref,
         input_refs=[invalid_input],
     )
 
@@ -334,6 +325,7 @@ async def test_dynamic_nodes_persist_across_repository_restart():
         intent_id="intent-persist",
         execution_id=started["execution_id"],
         package_ref=ResourceRef(resource_id=node_package.version_ref, version_or_digest=node_package.package_digest),
+        capability_descriptor_ref=node_package.capability_exports[0].capability_descriptor_ref,
         input_refs=[input_ref],
     )
     node = await repo.accept_node_intent(run.run_id, intent, selected_target="slave-a")
@@ -359,6 +351,7 @@ async def test_dynamic_node_dispatch_result_and_orchestration_completion():
         intent_id="intent-exec",
         execution_id=started["execution_id"],
         package_ref=ResourceRef(resource_id=node_package.version_ref, version_or_digest=node_package.package_digest),
+        capability_descriptor_ref=node_package.capability_exports[0].capability_descriptor_ref,
         input_refs=[input_ref],
     )
     node = await repo.accept_node_intent(run.run_id, intent, selected_target="slave-a")
@@ -415,6 +408,7 @@ async def test_dynamic_node_dispatch_binds_active_slave_instance():
             intent_id="intent-instance-binding",
             execution_id=started["execution_id"],
             package_ref=ResourceRef(resource_id=package.version_ref, version_or_digest=package.package_digest),
+            capability_descriptor_ref=package.capability_exports[0].capability_descriptor_ref,
             input_refs=[input_ref],
         ),
         selected_target="slave-a",
@@ -450,6 +444,7 @@ async def test_dynamic_node_dispatch_rejects_target_change_after_acceptance():
             intent_id="intent-target-fence",
             execution_id=started["execution_id"],
             package_ref=ResourceRef(resource_id=node_package.version_ref, version_or_digest=node_package.package_digest),
+            capability_descriptor_ref=node_package.capability_exports[0].capability_descriptor_ref,
             input_refs=[input_ref],
         ),
         selected_target="slave-a",
@@ -660,9 +655,14 @@ def test_dynamic_node_event_replay_keeps_reassigned_node_dispatched():
                 "node_id": "node-1",
                 "execution_id": "execution-1",
                 "intent_id": "intent-1",
-                "package_ref": package_ref.model_dump(mode="json"),
-                "package_digest": "a" * 64,
-                "input_refs": [input_ref.model_dump(mode="json")],
+                    "package_ref": package_ref.model_dump(mode="json"),
+                    "package_digest": "a" * 64,
+                    "capability_descriptor_ref": ResourceRef(
+                        resource_id="loom://summarize",
+                        version_or_digest="c" * 64,
+                        identity_criterion="descriptor_digest",
+                    ).model_dump(mode="json"),
+                    "input_refs": [input_ref.model_dump(mode="json")],
             },
             {
                 "phase": "node_reassigned",

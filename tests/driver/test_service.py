@@ -12,6 +12,37 @@ from loom_v2.slave.service import SlaveService
 from loom_v2.slave.app import create_app as create_slave_app
 
 
+def test_driver_special_orchestrator_detection_is_version_exact(monkeypatch):
+    monkeypatch.setattr("loom_v2.driver.service.shutil.which", lambda _name: None)
+
+    DriverService._ensure_orchestration_runtime(
+        {
+            "snapshot": {
+                "program_systems": {
+                    "execution": {
+                        "kind": "container:python_orchestrator",
+                        "version": "2",
+                    }
+                }
+            }
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="orchestrator_runtime_unavailable"):
+        DriverService._ensure_orchestration_runtime(
+            {
+                "snapshot": {
+                    "program_systems": {
+                        "execution": {
+                            "kind": "container:python_orchestrator",
+                            "version": "1",
+                        }
+                    }
+                }
+            }
+        )
+
+
 @pytest.mark.asyncio
 async def test_driver_applies_fake_patches_continuously_and_starts_execution():
     repo = ObserverRepository()
@@ -44,6 +75,14 @@ class RunCodeClosureProvider:
 
     async def send_turn(self, user_message: str):
         assert "loom_open_run" in self.tool_names
+        operation_ref = "loom://test_double"
+        descriptor = await self.tool_handler(
+            "loom_put_content",
+            {
+                "media_type": "application/vnd.loom.operation-descriptor+json",
+                "content": {"schema_version": "operation.v1", "resource_id": operation_ref, "name": "test_double"},
+            },
+        )
         program = await self.tool_handler(
             "loom_put_content",
             {
@@ -68,7 +107,6 @@ class RunCodeClosureProvider:
             "loom_put_content",
             {"media_type": "application/json", "content": {"value": 3}},
         )
-        operation_ref = "loom://test_double"
         await self.tool_handler(
             "loom_open_run",
             {
@@ -114,11 +152,18 @@ class RunCodeClosureProvider:
                     "value": {
                                  "package_id": "run-code-package",
                                  "package_version": "v1",
+                                 "package_type": "function",
                                  "execution": {"kind": "process:json_stdio", "version": "1"},
-                                 "body": {
-                                     "operation_descriptor_ref": operation_ref,
-                                     "program_content_ref": program_ref,
+                                 "capability_exports": [{
+                                     "capability_descriptor_ref": descriptor["resource_ref"],
                                      "io_contract_ref": contract_ref,
+                                     "effect_class": "Sandboxed",
+                                     "permissions": [],
+                                     "replay_safety": "DeclaredByPackage",
+                                     "runtime_binding": {},
+                                 }],
+                                 "body": {
+                                     "program_content_ref": program_ref,
                                  },
                              },
                 }
@@ -133,7 +178,7 @@ class RunCodeClosureProvider:
                     "value": {
                         "binding_id": "binding-run-code",
                         "hole_id": "h_run_code",
-                        "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
+                        "capability_descriptor_ref": descriptor["resource_ref"],
                         "capability_package_ref": {"resource_id": "capability-package://run-code-package/v1"},
                         "target_resource_ref": {"resource_id": "slave-a"},
                     },

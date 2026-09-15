@@ -1,6 +1,0 @@
-#!/usr/bin/env python3
-from loom_v2.slave.container_http_plugin_server import main
-import asyncio
-
-if __name__ == "__main__":
-    asyncio.run(main())

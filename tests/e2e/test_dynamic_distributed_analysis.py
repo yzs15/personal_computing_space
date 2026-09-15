@@ -8,6 +8,7 @@ from loom_v2.driver.service import DriverService
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.driver.worker import WorkerSession
 from loom_v2.slave.app import create_app as create_slave_app
+from tests.support.package_fixture import orchestration_package_value, process_package_value
 
 
 async def _put(mcp: DriverMCP, content, media_type: str) -> ResourceRef:
@@ -103,27 +104,11 @@ async def test_dynamic_distributed_map_reduce_analysis():
                 {"kind": "set_execution_payload", "value": {"node_id": "loom://orchestrate", "input_ref": input_ref.model_dump(mode="json")}},
                 {
                     "kind": "materialize_capability_package_candidate",
-                    "value": {
-                                 "package_id": "summarize",
-                                 "package_version": "v1",
-                                 "body": {
-                                     "program_content_ref": summarize_program.model_dump(mode="json"),
-                                     "io_contract_ref": summarize_contract.model_dump(mode="json"),
-                                     "operation_descriptor_ref": "loom://summarize",
-                                 },
-                             },
+                    "value": process_package_value(repo, package_id="summarize", operation_ref="loom://summarize", program_content_ref=summarize_program, io_contract_ref=summarize_contract),
                 },
                 {
                     "kind": "materialize_capability_package_candidate",
-                    "value": {
-                                 "package_id": "merge-summaries",
-                                 "package_version": "v1",
-                                 "body": {
-                                     "program_content_ref": merge_program.model_dump(mode="json"),
-                                     "io_contract_ref": merge_contract.model_dump(mode="json"),
-                                     "operation_descriptor_ref": "loom://merge-summaries",
-                                 },
-                             },
+                    "value": process_package_value(repo, package_id="merge-summaries", operation_ref="loom://merge-summaries", program_content_ref=merge_program, io_contract_ref=merge_contract),
                 },
             ]
         },
@@ -133,14 +118,18 @@ async def test_dynamic_distributed_map_reduce_analysis():
     merge_package = next(item for item in packages if item.package_id == "merge-summaries")
     summarize_ref = ResourceRef(resource_id=summarize_package.version_ref, version_or_digest=summarize_package.package_digest)
     merge_ref = ResourceRef(resource_id=merge_package.version_ref, version_or_digest=merge_package.package_digest)
+    summarize_descriptor_ref = summarize_package.capability_exports[0].capability_descriptor_ref
+    merge_descriptor_ref = merge_package.capability_exports[0].capability_descriptor_ref
     orchestration_source = f'''SUMMARIZE = {summarize_ref.model_dump(mode="json")}
+SUMMARIZE_DESCRIPTOR = {summarize_descriptor_ref.model_dump(mode="json")}
 MERGE = {merge_ref.model_dump(mode="json")}
+MERGE_DESCRIPTOR = {merge_descriptor_ref.model_dump(mode="json")}
 
 async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> "ResourceRef":
     document = await ctx.read_json(input_ref)
-    handles = [ctx.emit_node(SUMMARIZE, [partition]) for partition in document["partitions"]]
+    handles = [ctx.emit_node(SUMMARIZE, SUMMARIZE_DESCRIPTOR, [partition]) for partition in document["partitions"]]
     summaries = [await ctx.result(handle) for handle in handles]
-    merged = ctx.emit_node(MERGE, summaries)
+    merged = ctx.emit_node(MERGE, MERGE_DESCRIPTOR, summaries)
     return await ctx.result(merged)
 '''
     orchestration_program = await _put(mcp, orchestration_source, "text/x-python")
@@ -150,19 +139,7 @@ async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> 
             "ops": [
                 {
                     "kind": "materialize_capability_package_candidate",
-                    "value": {
-                                 "package_id": "orchestrate",
-                                 "package_version": "v1",
-                                 "execution": {"kind": "container:python_orchestrator", "version": "1"},
-                                 "body": {
-                                     "program_content_ref": orchestration_program.model_dump(mode="json"),
-                                     "io_contract_ref": parent_contract.model_dump(mode="json"),
-                                     "operation_descriptor_ref": "loom://orchestrate",
-                                     "allowed_node_package_refs": [summarize_ref.model_dump(mode="json"), merge_ref.model_dump(mode="json")],
-                                     "max_nodes": 6,
-                                     "max_live_nodes": 2,
-                                 },
-                             },
+                    "value": orchestration_package_value(repo, package_id="orchestrate", operation_ref="loom://orchestrate", program_content_ref=orchestration_program, io_contract_ref=parent_contract, allowed_node_package_refs=[summarize_ref, merge_ref], max_nodes=6, max_live_nodes=2),
                 }
             ]
         },

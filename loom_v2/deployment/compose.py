@@ -92,6 +92,7 @@ def _postgres_service(volume_name: str, database: str) -> dict[str, Any]:
 def _role_environment(config: DeploymentConfig, machine: MachineConfig, database_url: str) -> dict[str, str]:
     return {
         "LOOM_DATABASE_URL": database_url.replace(quote_password(config.postgres_password), "${POSTGRES_PASSWORD_URLENCODED}"),
+        "LOOM_PACKAGE_CONTRACT_DIR": "/opt/loom/package-contracts",
         "LOOM_S3_ACCESS_KEY": "${MINIO_ACCESS_KEY}",
         "LOOM_S3_BUCKET": "${LOOM_S3_BUCKET}",
         "LOOM_S3_ENDPOINT_URL": "${LOOM_S3_ENDPOINT_URL}",
@@ -116,6 +117,9 @@ def _render_observer(config: DeploymentConfig, machine: MachineConfig) -> tuple[
             "ports": [f"{machine.service_port}:8080"],
             "secrets": ["internal_api_secret"],
             "depends_on": {"postgres": {"condition": "service_healthy"}},
+            "volumes": [
+                "./source/package_contracts:/opt/loom/package-contracts:ro"
+            ],
         }
     )
     document = {
@@ -155,6 +159,7 @@ def _render_slave(config: DeploymentConfig, machine: MachineConfig) -> tuple[dic
             "depends_on": {"postgres": {"condition": "service_healthy"}},
             "volumes": [
                 "./source/runtime_plugins:/opt/loom/runtime-plugins:ro",
+                "./source/package_contracts:/opt/loom/package-contracts:ro",
                 f"{machine.name}-runtime-plugin-sockets:/run/loom/runtime-plugins",
                 "/var/run/docker.sock:/var/run/docker.sock",
             ],
@@ -186,6 +191,7 @@ def _render_driver(config: DeploymentConfig, machine: MachineConfig) -> tuple[di
         "LOOM_CODEX_WIRE_API": config.driver.codex_wire_api,
         "LOOM_DRIVER_URL": machine.endpoint_url,
         "LOOM_OBSERVER_URL": config.urls.observer,
+        "LOOM_PACKAGE_CONTRACT_DIR": "/opt/loom/package-contracts",
         "LOOM_S3_ACCESS_KEY": "${MINIO_ACCESS_KEY}",
         "LOOM_S3_BUCKET": "${LOOM_S3_BUCKET}",
         "LOOM_S3_ENDPOINT_URL": "${LOOM_S3_ENDPOINT_URL}",
@@ -209,6 +215,7 @@ def _render_driver(config: DeploymentConfig, machine: MachineConfig) -> tuple[di
             "volumes": [
                 f"{config.driver.workspace_path}:/workspace",
                 "driver-codex-state:/var/lib/loom/codex",
+                "./source/package_contracts:/opt/loom/package-contracts:ro",
                 "/var/run/docker.sock:/var/run/docker.sock",
             ],
         }

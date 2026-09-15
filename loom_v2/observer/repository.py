@@ -16,14 +16,14 @@ from uuid import uuid4
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from loom_v2.contracts.constraints import Constraint, ConstraintRef
+from loom_v2.contracts.constraints import Constraint
 from loom_v2.contracts.refinement import is_monotonic_tightening
 from loom_v2.contracts.types import (
+    CapabilityExport,
+    CapabilityHealthReport,
     CapabilityPackage,
     CapabilityPackageActivation,
     CapabilityPackageVersion,
-    FunctionCapabilityPackageBody,
-    ServiceCapabilityPackageBody,
     ExecutionContract,
     ClosureContract,
     ClosureVersion,
@@ -43,9 +43,10 @@ from loom_v2.db.models import DriverRequestRow, DriverThreadRow, IdempotencyRow,
 from loom_v2.contracts.agents import AgentLease, AgentRegistration, DriverCommand, DriverThreadBinding
 from loom_v2.contracts.messages import MessageReceipt, MessageReceiptState
 from loom_v2.db.session import make_session_factory
-from loom_v2.content_store import ContentStore, canonical_json_bytes
+from loom_v2.content_store import ContentStore, canonical_json_bytes, put_typed_content
 from loom_v2.digest import digest_bytes, digest_json
 from loom_v2.contracts.io_schema import ValidationError as SchemaValidationError, validate, validate_schema
+from loom_v2.contracts.package_contracts import DRIVER_ORCHESTRATOR_KEY
 from loom_v2.settings import Settings
 from loom_v2.slave.executor import default_registry
 from loom_v2.contracts.errors import DomainError, DomainErrorEnvelope
@@ -221,6 +222,7 @@ class ObserverRepository:
         # pass the existence check before either persists its derivative.
         self._promotion_lock = asyncio.Lock()
         self._dynamic_intent_locks: dict[str, asyncio.Lock] = {}
+        self._activation_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         # Runtime agent state is kept in-memory when no database is configured
         # (the hermetic test profile) and mirrored to Observer PostgreSQL when
         # one is available. Lease ids are never persisted in plaintext.
@@ -241,8 +243,14 @@ class ObserverRepository:
                     "protocol_version": "loom.v1",
                     "capabilities": {
                         "operations": sorted(embedded_slave.supported_operations),
+                        "base_operations": sorted(embedded_slave.supported_operations),
                         "executor_descriptors": [
-                            descriptor.kind for descriptor in embedded_slave.executor_registry.descriptors()
+                            {
+                                "package_type": descriptor.package_type,
+                                "kind": descriptor.kind,
+                                "version": descriptor.version,
+                            }
+                            for descriptor in embedded_slave.executor_registry.descriptors()
                         ],
                         "term_support": [item.model_dump(mode="json") for item in embedded_slave.term_support()],
                     },
@@ -298,6 +306,33 @@ class ObserverRepository:
         descriptor_payload = descriptor.model_dump(mode="json") if hasattr(descriptor, "model_dump") else descriptor
         if digest_json(descriptor_payload, domain="loom/operation-descriptor/v1") != digest:
             raise ValueError("operation_descriptor_digest_mismatch")
+
+    async def _validate_package_exports(self, package: CapabilityPackageVersion) -> None:
+        for capability_export in package.capability_exports:
+            await self._validate_operation_descriptor_ref(capability_export.capability_descriptor_ref)
+            try:
+                contract = IoContract.model_validate(await self._load_json_content(capability_export.io_contract_ref))
+                for schema_ref in (contract.input_schema_ref, contract.output_schema_ref):
+                    if schema_ref is not None:
+                        validate_schema(await self._load_json_content(schema_ref))
+                if contract.success_validator_ref is not None:
+                    self._require_content_ref(contract.success_validator_ref)
+                    await self.content_store.get(contract.success_validator_ref)
+            except (FileNotFoundError, TypeError, ValueError) as exc:
+                raise ValueError("io_contract_invalid") from exc
+
+    @staticmethod
+    def _single_export(package: CapabilityPackageVersion) -> CapabilityExport:
+        if len(package.capability_exports) != 1:
+            raise ValueError("capability_export_selection_required")
+        return package.capability_exports[0]
+
+    @staticmethod
+    def _package_body_ref(package: CapabilityPackageVersion, field_name: str) -> ResourceRef:
+        try:
+            return ResourceRef.model_validate(package.body[field_name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name}_required") from exc
 
     @staticmethod
     def _message_receipt_from_row(row: MessageReceiptRow) -> MessageReceipt:
@@ -1043,14 +1078,59 @@ class ObserverRepository:
             if agent.get("lease_state") != "active":
                 continue
             capabilities = dict(agent.get("capabilities") or {})
+            base_operations = set(
+                capabilities.get("base_operations", capabilities.get("operations", []))
+            )
             self.slave_capabilities[slave_id] = {
                 **capabilities,
-                "operations": set(capabilities.get("operations", [])),
+                "base_operations": base_operations,
+                "operations": set(base_operations),
             }
+
+    def _project_ready_capabilities(self, slave_id: str | None = None) -> None:
+        targets = [slave_id] if slave_id is not None else list(self.slave_capabilities)
+        for target in targets:
+            details = self.slave_capabilities.get(target)
+            agent = self.slave_agents.get(target)
+            if details is None or agent is None:
+                continue
+            capabilities = agent.get("capabilities") or {}
+            base_operations = set(
+                capabilities.get("base_operations", capabilities.get("operations", []))
+            )
+            projected = set(base_operations)
+            for record in self.runs.values():
+                for activation in record.capability_activations:
+                    if (
+                        activation.target_slave != target
+                        or activation.desired_state != "running"
+                        or activation.activation_state != "ready"
+                    ):
+                        continue
+                    # A reusable coordinate can be present in more than one
+                    # run-bound record.  Resolve the manifest with the
+                    # activation's digest assertion so a different package
+                    # sharing the coordinate cannot hide this activation's
+                    # exports from the projection.
+                    package = self._find_package(
+                        ResourceRef(
+                            resource_id=activation.package_version_ref,
+                            version_or_digest=activation.package_digest,
+                        )
+                    )
+                    if package is None or package.package_digest != activation.package_digest:
+                        continue
+                    projected.update(
+                        self._operation_name(export.capability_descriptor_ref.resource_id)
+                        for export in package.capability_exports
+                    )
+            details["operations"] = projected
 
     async def refresh_slaves(self, workspace_id: str | None = None) -> list[dict[str, Any]]:
         agents = await self.list_agents(workspace_id or "workspace-default", role="slave")
+        await self._all_records()
         self._store_slave_snapshot(agents)
+        self._project_ready_capabilities()
         return agents
 
     async def bind_thread(self, binding: DriverThreadBinding) -> dict[str, Any]:
@@ -1157,6 +1237,7 @@ class ObserverRepository:
             "run.readiness", "run.recovery.list", "run.recovery.mark", "message.append", "message.claim", "message.update", "message.release", "agent_signal.record",
             "run.result",
             "thread.bind", "thread.get", "turn.state", "capability.list", "capability.get", "capability.health",
+            "capability.desire",
             "node.accept", "node.dispatch", "node.reassign", "node.result", "node.fail",
         }
         if command.command not in allowed:
@@ -1196,7 +1277,7 @@ class ObserverRepository:
         workspace_id = str(agent["workspace_id"])
         run_scoped_commands = {
             "run.get", "run.begin", "run.patch", "run.commit", "run.start", "run.close", "run.cancel", "run.fail", "run.resolve",
-            "run.readiness", "message.append", "agent_signal.record", "capability.health",
+            "run.readiness", "message.append", "agent_signal.record", "capability.health", "capability.desire",
             "node.accept", "node.dispatch", "node.reassign", "node.result", "node.fail",
         }
         if command.command in run_scoped_commands and args.get("run_id") is not None:
@@ -1214,6 +1295,17 @@ class ObserverRepository:
         elif command.command == "capability.health" and args.get("run_id") is None:
             report = args.get("report") or {}
             await self._assert_package_workspace(str(report.get("package_version_ref") or ""), workspace_id)
+        elif command.command == "capability.desire":
+            package_ref = args.get("package_ref")
+            if isinstance(package_ref, dict):
+                try:
+                    package_ref = ResourceRef.model_validate(package_ref)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("capability_package_ref_invalid") from exc
+                args["package_ref"] = package_ref
+            await self._assert_package_workspace(
+                package_ref, workspace_id, run_id=args.get("run_id")
+            )
         if command.command == "run.open":
             contract = args.get("closure_contract")
             result = (await self.open_run(args.get("run_id"), str(args.get("task_ref") or args.get("conversation_ref") or ""), str(args.get("goal") or (contract or {}).get("goal") or ""), bool(args.get("allow_reassignment", False)), ClosureContract.model_validate(contract) if contract else None, user_id=str(args.get("user_id", "user-default")), workspace_id=workspace_id)).__dict__
@@ -1316,7 +1408,7 @@ class ObserverRepository:
                 {
                     "resource_id": agent["agent_id"],
                     "available": agent.get("lease_state") == "active",
-                    "operations": sorted((agent.get("capabilities") or {}).get("operations", [])),
+                    "operations": sorted(self.slave_capabilities.get(str(agent["agent_id"]), {}).get("operations", set())),
                     "executor_descriptors": (agent.get("capabilities") or {}).get("executor_descriptors", []),
                     "runtime_plugin_descriptors": (agent.get("capabilities") or {}).get("runtime_plugin_descriptors", (agent.get("capabilities") or {}).get("runtime_plugins", [])),
                     "term_support": (agent.get("capabilities") or {}).get("term_support", []),
@@ -1328,9 +1420,33 @@ class ObserverRepository:
                 "packages": [item.model_dump(mode="json") for item in await self.list_capability_packages(run_id=args.get("run_id"), include_abandoned=bool(args.get("include_abandoned", False)))],
             }
         elif command.command == "capability.get":
-            result = (await self.get_capability_package(args["package_ref"], run_id=args.get("run_id"))).model_dump(mode="json")
+            package_ref = args["package_ref"]
+            if isinstance(package_ref, dict):
+                try:
+                    package_ref = ResourceRef.model_validate(package_ref)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("capability_package_ref_invalid") from exc
+            result = (await self.get_capability_package(package_ref, run_id=args.get("run_id"))).model_dump(mode="json")
+        elif command.command == "capability.desire":
+            package_ref = args["package_ref"]
+            if isinstance(package_ref, dict):
+                try:
+                    package_ref = ResourceRef.model_validate(package_ref)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("capability_package_ref_invalid") from exc
+            activation = await self.set_capability_desired(
+                package_ref,
+                str(args["target_slave"]),
+                desired_state=str(args["desired_state"]),
+                idempotency_key=str(args["idempotency_key"]),
+                run_id=args.get("run_id"),
+                workspace_id=workspace_id,
+                activation_closure_version_ref=str(args.get("activation_closure_version_ref") or ""),
+                compute_binding_ref=str(args.get("compute_binding_ref") or ""),
+                rebuild=bool(args.get("rebuild", False)),
+            )
+            result = activation.model_dump(mode="json")
         elif command.command == "capability.health":
-            from loom_v2.contracts.types import CapabilityHealthReport
             result = (await self.record_capability_health(CapabilityHealthReport.model_validate(args["report"]), run_id=args.get("run_id"))).model_dump(mode="json")
         elif command.command == "node.accept":
             node = await self.accept_node_intent(str(args["run_id"]), NodeIntent.model_validate(args["intent"]), selected_target=str(args["selected_target"]))
@@ -1415,7 +1531,10 @@ class ObserverRepository:
                 continue
             if record.state == "running" and record.execution_id is not None:
                 snapshot = record.committed.snapshot if record.committed is not None else record.draft.snapshot
-                if snapshot.program_systems.execution.kind == "container:python_orchestrator":
+                if (
+                    snapshot.program_systems.execution.kind,
+                    snapshot.program_systems.execution.version,
+                ) == DRIVER_ORCHESTRATOR_KEY[1:]:
                     package = (
                         self._find_package(snapshot.program_systems.package_ref, run_id=record.run_id)
                         if snapshot.program_systems.package_ref
@@ -1423,10 +1542,10 @@ class ObserverRepository:
                     )
                     replayable = (
                         package is not None
-                        and package.function_body.replay_safety == "DeterministicByEventLog"
-                        and not package.function_body.captures_run_state
-                        and not package.function_body.captured_secret_refs
-                        and not package.function_body.captured_path_refs
+                        and self._single_export(package).replay_safety == "DeterministicByEventLog"
+                        and not bool(package.body.get("captures_run_state", False))
+                        and not package.body.get("captured_secret_refs")
+                        and not package.body.get("captured_path_refs")
                     )
                     if replayable:
                         reason = {"code": "driver_restarted", "action": "replay_orchestration"}
@@ -1455,7 +1574,11 @@ class ObserverRepository:
                 "code": "orchestration_not_replayable"
                 if record.state == "running"
                 and record.committed is not None
-                and record.committed.snapshot.program_systems.execution.kind == "container:python_orchestrator"
+                and (
+                    record.committed.snapshot.program_systems.execution.kind,
+                    record.committed.snapshot.program_systems.execution.version,
+                )
+                == DRIVER_ORCHESTRATOR_KEY[1:]
                 else "observer_restarted"
             }
             for attempt in record.attempts:
@@ -1487,39 +1610,7 @@ class ObserverRepository:
 
     async def put_content(self, content: Any, *, media_type: str) -> ResourceRef:
         """Canonicalize and persist content through the single upload path."""
-
-        normalized_media_type = str(media_type or "").split(";", 1)[0].strip().lower()
-        if not normalized_media_type:
-            raise ValueError("media_type_required")
-
-        json_media_types = {
-            "application/json",
-            "application/schema+json",
-            "application/vnd.loom.io-contract+json",
-        }
-        if normalized_media_type in json_media_types:
-            if isinstance(content, (bytes, bytearray, str)):
-                try:
-                    parsed = json.loads(content)
-                except (TypeError, json.JSONDecodeError) as exc:
-                    raise ValueError("invalid_json") from exc
-            else:
-                parsed = content
-            if normalized_media_type == "application/schema+json":
-                validate_schema(parsed)
-            elif normalized_media_type == "application/vnd.loom.io-contract+json":
-                try:
-                    IoContract.model_validate(parsed)
-                except Exception as exc:
-                    raise ValueError("io_contract_invalid") from exc
-            body = canonical_json_bytes(parsed)
-        elif isinstance(content, str):
-            body = content.encode("utf-8")
-        elif isinstance(content, (bytes, bytearray)):
-            body = bytes(content)
-        else:
-            raise TypeError("content_must_be_string_or_bytes")
-        return await self.content_store.put(body, media_type=normalized_media_type)
+        return await put_typed_content(self.content_store, content, media_type=media_type)
 
     @staticmethod
     def _record_from_row(row: RunRow) -> RunRecord:
@@ -1559,12 +1650,16 @@ class ObserverRepository:
             if phase == "node_accepted" and node_id:
                 try:
                     package_ref = ResourceRef.model_validate(event["package_ref"])
+                    capability_descriptor_ref = ResourceRef.model_validate(
+                        event["capability_descriptor_ref"]
+                    )
                     input_refs = [ResourceRef.model_validate(item) for item in event.get("input_refs", [])]
                     nodes[node_id] = DynamicNode(
                         node_id=node_id,
                         parent_execution_ref=str(event.get("execution_id") or ""),
                         intent_id=str(event.get("intent_id") or ""),
                         package_ref=package_ref,
+                        capability_descriptor_ref=capability_descriptor_ref,
                         input_refs=input_refs,
                         state="accepted",
                     )
@@ -1730,41 +1825,38 @@ class ObserverRepository:
         agent = self.slave_agents.get(slave_id)
         if details is None or agent is None or agent.get("lease_state") != "active":
             return False
-        declared_operations = details.get("operations", set())
-        operations = {declared_operations} if isinstance(declared_operations, str) else set(declared_operations)
-        execution_kind = package.execution.kind
-        operation = "run_code" if execution_kind == "process:json_stdio" else ""
-        if operation and operation not in operations:
-            return False
         declared_executors = (
             details.get("executor_kinds")
             or details.get("executors")
             or details.get("executor_descriptors")
         )
-        package_type = getattr(package, "package_type", "function")
-        if package_type != "service" and declared_executors:
+        if declared_executors:
             raw_executors = [declared_executors] if isinstance(declared_executors, str) else declared_executors
-            return any(
-                (str(item.get("kind")), str(item.get("version", "1"))) == (package.execution.kind, package.execution.version)
-                if isinstance(item, dict) else str(item) == package.execution.kind
+            if any(
+                isinstance(item, dict)
+                and (
+                    str(item.get("package_type") or ""),
+                    str(item.get("kind") or ""),
+                    str(item.get("version") or "1"),
+                )
+                == (package.package_type, package.execution.kind, package.execution.version)
                 for item in raw_executors
-            )
-        if package_type == "service":
-            descriptors = details.get("runtime_plugin_descriptors") or details.get("runtime_plugins") or []
-            for descriptor in descriptors if isinstance(descriptors, list) else []:
-                supports = descriptor.get("supports", []) if isinstance(descriptor, dict) else []
-                for support in supports if isinstance(supports, list) else []:
-                    if not isinstance(support, dict):
-                        continue
-                    execution = support.get("execution") if isinstance(support.get("execution"), dict) else support
-                    if (
-                        str(support.get("package_type") or "") == package.package_type
-                        and str(support.get("execution_kind") or execution.get("kind") or "") == package.execution.kind
-                        and str(support.get("execution_version") or execution.get("version") or "1") == package.execution.version
-                    ):
-                        return True
-            return False
-        return True
+            ):
+                return True
+        descriptors = details.get("runtime_plugin_descriptors") or details.get("runtime_plugins") or []
+        for descriptor in descriptors if isinstance(descriptors, list) else []:
+            supports = descriptor.get("supports", []) if isinstance(descriptor, dict) else []
+            for support in supports if isinstance(supports, list) else []:
+                if not isinstance(support, dict):
+                    continue
+                execution = support.get("execution") if isinstance(support.get("execution"), dict) else support
+                if (
+                    str(support.get("package_type") or "") == package.package_type
+                    and str(support.get("execution_kind") or execution.get("kind") or "") == package.execution.kind
+                    and str(support.get("execution_version") or execution.get("version") or "1") == package.execution.version
+                ):
+                    return True
+        return False
 
     def _slave_is_active(self, slave_id: str) -> bool:
         agent = self.slave_agents.get(slave_id)
@@ -1827,14 +1919,7 @@ class ObserverRepository:
             for package in record.capability_packages:
                 if not self._package_visible_to_run(package, run_id):
                     continue
-                if resource_id not in {
-                    package.package_id,
-                    self._package_ref(package),
-                    f"{package.package_id}:{package.package_version}",
-                    package.package_version,
-                    package.package_closure_version_ref,
-                    package.package_digest,
-                }:
+                if resource_id != package.version_ref:
                     continue
                 if digest is not None and digest != package.package_digest.lower():
                     continue
@@ -1871,7 +1956,7 @@ class ObserverRepository:
     async def get_capability_package_aggregate(self, package_ref: str) -> CapabilityPackage:
         version = await self.get_capability_package(package_ref)
         records = await self._all_records()
-        activations = [activation for record in records for activation in record.capability_activations if activation.package_version_ref in {f"{version.package_id}:{version.package_version}", self._package_ref(version), version.version_ref}]
+        activations = [activation for record in records for activation in record.capability_activations if activation.package_version_ref == version.version_ref]
         versions = [item for record in records for item in record.capability_packages if item.package_id == version.package_id]
         return CapabilityPackage(package_id=version.package_id, versions=versions, activations=activations)
 
@@ -1916,29 +2001,20 @@ class ObserverRepository:
                 raise ValueError("capability_package_abandoned")
             if approved_digest and approved_digest != candidate.package_digest:
                 raise ValueError("promotion_digest_mismatch")
-            if isinstance(candidate.body, FunctionCapabilityPackageBody):
-                if not candidate.function_body.semantic_closed:
+            if (
+                candidate.package_type,
+                candidate.execution.kind,
+                candidate.execution.version,
+            ) == DRIVER_ORCHESTRATOR_KEY:
+                if not bool(candidate.body.get("semantic_closed", True)):
                     raise ValueError("package_promotion_denied:semantic_not_closed")
-                if candidate.function_body.captures_run_state or candidate.function_body.captured_secret_refs or candidate.function_body.captured_path_refs:
+                if (
+                    bool(candidate.body.get("captures_run_state", False))
+                    or candidate.body.get("captured_secret_refs")
+                    or candidate.body.get("captured_path_refs")
+                ):
                     raise ValueError("package_captures_run_state")
-            elif isinstance(candidate.body, ServiceCapabilityPackageBody):
-                try:
-                    for endpoint in candidate.body.endpoints:
-                        # Keep descriptor registry failures distinguishable
-                        # from malformed/missing IO contracts.
-                        await self._validate_operation_descriptor_ref(endpoint.operation_descriptor_ref)
-                except (FileNotFoundError, TypeError, ValueError) as exc:
-                    if str(exc) in {"operation_descriptor_unavailable", "operation_descriptor_digest_mismatch"}:
-                        raise
-                    raise ValueError("io_contract_invalid") from exc
-                try:
-                    for endpoint in candidate.body.endpoints:
-                        contract = IoContract.model_validate(await self._load_json_content(endpoint.io_contract_ref))
-                        for schema_ref in (contract.input_schema_ref, contract.output_schema_ref):
-                            if schema_ref is not None:
-                                validate_schema(await self._load_json_content(schema_ref))
-                except (FileNotFoundError, TypeError, ValueError) as exc:
-                    raise ValueError("io_contract_invalid") from exc
+            await self._validate_package_exports(candidate)
             source_record = next(
                 (
                     record
@@ -1978,81 +2054,259 @@ class ObserverRepository:
             await self._persist(source_record)
             return reusable
 
-    async def record_capability_health(self, report: Any, *, run_id: str | None = None) -> CapabilityPackageActivation:
-        """Accept a verified Slave health report into the activation projection."""
-        package = await self.get_capability_package(report.package_version_ref, run_id=run_id)
-        if package.package_digest != report.package_digest:
-            raise ValueError("capability_package_digest_mismatch")
-        record = (
-            self.runs.get(run_id)
-            if run_id is not None
-            else next(
+    async def _activation_record(
+        self, package: CapabilityPackageVersion
+    ) -> RunRecord:
+        records = await self._all_records()
+        record = next(
+            (
+                item
+                for item in records
+                if any(
+                    candidate.version_ref == package.version_ref
+                    and candidate.package_digest == package.package_digest
+                    for candidate in item.capability_packages
+                )
+            ),
+            None,
+        )
+        if record is None:
+            raise KeyError(package.version_ref)
+        return record
+
+    async def set_capability_desired(
+        self,
+        package_ref: str | ResourceRef,
+        target_slave: str,
+        *,
+        desired_state: str,
+        idempotency_key: str,
+        run_id: str | None = None,
+        workspace_id: str | None = None,
+        activation_closure_version_ref: str = "",
+        compute_binding_ref: str = "",
+        rebuild: bool = False,
+    ) -> CapabilityPackageActivation:
+        """Atomically assign the next desired-state revision for one activation."""
+        if desired_state not in {"running", "stopped"}:
+            raise ValueError("activation_desired_state_invalid")
+        if not target_slave:
+            raise ValueError("target_slave_required")
+        if not idempotency_key:
+            raise ValueError("idempotency_key_required")
+        package = await self.get_capability_package(package_ref, run_id=run_id)
+        if package.publication_state == "abandoned":
+            raise ValueError("capability_package_abandoned")
+        record = await self._activation_record(package)
+        record_workspace = (
+            record.closure_contract.workspace_id
+            if record.closure_contract is not None
+            else "workspace-default"
+        )
+        if workspace_id is not None and workspace_id != record_workspace:
+            raise ValueError("workspace_binding_mismatch")
+        lock_key = (record_workspace, package.version_ref, target_slave)
+        lock = self._activation_locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            record = await self._activation_record(package)
+            current = next(
                 (
                     item
-                    for item in self.runs.values()
-                    if any(
-                        p.package_id == package.package_id
-                        and p.package_version == package.package_version
-                        for p in item.capability_packages
-                    )
+                    for item in record.capability_activations
+                    if item.package_version_ref == package.version_ref
+                    and item.target_slave == target_slave
                 ),
                 None,
             )
-        )
-        if record is None:
-            raise KeyError(report.package_version_ref)
-        activation_ref = package.version_ref
-        current = next((item for item in record.capability_activations if item.package_version_ref == activation_ref and item.target_slave == report.target_slave), None)
-        if current is not None and report.session_generation < current.session_generation:
-            raise ValueError("stale_session_generation")
-        activation = CapabilityPackageActivation(
-            package_version_ref=activation_ref,
-            package_digest=package.package_digest,
-            target_slave=report.target_slave,
-            activation_closure_version_ref=package.package_closure_version_ref,
-            compute_binding_ref="",
-            session_generation=report.session_generation,
-            evidence_refs=list(report.evidence_refs),
-            activation_state=report.activation_state,
-            runtime_profile=dict(report.details.get("runtime_profile", {})) if isinstance(report.details, dict) else {},
-        )
-        record.capability_activations = [item for item in record.capability_activations if not (item.package_version_ref == activation_ref and item.target_slave == report.target_slave)]
-        record.capability_activations.append(activation)
-        if report.activation_state == "ready" and package.scope == "workspace_reusable" and package.publication_state == "published":
-            operations: list[str] = []
-            if isinstance(package.body, FunctionCapabilityPackageBody):
-                operation_ref = package.body.operation_descriptor_ref
-                operations.append(operation_ref.resource_id if isinstance(operation_ref, ResourceRef) else str(operation_ref))
-            elif isinstance(package.body, ServiceCapabilityPackageBody):
-                operations.extend(endpoint.operation_descriptor_ref.resource_id for endpoint in package.body.endpoints)
-            self.slave_capabilities.setdefault(report.target_slave, {}).setdefault("operations", set()).update(
-                self._operation_name(operation) for operation in operations
+            if current is not None and current.package_digest != package.package_digest:
+                raise ValueError("capability_package_identity_conflict")
+            if current is not None and current.last_idempotency_key == idempotency_key:
+                if current.desired_state != desired_state:
+                    raise ValueError("idempotency_key_reused")
+                return current
+            if current is not None and current.desired_state == desired_state and not rebuild:
+                return current
+
+            revision = 1 if current is None else current.activation_revision + 1
+            actual_state = (
+                "provisioning"
+                if desired_state == "running"
+                else current.activation_state if current is not None else "stopped"
             )
-        elif report.activation_state == "stopped" and isinstance(package.body, ServiceCapabilityPackageBody):
-            # Remove only operations no longer backed by another ready
-            # activation on this target.  ``operations`` also contains the
-            # built-in function capability, so avoid replacing the set.
-            projected = self.slave_capabilities.setdefault(report.target_slave, {}).setdefault("operations", set())
-            for endpoint in package.body.endpoints:
-                operation_name = self._operation_name(endpoint.operation_descriptor_ref.resource_id)
-                still_ready = False
-                for other_record in self.runs.values():
-                    for activation in other_record.capability_activations:
-                        if activation.target_slave != report.target_slave or activation.activation_state != "ready":
-                            continue
-                        other_package = self._find_package(activation.package_version_ref)
-                        if other_package is not None and isinstance(other_package.body, ServiceCapabilityPackageBody) and any(
-                            self._operation_name(item.operation_descriptor_ref.resource_id) == operation_name
-                            for item in other_package.body.endpoints
-                        ):
-                            still_ready = True
-                            break
-                    if still_ready:
-                        break
-                if not still_ready:
-                    projected.discard(operation_name)
-        record.events.append({"phase": "capability_health_report", "package_ref": activation_ref, "target_slave": report.target_slave, "activation_state": report.activation_state, "evidence_refs": report.evidence_refs, "created_at": datetime.now(timezone.utc).isoformat()})
+            activation = CapabilityPackageActivation(
+                package_version_ref=package.version_ref,
+                package_digest=package.package_digest,
+                target_slave=target_slave,
+                activation_closure_version_ref=(
+                    activation_closure_version_ref
+                    or (
+                        current.activation_closure_version_ref
+                        if current is not None
+                        else package.package_closure_version_ref
+                    )
+                ),
+                compute_binding_ref=(
+                    compute_binding_ref
+                    or (current.compute_binding_ref if current is not None else "")
+                ),
+                desired_state=desired_state,
+                activation_revision=revision,
+                last_idempotency_key=idempotency_key,
+                evidence_refs=list(current.evidence_refs) if current is not None else [],
+                activation_state=actual_state,
+                runtime_profile=dict(current.runtime_profile) if current is not None else {},
+            )
+            record.capability_activations = [
+                item
+                for item in record.capability_activations
+                if not (
+                    item.package_version_ref == package.version_ref
+                    and item.target_slave == target_slave
+                )
+            ]
+            record.capability_activations.append(activation)
+            record.events.append(
+                {
+                    "phase": "capability_desired_state_changed",
+                    "package_ref": package.version_ref,
+                    "package_digest": package.package_digest,
+                    "target_slave": target_slave,
+                    "desired_state": desired_state,
+                    "activation_revision": revision,
+                    "idempotency_key": idempotency_key,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            await self._persist(record)
+            self._project_ready_capabilities(target_slave)
+            return activation
+
+    async def record_capability_health(
+        self, report: CapabilityHealthReport, *, run_id: str | None = None
+    ) -> CapabilityPackageActivation:
+        if not isinstance(report, CapabilityHealthReport):
+            report = CapabilityHealthReport.model_validate(report)
+        package = await self.get_capability_package(
+            report.package_version_ref, run_id=run_id
+        )
+        record = await self._activation_record(package)
+        workspace = (
+            record.closure_contract.workspace_id
+            if record.closure_contract is not None
+            else "workspace-default"
+        )
+        lock = self._activation_locks.setdefault(
+            (workspace, package.version_ref, report.target_slave), asyncio.Lock()
+        )
+        async with lock:
+            return await self._record_capability_health_locked(report, run_id=run_id)
+
+    async def _record_capability_health_locked(
+        self, report: CapabilityHealthReport, *, run_id: str | None = None
+    ) -> CapabilityPackageActivation:
+        """Accept an actual-state report only for the current desired revision."""
+        if not isinstance(report, CapabilityHealthReport):
+            report = CapabilityHealthReport.model_validate(report)
+        package = await self.get_capability_package(
+            report.package_version_ref, run_id=run_id
+        )
+        if package.package_digest != report.package_digest:
+            raise ValueError("capability_package_digest_mismatch")
+        record = await self._activation_record(package)
+        current = next(
+            (
+                item
+                for item in record.capability_activations
+                if item.package_version_ref == package.version_ref
+                and item.target_slave == report.target_slave
+            ),
+            None,
+        )
+        if current is None:
+            raise ValueError("activation_desired_state_missing")
+        if report.activation_revision < current.activation_revision:
+            raise ValueError("stale_activation_revision")
+        if report.activation_revision > current.activation_revision:
+            raise ValueError("future_activation_revision")
+
+        previous_report = next(
+            (
+                event
+                for event in record.events
+                if event.get("phase") == "capability_health_report"
+                and event.get("report_id") == report.report_id
+            ),
+            None,
+        )
+        if previous_report is not None:
+            if (
+                previous_report.get("package_digest") == report.package_digest
+                and previous_report.get("target_slave") == report.target_slave
+                and previous_report.get("activation_revision")
+                == report.activation_revision
+                and previous_report.get("activation_state")
+                == report.activation_state
+                and previous_report.get("evidence_refs") == report.evidence_refs
+                and previous_report.get("details") == report.details
+            ):
+                return current
+            raise ValueError("health_report_id_reused")
+
+        allowed_transitions = {
+            "not_installed": {"ready", "failed", "stopped"},
+            "provisioning": {"ready", "degraded", "failed", "stopped"},
+            "ready": {"ready", "degraded", "failed", "stopped"},
+            "degraded": {"ready", "degraded", "failed", "stopped"},
+            "failed": {"failed", "stopped"},
+            "stopped": {"stopped"},
+            "lost": {"ready", "degraded", "failed", "stopped"},
+        }
+        if report.activation_state not in allowed_transitions[current.activation_state]:
+            raise ValueError("activation_state_transition_invalid")
+        runtime_profile = (
+            dict(report.details.get("runtime_profile") or {})
+            if isinstance(report.details, dict)
+            else {}
+        )
+        activation = current
+        if (
+            report.activation_state != current.activation_state
+            or report.evidence_refs != current.evidence_refs
+            or runtime_profile
+        ):
+            activation = current.model_copy(
+                update={
+                    "activation_state": report.activation_state,
+                    "evidence_refs": list(report.evidence_refs),
+                    "runtime_profile": runtime_profile or current.runtime_profile,
+                }
+            )
+            record.capability_activations = [
+                item
+                for item in record.capability_activations
+                if not (
+                    item.package_version_ref == package.version_ref
+                    and item.target_slave == report.target_slave
+                )
+            ]
+            record.capability_activations.append(activation)
+        record.events.append(
+            {
+                "phase": "capability_health_report",
+                "report_id": report.report_id,
+                "package_ref": package.version_ref,
+                "package_digest": package.package_digest,
+                "target_slave": report.target_slave,
+                "desired_state": activation.desired_state,
+                "activation_revision": report.activation_revision,
+                "activation_state": report.activation_state,
+                "evidence_refs": report.evidence_refs,
+                "details": report.details,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         await self._persist(record)
+        self._project_ready_capabilities(report.target_slave)
         return activation
 
     @staticmethod
@@ -2191,16 +2445,33 @@ class ObserverRepository:
             if foreign is not None:
                 return [{"code": "capability_package_scope_mismatch", "package_ref": self._package_ref(foreign)}]
             return [{"code": "orchestration_package_not_found"}]
-        if package.execution.kind != "container:python_orchestrator":
+        if (
+            package.package_type,
+            package.execution.kind,
+            package.execution.version,
+        ) != DRIVER_ORCHESTRATOR_KEY:
             return [{"code": "orchestration_package_invalid"}]
         blockers: list[dict[str, Any]] = []
+        try:
+            capability_export = self._single_export(package)
+            program_content_ref = self._package_body_ref(package, "program_content_ref")
+            allowed_node_package_refs = [
+                ResourceRef.model_validate(item)
+                for item in package.body["allowed_node_package_refs"]
+            ]
+            max_nodes = int(package.body["max_nodes"])
+            max_live_nodes = int(package.body["max_live_nodes"])
+        except (KeyError, TypeError, ValueError):
+            return [{"code": "orchestration_package_invalid"}]
         if (
-            package.function_body.replay_safety != "DeterministicByEventLog"
-            or package.function_body.captures_run_state
-            or package.function_body.captured_secret_refs
-            or package.function_body.captured_path_refs
+            capability_export.replay_safety != "DeterministicByEventLog"
+            or bool(package.body.get("captures_run_state", False))
+            or package.body.get("captured_secret_refs")
+            or package.body.get("captured_path_refs")
         ):
             blockers.append({"code": "orchestration_not_replayable", "package_ref": self._package_ref(package)})
+        if max_live_nodes > max_nodes:
+            blockers.append({"code": "orchestration_live_node_limit_exceeded", "package_ref": self._package_ref(package), "limit": max_live_nodes, "max_nodes": max_nodes})
         if self.orchestrator_runtime_available is not False and shutil.which("docker") is None:
             blockers.append({"code": "orchestrator_runtime_unavailable"})
         if run_id is not None and not self._package_visible_to_run(package, run_id):
@@ -2213,7 +2484,7 @@ class ObserverRepository:
             ("max_nodes", "max_nodes", "orchestration_node_limit_exceeded"),
             ("max_live_nodes", "max_live_nodes", "orchestration_live_node_limit_exceeded"),
         ):
-            package_limit = getattr(package.function_body, field_name)
+            package_limit = max_nodes if field_name == "max_nodes" else max_live_nodes
             budget_limit = budget.get(budget_key)
             try:
                 exceeds_budget = budget_limit is not None and package_limit is not None and int(package_limit) > int(budget_limit)
@@ -2222,22 +2493,22 @@ class ObserverRepository:
             if exceeds_budget:
                 blockers.append({"code": code, "package_ref": self._package_ref(package), "limit": package_limit, "budget": budget_limit})
         closure_contract_ref = snapshot.program.io_contract_ref
-        package_contract_ref = package.function_body.io_contract_ref
+        export_io_contract_ref = capability_export.io_contract_ref
         if (
             closure_contract_ref is None
-            or package_contract_ref is None
+            or export_io_contract_ref is None
             or (closure_contract_ref.digest or closure_contract_ref.resource_id)
-            != (package_contract_ref.digest or package_contract_ref.resource_id)
+            != (export_io_contract_ref.digest or export_io_contract_ref.resource_id)
         ):
             blockers.append({"code": "io_contract_mismatch", "package_ref": self._package_ref(package)})
-        stat = await self.content_store.stat(package.function_body.program_content_ref)
-        if stat is None or not stat.integrity_verified or stat.declared_digest != package.function_body.program_digest:
+        stat = await self.content_store.stat(program_content_ref)
+        if stat is None or not stat.integrity_verified or stat.declared_digest != program_content_ref.digest:
             blockers.append({"code": "package_content_unavailable", "package_ref": self._package_ref(package)})
         elif stat.media_type != "text/x-python":
             blockers.append({"code": "orchestration_program_invalid", "package_ref": self._package_ref(package)})
         else:
             try:
-                source = (await self.content_store.get(package.function_body.program_content_ref)).decode("utf-8")
+                source = (await self.content_store.get(program_content_ref)).decode("utf-8")
                 ast.parse(source)
             except (UnicodeDecodeError, SyntaxError):
                 blockers.append({"code": "orchestration_program_invalid", "package_ref": self._package_ref(package)})
@@ -2274,25 +2545,24 @@ class ObserverRepository:
                             blockers.append({"code": "orchestration_program_unresolved_name", "diagnostics": unresolved})
                         if type_errors:
                             blockers.append({"code": "orchestration_program_type_error", "diagnostics": type_errors})
-        for node_package_ref in package.function_body.allowed_node_package_refs:
+        for node_package_ref in allowed_node_package_refs:
             node_package = self._find_package(node_package_ref, run_id=run_id)
             if node_package is None:
                 blockers.append({"code": "node_package_not_found", "package_ref": node_package_ref.resource_id})
                 continue
-            if node_package.execution.kind != "process:json_stdio":
-                blockers.append({"code": "node_package_invalid", "package_ref": node_package_ref.resource_id})
             if run_id is not None and not self._package_visible_to_run(node_package, run_id):
                 blockers.append({"code": "capability_package_scope_mismatch", "package_ref": self._package_ref(node_package)})
-            if node_package.function_body.io_contract_ref is None:
-                blockers.append({"code": "node_io_contract_unavailable", "package_ref": self._package_ref(node_package)})
-            else:
+            for node_export in node_package.capability_exports:
                 try:
-                    IoContract.model_validate(await self._load_json_content(node_package.function_body.io_contract_ref))
+                    IoContract.model_validate(await self._load_json_content(node_export.io_contract_ref))
                 except (FileNotFoundError, TypeError, ValueError):
-                    blockers.append({"code": "node_io_contract_unavailable", "package_ref": self._package_ref(node_package)})
-            stat = await self.content_store.stat(node_package.function_body.program_content_ref)
-            if stat is None or not stat.integrity_verified or stat.declared_digest != node_package.function_body.program_digest:
-                blockers.append({"code": "package_content_unavailable", "package_ref": self._package_ref(node_package)})
+                    blockers.append(
+                        {
+                            "code": "node_io_contract_unavailable",
+                            "package_ref": self._package_ref(node_package),
+                            "capability_descriptor_ref": node_export.capability_descriptor_ref.model_dump(mode="json"),
+                        }
+                    )
             if not any(self._slave_supports_package(slave_id, node_package) for slave_id in self.slave_capabilities):
                 blockers.append({"code": "node_target_unavailable", "package_ref": self._package_ref(node_package)})
         return blockers
@@ -2319,7 +2589,10 @@ class ObserverRepository:
                 }
             )
         blockers.extend(await self._evaluate_input_schema(snapshot, operation_ref))
-        is_orchestration = snapshot.program_systems.execution.kind == "container:python_orchestrator"
+        is_orchestration = (
+            snapshot.program_systems.execution.kind,
+            snapshot.program_systems.execution.version,
+        ) == DRIVER_ORCHESTRATOR_KEY[1:]
         if is_orchestration:
             blockers.extend(await self._evaluate_orchestration_package(snapshot, run_id=run_id))
         bindings_by_hole = {binding.hole_id: binding for binding in snapshot.compute_bindings}
@@ -2351,51 +2624,21 @@ class ObserverRepository:
                     blockers.append({"code": "capability_package_scope_mismatch", "hole_id": hole.hole_id, "source_run_ref": package.source_run_ref})
                 if package.publication_state == "abandoned":
                     blockers.append({"code": "capability_package_abandoned", "package_ref": self._package_ref(package)})
-                if package.package_type == "service":
-                    endpoints = list(package.body.endpoints) if isinstance(package.body, ServiceCapabilityPackageBody) else []
-                    matching = [item for item in endpoints if self._operation_name(item.operation_descriptor_ref.resource_id) == operation or item.endpoint_id == operation or item.path == operation]
-                    if operation and len(matching) != 1:
-                        blockers.append({"code": "operation_descriptor_mismatch", "operation": operation})
-                    if not self._slave_supports_package(target, package):
-                        blockers.append({"code": "runtime_plugin_unavailable", "execution_kind": package.execution.kind})
-                    if matching:
-                        endpoint = matching[0]
-                        descriptor = binding.capability_descriptor_ref
-                        endpoint_descriptor = endpoint.operation_descriptor_ref
-                        if (
-                            descriptor.resource_id != endpoint_descriptor.resource_id
-                            or descriptor.digest != endpoint_descriptor.digest
-                        ):
-                            blockers.append({"code": "operation_descriptor_mismatch", "operation": operation})
-                        endpoint_contract = endpoint.io_contract_ref
-                        closure_contract_ref = snapshot.program.io_contract_ref
-                        if closure_contract_ref is not None and (closure_contract_ref.digest or closure_contract_ref.resource_id) != (endpoint_contract.digest or endpoint_contract.resource_id):
-                            blockers.append({"code": "io_contract_mismatch", "hole_id": hole.hole_id, "closure_io_contract_ref": closure_contract_ref.resource_id, "package_io_contract_ref": endpoint_contract.resource_id})
+                try:
+                    capability_export = package.export_for(binding.capability_descriptor_ref)
+                except ValueError:
+                    blockers.append({"code": "operation_descriptor_mismatch", "operation": operation})
                 else:
                     closure_contract_ref = snapshot.program.io_contract_ref
-                    package_contract_ref = package.function_body.io_contract_ref
+                    export_io_contract_ref = capability_export.io_contract_ref
                     if (
                         closure_contract_ref is None
-                        or package_contract_ref is None
                         or (closure_contract_ref.digest or closure_contract_ref.resource_id)
-                        != (package_contract_ref.digest or package_contract_ref.resource_id)
+                        != (export_io_contract_ref.digest or export_io_contract_ref.resource_id)
                     ):
-                        blockers.append({"code": "io_contract_mismatch", "hole_id": hole.hole_id, "closure_io_contract_ref": closure_contract_ref.resource_id if closure_contract_ref else None, "package_io_contract_ref": package_contract_ref.resource_id if package_contract_ref else None})
-                    stat = await self.content_store.stat(package.function_body.program_content_ref)
-                    if stat is None or not stat.integrity_verified or stat.declared_digest != package.function_body.program_digest:
-                        blockers.append({"code": "package_content_unavailable", "hole_id": hole.hole_id})
-                    if package.function_body.provider_fillable_hole_refs and not binding.runtime_profile:
-                        blockers.append({"code": "provider_fillable_hole_unbound", "hole_id": hole.hole_id, "hole_refs": package.function_body.provider_fillable_hole_refs})
-                    if "run_code" not in capability.get("operations", set()):
-                        blockers.append({"code": "capability_unavailable", "operation": "run_code", "target_resource_ref": target})
-                    try:
-                        default_registry.get(package.execution)
-                    except ValueError:
-                        blockers.append({"code": "executor_unavailable", "execution_kind": package.execution.kind})
-                    descriptor_ref = package.function_body.operation_descriptor_ref
-                    descriptor_name = descriptor_ref.resource_id if isinstance(descriptor_ref, ResourceRef) else str(descriptor_ref)
-                    if operation and self._operation_name(descriptor_name) != operation:
-                        blockers.append({"code": "operation_descriptor_mismatch", "operation": operation})
+                        blockers.append({"code": "io_contract_mismatch", "hole_id": hole.hole_id, "closure_io_contract_ref": closure_contract_ref.resource_id if closure_contract_ref else None, "package_io_contract_ref": export_io_contract_ref.resource_id})
+                if not self._slave_supports_package(target, package):
+                    blockers.append({"code": "runtime_provider_unavailable", "execution_kind": package.execution.kind})
             elif operation == "run_code":
                 # ``run_code`` is the generic subprocess executor, not an
                 # executable builtin.  A concrete capability package is the
@@ -2796,127 +3039,31 @@ class ObserverRepository:
                 snapshot.compute.typed_holes.append(hole)
             elif kind == "materialize_capability_package_candidate":
                 header = dict(operation.get("value") or {})
-                if set(header) - {"package_id", "package_version", "package_type", "execution", "body", "package_digest"}:
+                if set(header) - {"package_id", "package_version", "package_type", "execution", "capability_exports", "body", "package_digest"}:
                     raise ValueError("capability_package_header_invalid")
-                if header.get("package_type") == "service":
-                    if not isinstance(header.get("body"), dict):
-                        raise ValueError("capability_package_body_required")
-                    try:
-                        execution = ExecutionContract.model_validate(header.get("execution") or {"kind": "container:http", "version": "1"})
-                        body = ServiceCapabilityPackageBody.model_validate(header["body"])
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError(str(exc) or "service_package_body_invalid") from exc
-                    if execution.kind != "container:http" or execution.version != "1":
-                        raise ValueError("unsupported_execution_contract")
-                    # Resolve every IoContract and schema while the candidate
-                    # is created, so an unresolvable ref cannot be promoted or
-                    # provisioned later.
-                    for endpoint in body.endpoints:
-                        # Descriptor resolution has its own stable error
-                        # codes; do not hide an unavailable/mismatched
-                        # descriptor behind the generic IO-contract error.
-                        await self._validate_operation_descriptor_ref(endpoint.operation_descriptor_ref)
-                        try:
-                            contract = IoContract.model_validate(await self._load_json_content(endpoint.io_contract_ref))
-                            for schema_ref in (contract.input_schema_ref, contract.output_schema_ref):
-                                if schema_ref is not None:
-                                    validate_schema(await self._load_json_content(schema_ref))
-                            if contract.success_validator_ref is not None:
-                                self._require_content_ref(contract.success_validator_ref)
-                                await self.content_store.get(contract.success_validator_ref)
-                        except (FileNotFoundError, TypeError, ValueError) as exc:
-                            raise ValueError("io_contract_invalid") from exc
+                required = {"package_type", "execution", "capability_exports", "body"}
+                if not required.issubset(header):
+                    raise ValueError("capability_package_header_invalid")
+                try:
                     package = CapabilityPackageVersion(
-                        package_type="service",
+                        package_type=str(header["package_type"]),
                         package_id=str(header.get("package_id") or f"package-{uuid4().hex[:12]}"),
                         package_version=str(header.get("package_version") or "v1"),
                         package_closure_version_ref=f"package-closure-{uuid4().hex[:12]}",
                         source_run_ref=record.run_id,
                         source_closure_version_ref=record.draft.version_id,
-                        execution=execution,
-                        body=body,
+                        execution=ExecutionContract.model_validate(header["execution"]),
+                        capability_exports=[
+                            CapabilityExport.model_validate(item)
+                            for item in header["capability_exports"]
+                        ],
+                        body=header["body"],
                         package_digest=str(header.get("package_digest") or ""),
                         provenance=[{"source": "coding_agent", "run_id": record.run_id}],
                     )
-                    existing = next((item for item in record.capability_packages if item.package_id == package.package_id and item.package_version == package.package_version), None)
-                    if existing is None:
-                        record.capability_packages.append(package)
-                    elif existing.package_digest != package.package_digest:
-                        raise ValueError("capability_package_identity_conflict")
-                    else:
-                        package = existing
-                    snapshot.metadata.setdefault("capability_package_refs", []).append(self._package_ref(package))
-                    continue
-                if header.get("package_type", "function") != "function":
-                    raise ValueError(f"unsupported_package_type:{header['package_type']}")
-                if not isinstance(header.get("body"), dict):
-                    raise ValueError("capability_package_body_required")
-                value = dict(header["body"])
-                if set(value) - FunctionCapabilityPackageBody.model_fields.keys():
-                    if "program" in value:
-                        raise ValueError("program_content_ref_required")
-                    raise ValueError("capability_package_body_invalid")
-                package_id = str(header.get("package_id") or f"package-{uuid4().hex[:12]}")
-                package_version = str(header.get("package_version") or "v1")
-                io_contract_payload = value.get("io_contract_ref")
-                if not io_contract_payload:
-                    raise ValueError("io_contract_required")
-                try:
-                    io_contract_ref = ResourceRef.model_validate(io_contract_payload)
-                    IoContract.model_validate(await self._load_json_content(io_contract_ref))
-                except (FileNotFoundError, TypeError, ValueError) as exc:
-                    if str(exc) in {"io_contract_invalid", "invalid_json"}:
-                        raise
-                    raise ValueError("io_contract_invalid") from exc
-                program_ref_payload = value.get("program_content_ref")
-                if isinstance(program_ref_payload, ResourceRef):
-                    program_ref = program_ref_payload
-                elif isinstance(program_ref_payload, dict):
-                    program_ref = ResourceRef.model_validate(program_ref_payload)
-                else:
-                    raise ValueError("program_content_ref_required")
-                self._require_content_ref(program_ref)
-                operation_ref = value.get("operation_descriptor_ref") or snapshot.program.operation_ref or snapshot.compute.operation_ref
-                if isinstance(operation_ref, dict):
-                    operation_ref = ResourceRef.model_validate(operation_ref)
-                else:
-                    operation_ref = ResourceRef(resource_id=str(operation_ref), identity_criterion="descriptor_digest")
-                descriptor_identity = operation_ref.resource_id if isinstance(operation_ref, ResourceRef) else str(operation_ref)
-                if not descriptor_identity:
-                    raise ValueError("operation_descriptor_required")
-                allowed_node_package_refs = [ResourceRef.model_validate(item) for item in value.get("allowed_node_package_refs", [])]
-                max_nodes = value.get("max_nodes")
-                max_live_nodes = value.get("max_live_nodes")
-                execution = ExecutionContract.model_validate(header.get("execution", {}))
-                execution_kind = execution.kind
-                package = CapabilityPackageVersion(
-                    package_type="function",
-                    package_id=package_id,
-                    package_version=package_version,
-                    package_closure_version_ref=f"package-closure-{uuid4().hex[:12]}",
-                    source_run_ref=record.run_id,
-                    source_closure_version_ref=record.draft.version_id,
-                    execution=execution,
-                    body=FunctionCapabilityPackageBody(
-                        operation_descriptor_ref=operation_ref,
-                        program_content_ref=program_ref,
-                        io_contract_ref=io_contract_ref,
-                        effective_constraint_refs=[Constraint.model_validate(item).ref() if isinstance(item, dict) else ConstraintRef.model_validate(item) for item in value.get("effective_constraint_refs", [])],
-                        provider_fillable_hole_refs=[str(item) for item in value.get("provider_fillable_hole_refs", [])],
-                        effect_class=str(value.get("effect_class") or "Sandboxed"),
-                        permissions=[str(item) for item in value.get("permissions", [])],
-                        replay_safety=str(value.get("replay_safety") or ("DeterministicByEventLog" if execution_kind == "container:python_orchestrator" else "DeclaredByPackage")),
-                        captures_run_state=bool(value.get("captures_run_state", False)),
-                        captured_secret_refs=[str(item) for item in value.get("captured_secret_refs", [])],
-                        captured_path_refs=[str(item) for item in value.get("captured_path_refs", [])],
-                        semantic_closed=bool(value.get("semantic_closed", True)),
-                        allowed_node_package_refs=allowed_node_package_refs,
-                        max_nodes=int(max_nodes) if max_nodes is not None else None,
-                        max_live_nodes=int(max_live_nodes) if max_live_nodes is not None else None,
-                    ),
-                    package_digest=str(header.get("package_digest") or ""),
-                    provenance=[{"source": "coding_agent", "run_id": record.run_id}],
-                )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(str(exc) or "capability_package_invalid") from exc
+                await self._validate_package_exports(package)
                 # Re-materializing the exact immutable package is idempotent,
                 # but a logical coordinate must not silently change meaning
                 # within one Run.  A caller that changes the program or any
@@ -2936,10 +3083,14 @@ class ObserverRepository:
                     raise ValueError("capability_package_identity_conflict")
                 else:
                     package = existing
-                if package.execution.kind == "container:python_orchestrator":
+                if (
+                    package.package_type,
+                    package.execution.kind,
+                    package.execution.version,
+                ) == DRIVER_ORCHESTRATOR_KEY:
                     snapshot.program_systems.execution = package.execution
                     snapshot.program_systems.package_ref = ResourceRef(resource_id=self._package_ref(package), version_or_digest=package.package_digest)
-                    snapshot.program_systems.replay_safety = package.function_body.replay_safety
+                    snapshot.program_systems.replay_safety = self._single_export(package).replay_safety
                 snapshot.metadata.setdefault("capability_package_refs", []).append(self._package_ref(package))
             elif kind == "bind_compute_hole":
                 value = operation.get("value", {})
@@ -3057,7 +3208,10 @@ class ObserverRepository:
         if not readiness["ready"]:
             await self._persist(record)
             raise self._readiness_error(readiness)
-        if record.committed.snapshot.program_systems.execution.kind != "container:python_orchestrator":
+        if (
+            record.committed.snapshot.program_systems.execution.kind,
+            record.committed.snapshot.program_systems.execution.version,
+        ) != DRIVER_ORCHESTRATOR_KEY[1:]:
             self._check_attempt_budget(record)
         previous_execution_id = record.execution_id
         if previous_execution_id is None:
@@ -3067,7 +3221,10 @@ class ObserverRepository:
         record.execution_id = f"execution-{uuid4().hex[:12]}"
         record.outcome = None
         _transition(record, "execution_started")
-        if record.committed.snapshot.program_systems.execution.kind != "container:python_orchestrator":
+        if (
+            record.committed.snapshot.program_systems.execution.kind,
+            record.committed.snapshot.program_systems.execution.version,
+        ) != DRIVER_ORCHESTRATOR_KEY[1:]:
             target = "slave-a"
             if record.committed.snapshot.compute_bindings:
                 target = self._canonical_target_resource_id(
@@ -3081,7 +3238,10 @@ class ObserverRepository:
                 "execution_epoch": record.execution_epoch,
             }
         )
-        if record.committed.snapshot.program_systems.execution.kind == "container:python_orchestrator":
+        if (
+            record.committed.snapshot.program_systems.execution.kind,
+            record.committed.snapshot.program_systems.execution.version,
+        ) == DRIVER_ORCHESTRATOR_KEY[1:]:
             record.events.append(
                 {
                     "phase": "orchestration_started",
@@ -3266,7 +3426,8 @@ class ObserverRepository:
             try:
                 validator_program = await self.content_store.get(expected_validator_ref)
                 validator_input = result["value"] if isinstance(result["value"], dict) else {"value": result["value"]}
-                validator_result = await default_registry.invoke(
+                validator_result = await default_registry.invoke_for(
+                    "function",
                     ExecutionContract(kind="process:json_stdio", version="1"),
                     validator_input,
                     program=validator_program,
@@ -3424,7 +3585,9 @@ class ObserverRepository:
         return record
 
     async def set_slave_capabilities(self, slave_id: str, operations: set[str]) -> None:
-        self.slave_capabilities.setdefault(slave_id, {})["operations"] = set(operations)
+        details = self.slave_capabilities.setdefault(slave_id, {})
+        details["base_operations"] = set(operations)
+        details["operations"] = set(operations)
 
     def _orchestration_provenance(
         self,
@@ -3440,7 +3603,7 @@ class ObserverRepository:
             "parent_execution_ref": record.execution_id,
             "closure_version_ref": record.committed.version_id if record.committed is not None else record.draft.version_id,
             "orchestration_package_ref": package_ref.model_dump(mode="json") if package_ref is not None else None,
-            "orchestration_program_ref": package.function_body.program_content_ref.model_dump(mode="json") if package is not None else None,
+            "orchestration_program_ref": self._package_body_ref(package, "program_content_ref").model_dump(mode="json") if package is not None else None,
         }
 
     async def accept_node_intent(
@@ -3478,7 +3641,10 @@ class ObserverRepository:
 
         snapshot = record.committed.snapshot if record.committed is not None else record.draft.snapshot
         orchestration_ref = snapshot.program_systems.package_ref
-        if orchestration_ref is None or snapshot.program_systems.execution.kind != "container:python_orchestrator":
+        if orchestration_ref is None or (
+            snapshot.program_systems.execution.kind,
+            snapshot.program_systems.execution.version,
+        ) != DRIVER_ORCHESTRATOR_KEY[1:]:
             raise ValueError("orchestration_package_not_bound")
         orchestration_package = self._find_package(orchestration_ref, run_id=run_id)
         if orchestration_package is None:
@@ -3486,8 +3652,21 @@ class ObserverRepository:
             if foreign is not None:
                 raise ValueError("capability_package_scope_mismatch")
             raise ValueError("orchestration_package_not_found")
-        if orchestration_package.execution.kind != "container:python_orchestrator":
+        if (
+            orchestration_package.package_type,
+            orchestration_package.execution.kind,
+            orchestration_package.execution.version,
+        ) != DRIVER_ORCHESTRATOR_KEY:
             raise ValueError("orchestration_package_not_found")
+        try:
+            allowed_node_package_refs = [
+                ResourceRef.model_validate(item)
+                for item in orchestration_package.body["allowed_node_package_refs"]
+            ]
+            max_nodes = int(orchestration_package.body["max_nodes"])
+            max_live_nodes = int(orchestration_package.body["max_live_nodes"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("orchestration_package_invalid") from exc
 
         if not any(
             event.get("phase") == "node_requested" and event.get("intent_id") == intent.intent_id
@@ -3509,13 +3688,17 @@ class ObserverRepository:
 
         existing = next((node for node in record.dynamic_nodes if node.intent_id == intent.intent_id), None)
         if existing is not None:
-            if existing.package_ref == intent.package_ref and existing.input_refs == intent.input_refs:
+            if (
+                existing.package_ref == intent.package_ref
+                and existing.capability_descriptor_ref == intent.capability_descriptor_ref
+                and existing.input_refs == intent.input_refs
+            ):
                 return existing
             raise ValueError("node_intent_conflict")
-        if len(record.dynamic_nodes) >= orchestration_package.function_body.max_nodes:
+        if len(record.dynamic_nodes) >= max_nodes:
             raise ValueError("orchestration_node_limit_exceeded")
         live_nodes = [node for node in record.dynamic_nodes if node.state not in {"completed", "failed", "decision_required"}]
-        if len(live_nodes) >= orchestration_package.function_body.max_live_nodes:
+        if len(live_nodes) >= max_live_nodes:
             raise ValueError("orchestration_live_node_limit_exceeded")
 
         def same_ref(left: ResourceRef, right: ResourceRef) -> bool:
@@ -3523,7 +3706,7 @@ class ObserverRepository:
             right_digest = (right.digest or "").lower()
             return left.resource_id == right.resource_id and left_digest == right_digest
 
-        if not any(same_ref(intent.package_ref, allowed) for allowed in orchestration_package.function_body.allowed_node_package_refs):
+        if not any(same_ref(intent.package_ref, allowed) for allowed in allowed_node_package_refs):
             raise ValueError("node_package_not_allowed")
         try:
             node_package = await self.get_capability_package(intent.package_ref, run_id=run_id)
@@ -3535,16 +3718,16 @@ class ObserverRepository:
             raise ValueError("capability_package_scope_mismatch")
         if node_package.publication_state == "abandoned":
             raise ValueError("capability_package_abandoned")
-        if node_package.execution.kind != "process:json_stdio":
-            raise ValueError("node_package_invalid")
+        try:
+            node_export = node_package.export_for(intent.capability_descriptor_ref)
+        except ValueError as exc:
+            raise ValueError("node_capability_export_not_found") from exc
 
         workspace_id = record.closure_contract.workspace_id if record.closure_contract is not None else "workspace-default"
         await self.refresh_slaves(workspace_id)
 
-        if node_package.function_body.io_contract_ref is None:
-            raise ValueError("node_io_contract_unavailable")
         try:
-            contract_payload = await self._load_json_content(node_package.function_body.io_contract_ref)
+            contract_payload = await self._load_json_content(node_export.io_contract_ref)
             contract = IoContract.model_validate(contract_payload)
         except (FileNotFoundError, TypeError, ValueError):
             raise ValueError("node_io_contract_unavailable")
@@ -3601,8 +3784,8 @@ class ObserverRepository:
         target = self._canonical_target_resource_id(selected_target)
         if not self._slave_supports_package(target, node_package):
             raise ValueError("node_target_unavailable")
-        if record.closure_contract is not None and node_package.function_body.permissions:
-            if not set(node_package.function_body.permissions).issubset(set(record.closure_contract.allowed_effects)):
+        if record.closure_contract is not None and node_export.permissions:
+            if not set(node_export.permissions).issubset(set(record.closure_contract.allowed_effects)):
                 raise ValueError("node_permission_denied")
         locality = next(
             (
@@ -3615,10 +3798,10 @@ class ObserverRepository:
         if locality is not None and self._canonical_target_resource_id(str(locality)) != target:
             raise ValueError("node_target_unavailable")
 
-        if len(record.dynamic_nodes) >= orchestration_package.function_body.max_nodes:
+        if len(record.dynamic_nodes) >= max_nodes:
             raise ValueError("orchestration_node_limit_exceeded")
         live_nodes = [node for node in record.dynamic_nodes if node.state not in {"completed", "failed", "decision_required"}]
-        if len(live_nodes) >= orchestration_package.function_body.max_live_nodes:
+        if len(live_nodes) >= max_live_nodes:
             raise ValueError("orchestration_live_node_limit_exceeded")
 
         node_id = f"node-{record.execution_id}-{len(record.dynamic_nodes) + 1}"
@@ -3627,6 +3810,7 @@ class ObserverRepository:
             parent_execution_ref=record.execution_id,
             intent_id=intent.intent_id,
             package_ref=intent.package_ref,
+            capability_descriptor_ref=intent.capability_descriptor_ref,
             input_refs=intent.input_refs,
             state="accepted",
         )
@@ -3642,12 +3826,14 @@ class ObserverRepository:
                     "node_id": node.node_id,
                     "intent_id": intent.intent_id,
                     "package_ref": intent.package_ref.model_dump(mode="json"),
+                    "capability_descriptor_ref": intent.capability_descriptor_ref.model_dump(mode="json"),
                     "input_refs": [item.model_dump(mode="json") for item in intent.input_refs],
                     "selected_target": target,
                     "reason": "capability_match",
                     "provenance": {
                         **provenance,
                         "node_package_ref": node.package_ref.model_dump(mode="json"),
+                        "capability_descriptor_ref": node.capability_descriptor_ref.model_dump(mode="json"),
                     },
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 },
@@ -3686,6 +3872,10 @@ class ObserverRepository:
         node_package = self._find_package(node.package_ref, run_id=run_id)
         if node_package is None or not self._slave_supports_package(normalized_target, node_package):
             raise ValueError("node_target_unavailable")
+        try:
+            node_package.export_for(node.capability_descriptor_ref)
+        except ValueError as exc:
+            raise ValueError("node_capability_export_not_found") from exc
         target_agent = self.slave_agents[normalized_target]
         self._check_attempt_budget(record)
         attempt = {
@@ -3713,10 +3903,12 @@ class ObserverRepository:
                 "target_instance_id": attempt["target_instance_id"],
                 "target_agent_epoch": attempt["target_agent_epoch"],
                 "package_ref": node.package_ref.model_dump(mode="json"),
+                "capability_descriptor_ref": node.capability_descriptor_ref.model_dump(mode="json"),
                 "input_refs": [item.model_dump(mode="json") for item in node.input_refs],
                 "provenance": {
                     **self._orchestration_provenance(record),
                     "node_package_ref": node.package_ref.model_dump(mode="json"),
+                    "capability_descriptor_ref": node.capability_descriptor_ref.model_dump(mode="json"),
                 },
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -3784,8 +3976,12 @@ class ObserverRepository:
             package = self._find_package(node.package_ref, run_id=run_id)
             if package is None:
                 raise ValueError("node_target_unavailable")
-            if record.closure_contract is not None and package.function_body.permissions:
-                if not set(package.function_body.permissions).issubset(set(record.closure_contract.allowed_effects)):
+            try:
+                capability_export = package.export_for(node.capability_descriptor_ref)
+            except ValueError as exc:
+                raise ValueError("node_capability_export_not_found") from exc
+            if record.closure_contract is not None and capability_export.permissions:
+                if not set(capability_export.permissions).issubset(set(record.closure_contract.allowed_effects)):
                     raise ValueError("node_permission_denied")
             for input_ref in node.input_refs:
                 try:
@@ -3875,7 +4071,7 @@ class ObserverRepository:
                         "origin_conversation_ref": contract.origin_conversation_ref if contract is not None else updated.task_ref,
                     },
                     "package_ref": updated_node.package_ref.model_dump(mode="json"),
-                    "package_replay_safety": package.function_body.replay_safety,
+                    "package_replay_safety": capability_export.replay_safety,
                     "input_refs": [item.model_dump(mode="json") for item in updated_node.input_refs],
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }
@@ -3951,10 +4147,9 @@ class ObserverRepository:
             raise ValueError("node_package_not_found") from exc
         if node_package.package_digest != (node.package_ref.digest or ""):
             raise ValueError("node_package_digest_mismatch")
-        if node_package.function_body.io_contract_ref is None:
-            raise ValueError("node_io_contract_unavailable")
         try:
-            contract = IoContract.model_validate(await self._load_json_content(node_package.function_body.io_contract_ref))
+            node_export = node_package.export_for(node.capability_descriptor_ref)
+            contract = IoContract.model_validate(await self._load_json_content(node_export.io_contract_ref))
             output_schema_ref = contract.output_schema_ref
             def same_ref(left: ResourceRef | None, right: ResourceRef | None) -> bool:
                 if left is None or right is None:
@@ -3992,7 +4187,8 @@ class ObserverRepository:
             try:
                 validator_program = await self.content_store.get(contract.success_validator_ref)
                 validator_input = value if isinstance(value, dict) else {"value": value}
-                validator_result = await default_registry.invoke(
+                validator_result = await default_registry.invoke_for(
+                    "function",
                     ExecutionContract(kind="process:json_stdio", version="1"),
                     validator_input,
                     program=validator_program,
@@ -4174,7 +4370,10 @@ class ObserverRepository:
         if record.state != "running" or record.execution_id is None:
             raise ValueError("execution_not_running")
         snapshot = record.committed.snapshot if record.committed is not None else record.draft.snapshot
-        if snapshot.program_systems.execution.kind != "container:python_orchestrator":
+        if (
+            snapshot.program_systems.execution.kind,
+            snapshot.program_systems.execution.version,
+        ) != DRIVER_ORCHESTRATOR_KEY[1:]:
             raise ValueError("orchestration_not_running")
         if any(node.state in {"failed", "decision_required"} for node in record.dynamic_nodes):
             raise ValueError("dynamic_nodes_not_successful")
@@ -4269,7 +4468,12 @@ class ObserverRepository:
             try:
                 validator_program = await self.content_store.get(contract.success_validator_ref)
                 validator_input = value if isinstance(value, dict) else {"value": value}
-                validator_result = await default_registry.invoke(ExecutionContract(kind="process:json_stdio", version="1"), validator_input, program=validator_program)
+                validator_result = await default_registry.invoke_for(
+                    "function",
+                    ExecutionContract(kind="process:json_stdio", version="1"),
+                    validator_input,
+                    program=validator_program,
+                )
                 validator_payload = validator_result.value if isinstance(validator_result.value, dict) else {}
                 if validator_payload.get("result") != "pass":
                     raw_errors = validator_payload.get("errors")

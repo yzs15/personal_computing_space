@@ -65,6 +65,11 @@ def test_driver_mcp_exposes_dynamic_tool_specs():
     assert "batch" in description
     assert "atomic" in description
     assert "readiness" in description
+    put_spec = next(item for item in specs if item["name"] == "loom_put_content")
+    assert "operation-descriptor+json" in put_spec["description"]
+    assert "do not calculate" in put_spec["description"].lower()
+    assert "capability_exports" in description
+    assert "omit `package_digest`" in description
 
 
 @pytest.mark.asyncio
@@ -107,6 +112,13 @@ async def test_bind_compute_hole_accepts_capability_uri_target_for_registered_sl
             },
         },
     )
+    descriptor = await mcp.call(
+        "loom_put_content",
+        {
+            "media_type": "application/vnd.loom.operation-descriptor+json",
+            "content": {"schema_version": "operation.v1", "resource_id": "loom://test_binding", "name": "test_binding"},
+        },
+    )
     await mcp.call(
         "loom_open_run", {"closure_contract": {"closure_id": "closure-binding-uri", "goal": "run package", "body": {"closure_id": "closure-binding-uri"}}},
     )
@@ -127,11 +139,18 @@ async def test_bind_compute_hole_accepts_capability_uri_target_for_registered_sl
                 "value": {
                              "package_id": "mcp-binding-package",
                              "package_version": "v1",
+                             "package_type": "function",
                              "execution": {"kind": "process:json_stdio", "version": "1"},
-                             "body": {
-                                 "operation_descriptor_ref": "loom://test_binding",
-                                 "program_content_ref": program["resource_ref"],
+                             "capability_exports": [{
+                                 "capability_descriptor_ref": descriptor["resource_ref"],
                                  "io_contract_ref": contract["resource_ref"],
+                                 "effect_class": "Sandboxed",
+                                 "permissions": [],
+                                 "replay_safety": "DeclaredByPackage",
+                                 "runtime_binding": {},
+                             }],
+                             "body": {
+                                 "program_content_ref": program["resource_ref"],
                              },
                          },
             }],
@@ -147,7 +166,7 @@ async def test_bind_compute_hole_accepts_capability_uri_target_for_registered_sl
                     "value": {
                         "binding_id": "binding-test",
                         "hole_id": "h_binding",
-                        "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
+                        "capability_descriptor_ref": descriptor["resource_ref"],
                         "capability_package_ref": {"resource_id": "capability-package://mcp-binding-package/v1"},
                         "target_resource_ref": {"resource_id": "loom://compute/slave-a"},
                     },

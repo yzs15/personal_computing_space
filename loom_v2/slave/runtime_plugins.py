@@ -21,12 +21,12 @@ from uuid import uuid4
 
 import httpx
 
+from loom_v2.contracts.package_contracts import package_contract_registry
 from loom_v2.contracts.types import (
+    CapabilityExport,
     CapabilityDeprovisionCommand,
     CapabilityPackageVersion,
     CapabilityProvisionCommand,
-    ComputeBinding,
-    HttpServiceEndpoint,
 )
 
 
@@ -63,15 +63,26 @@ class RuntimePluginSupport:
             raise RuntimePluginError("runtime_plugin_manifest_invalid")
         package_type = str(value.get("package_type") or "")
         execution_value = value.get("execution")
-        execution = execution_value if isinstance(execution_value, dict) else {}
-        if execution_value is not None and (not isinstance(execution_value, dict) or set(execution) - {"kind", "version"}):
+        has_flat_execution = (
+            "execution_kind" in value or "execution_version" in value
+        )
+        if has_flat_execution:
+            if (
+                execution_value is not None
+                or "execution_kind" not in value
+                or "execution_version" not in value
+            ):
+                raise RuntimePluginError("runtime_plugin_manifest_invalid")
+            execution_kind = str(value.get("execution_kind") or "")
+            execution_version = str(value.get("execution_version") or "")
+        elif (
+            not isinstance(execution_value, dict)
+            or set(execution_value) != {"kind", "version"}
+        ):
             raise RuntimePluginError("runtime_plugin_manifest_invalid")
-        execution_kind = str(value.get("execution_kind") or execution.get("kind") or "")
-        execution_version = str(value.get("execution_version") or execution.get("version") or "1")
-        if value.get("execution_kind") is not None and execution.get("kind") is not None and str(value["execution_kind"]) != str(execution["kind"]):
-            raise RuntimePluginError("runtime_plugin_manifest_invalid")
-        if value.get("execution_version") is not None and execution.get("version") is not None and str(value["execution_version"]) != str(execution["version"]):
-            raise RuntimePluginError("runtime_plugin_manifest_invalid")
+        else:
+            execution_kind = str(execution_value.get("kind") or "")
+            execution_version = str(execution_value.get("version") or "")
         if not package_type or not execution_kind or not execution_version:
             raise RuntimePluginError("runtime_plugin_manifest_invalid")
         return cls(package_type, execution_kind, execution_version)
@@ -94,13 +105,20 @@ class RuntimePluginDescriptor:
         supports = value.get("supports")
         if not isinstance(supports, list) or not supports:
             raise RuntimePluginError("runtime_plugin_descriptor_invalid")
-        descriptor = cls(
-            plugin_id=str(value.get("plugin_id") or ""),
-            protocol_version=str(value.get("protocol_version") or ""),
-            supports=tuple(RuntimePluginSupport.from_mapping(item) for item in supports),
-            runtime_descriptor_ref=str(value.get("runtime_descriptor_ref") or ""),
-            runtime_descriptor_digest=str(value.get("runtime_descriptor_digest") or "").lower(),
-        )
+        try:
+            descriptor = cls(
+                plugin_id=str(value.get("plugin_id") or ""),
+                protocol_version=str(value.get("protocol_version") or ""),
+                supports=tuple(
+                    RuntimePluginSupport.from_mapping(item) for item in supports
+                ),
+                runtime_descriptor_ref=str(value.get("runtime_descriptor_ref") or ""),
+                runtime_descriptor_digest=str(
+                    value.get("runtime_descriptor_digest") or ""
+                ).lower(),
+            )
+        except RuntimePluginError as exc:
+            raise RuntimePluginError("runtime_plugin_descriptor_invalid") from exc
         if not descriptor.plugin_id or descriptor.protocol_version != PLUGIN_PROTOCOL_VERSION:
             raise RuntimePluginError("runtime_plugin_descriptor_invalid")
         if len(set(descriptor.supports)) != len(descriptor.supports):
@@ -118,7 +136,7 @@ class RuntimePlugin(Protocol):
     async def invoke(
         self,
         package: CapabilityPackageVersion,
-        endpoint: HttpServiceEndpoint,
+        capability_export: CapabilityExport,
         payload: dict[str, Any],
         *,
         activation: dict[str, Any],
@@ -198,6 +216,7 @@ class ProcessRuntimePlugin:
         self._client: httpx.AsyncClient | None = None
         self._restart_lock = asyncio.Lock()
         self._restart_attempt = 0
+        self._desired_activations: list[dict[str, Any]] = []
         self.descriptor = RuntimePluginDescriptor(
             plugin_id=manifest.plugin_id,
             protocol_version=manifest.protocol_version,
@@ -219,7 +238,6 @@ class ProcessRuntimePlugin:
         # boundary.
         env = {
             "PATH": os.getenv("PATH", ""),
-            "PYTHONPATH": os.getenv("PYTHONPATH", ""),
             "LANG": "C.UTF-8",
             "LOOM_RUNTIME_PLUGIN_ID": self.manifest.plugin_id,
             "LOOM_RUNTIME_PLUGIN_SOCKET": str(self.socket_path),
@@ -253,16 +271,37 @@ class ProcessRuntimePlugin:
                 raise RuntimePluginError("runtime_plugin_unavailable")
             try:
                 response = await self._client.get("/healthz", timeout=min(1.0, self.call_timeout))
-                if response.status_code < 400:
-                    descriptor_response = await self._client.get("/v1/descriptor", timeout=min(1.0, self.call_timeout))
-                    if descriptor_response.status_code < 400:
-                        descriptor = RuntimePluginDescriptor.from_mapping(descriptor_response.json())
-                        self._validate_descriptor(descriptor)
-                        self.descriptor = descriptor
-                        self._restart_attempt = 0
-                        return
-            except (httpx.HTTPError, RuntimePluginError, ValueError):
+            except httpx.HTTPError:
                 pass
+            else:
+                if response.status_code < 400:
+                    try:
+                        descriptor_response = await self._client.get(
+                            "/v1/descriptor", timeout=min(1.0, self.call_timeout)
+                        )
+                    except httpx.HTTPError:
+                        pass
+                    else:
+                        if descriptor_response.status_code < 400:
+                            try:
+                                if len(descriptor_response.content) > 1024 * 1024:
+                                    raise RuntimePluginError(
+                                        "runtime_plugin_descriptor_invalid"
+                                    )
+                                descriptor = RuntimePluginDescriptor.from_mapping(
+                                    descriptor_response.json()
+                                )
+                                self._validate_descriptor(descriptor)
+                            except (RuntimePluginError, ValueError) as exc:
+                                await self.close()
+                                if isinstance(exc, RuntimePluginError):
+                                    raise
+                                raise RuntimePluginError(
+                                    "runtime_plugin_descriptor_invalid"
+                                ) from exc
+                            self.descriptor = descriptor
+                            self._restart_attempt = 0
+                            return
             if asyncio.get_running_loop().time() >= deadline:
                 await self.close()
                 raise RuntimePluginError("runtime_plugin_start_timeout")
@@ -274,9 +313,29 @@ class ProcessRuntimePlugin:
         if set(descriptor.supports) != set(self.manifest.supports):
             raise RuntimePluginError("runtime_plugin_descriptor_mismatch")
 
-    async def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if self._client is None or self.process is None or self.process.returncode is not None:
             await self._restart_if_needed()
+        return await self._request_once(method, path, payload)
+
+    async def _request_once(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Perform one protocol call without recursively restarting.
+
+        Crash recovery invokes this helper while holding ``_restart_lock`` to
+        replay desired activations.  Keeping restart out of this layer avoids
+        attempting to acquire that same lock if the replacement process dies
+        during its reconcile handshake.
+        """
         if self._client is None or self.process is None or self.process.returncode is not None:
             raise RuntimePluginError("runtime_plugin_unavailable")
         request_id = uuid4().hex
@@ -288,22 +347,55 @@ class ProcessRuntimePlugin:
         except (TimeoutError, httpx.TimeoutException) as exc:
             raise RuntimePluginError("runtime_plugin_timeout") from exc
         except httpx.HTTPError as exc:
+            await self.close()
             raise RuntimePluginError("runtime_plugin_unavailable") from exc
         if len(response.content) > 4 * 1024 * 1024:
+            await self.close()
             raise RuntimePluginError("runtime_plugin_protocol_error")
         try:
             body = response.json()
         except ValueError as exc:
+            await self.close()
             raise RuntimePluginError("runtime_plugin_protocol_error") from exc
-        if not isinstance(body, dict) or body.get("request_id") != request_id or body.get("ok") is not True:
-            error = body.get("error") if isinstance(body, dict) else None
-            if isinstance(error, dict):
-                raise RuntimePluginError(str(error.get("code") or "runtime_plugin_error"), str(error.get("safe_message") or "runtime plugin failed"), details=dict(error.get("details") or {}))
+        if not isinstance(body, dict) or body.get("request_id") != request_id:
+            await self.close()
             raise RuntimePluginError("runtime_plugin_protocol_error")
-        result = body.get("result")
-        if not isinstance(result, dict):
+        if body.get("ok") is False:
+            if set(body) != {"request_id", "ok", "error"}:
+                await self.close()
+                raise RuntimePluginError("runtime_plugin_protocol_error")
+            error = body.get("error")
+            if (
+                not isinstance(error, dict)
+                or set(error) != {
+                    "code",
+                    "retryable",
+                    "safe_message",
+                    "details",
+                }
+                or not isinstance(error.get("code"), str)
+                or not error["code"]
+                or not isinstance(error.get("retryable"), bool)
+                or not isinstance(error.get("safe_message"), str)
+                or not isinstance(error.get("details"), dict)
+            ):
+                await self.close()
+                raise RuntimePluginError("runtime_plugin_protocol_error")
+            raise RuntimePluginError(
+                error["code"],
+                error["safe_message"] or "runtime plugin failed",
+                details=dict(error["details"]),
+            )
+        if (
+            response.status_code < 200
+            or response.status_code >= 300
+            or body.get("ok") is not True
+            or set(body) != {"request_id", "ok", "result"}
+            or not isinstance(body.get("result"), dict)
+        ):
+            await self.close()
             raise RuntimePluginError("runtime_plugin_protocol_error")
-        return result
+        return body["result"]
 
     async def _restart_if_needed(self) -> None:
         async with self._restart_lock:
@@ -320,6 +412,21 @@ class ProcessRuntimePlugin:
                 await self.start()
             except RuntimePluginError:
                 return
+            if self._desired_activations:
+                try:
+                    await self._request_once(
+                        "POST",
+                        "/v1/reconcile",
+                        {"activations": list(self._desired_activations)},
+                    )
+                except RuntimePluginError as exc:
+                    # Do not let the caller use a freshly restarted provider
+                    # until it has accepted the Core's desired state. Closing
+                    # it also ensures the next call retries the full sequence.
+                    await self.close()
+                    raise RuntimePluginError(
+                        "runtime_plugin_unavailable"
+                    ) from exc
 
     async def provision(self, package: CapabilityPackageVersion, command: CapabilityProvisionCommand) -> dict[str, Any]:
         return await self._request(
@@ -339,7 +446,7 @@ class ProcessRuntimePlugin:
     async def invoke(
         self,
         package: CapabilityPackageVersion,
-        endpoint: HttpServiceEndpoint,
+        capability_export: CapabilityExport,
         payload: dict[str, Any],
         *,
         activation: dict[str, Any],
@@ -351,7 +458,7 @@ class ProcessRuntimePlugin:
             "/v1/invoke",
             {
                 "package": package.model_dump(mode="json"),
-                "endpoint": endpoint.model_dump(mode="json"),
+                "capability_export": capability_export.model_dump(mode="json"),
                 "payload": payload,
                 "activation": activation,
                 "workspace_id": activation.get("workspace_id"),
@@ -370,7 +477,10 @@ class ProcessRuntimePlugin:
         return await self._request("POST", "/v1/deprovision", {"command": command.model_dump(mode="json")})
 
     async def reconcile(self, activations: Sequence[dict[str, Any]]) -> dict[str, Any]:
-        return await self._request("POST", "/v1/reconcile", {"activations": list(activations)})
+        self._desired_activations = [dict(item) for item in activations]
+        return await self._request(
+            "POST", "/v1/reconcile", {"activations": self._desired_activations}
+        )
 
     async def close(self) -> None:
         client, self._client = self._client, None
@@ -381,9 +491,13 @@ class ProcessRuntimePlugin:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
                 await asyncio.wait_for(process.wait(), timeout=2.0)
-            except (ProcessLookupError, TimeoutError, asyncio.TimeoutError):
+            except ProcessLookupError:
+                await process.wait()
+            except (TimeoutError, asyncio.TimeoutError):
                 with __import__("contextlib").suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
+                with __import__("contextlib").suppress(Exception):
+                    await process.wait()
         self.socket_path.unlink(missing_ok=True)
 
 
@@ -413,10 +527,31 @@ class RuntimePluginHost:
         if not isinstance(descriptor, RuntimePluginDescriptor):
             descriptor = RuntimePluginDescriptor.from_mapping(descriptor)
             plugin.descriptor = descriptor  # type: ignore[attr-defined]
-        for support in descriptor.supports:
-            key = (support.package_type, support.execution_kind, support.execution_version)
+        if (
+            not descriptor.plugin_id
+            or descriptor.protocol_version != PLUGIN_PROTOCOL_VERSION
+            or not descriptor.supports
+            or len(set(descriptor.supports)) != len(descriptor.supports)
+        ):
+            raise RuntimePluginError("runtime_plugin_descriptor_invalid")
+        keys = [
+            (support.package_type, support.execution_kind, support.execution_version)
+            for support in descriptor.supports
+        ]
+        if any(
+            existing is not plugin
+            and existing.descriptor.plugin_id == descriptor.plugin_id
+            for existing in {id(item): item for item in self.plugins.values()}.values()
+        ):
+            raise RuntimePluginError("runtime_plugin_conflict")
+        for key in keys:
+            try:
+                package_contract_registry.schema_for(key)
+            except ValueError as exc:
+                raise RuntimePluginError("runtime_plugin_capability_mismatch") from exc
             if key in self.plugins and self.plugins[key] is not plugin:
                 raise RuntimePluginError("runtime_plugin_conflict")
+        for key in keys:
             self.plugins[key] = plugin
 
     def _discover_manifests(self) -> list[_PluginManifest]:
@@ -440,7 +575,32 @@ class RuntimePluginHost:
         if self._process_plugins:
             return
         try:
-            for manifest in self._discover_manifests():
+            manifests = self._discover_manifests()
+            claimed_keys = set(self.plugins)
+            plugin_ids = {
+                plugin.descriptor.plugin_id
+                for plugin in {id(item): item for item in self.plugins.values()}.values()
+            }
+            for manifest in manifests:
+                if manifest.plugin_id in plugin_ids:
+                    raise RuntimePluginError("runtime_plugin_conflict")
+                plugin_ids.add(manifest.plugin_id)
+                for support in manifest.supports:
+                    key = (
+                        support.package_type,
+                        support.execution_kind,
+                        support.execution_version,
+                    )
+                    try:
+                        package_contract_registry.schema_for(key)
+                    except ValueError as exc:
+                        raise RuntimePluginError(
+                            "runtime_plugin_capability_mismatch"
+                        ) from exc
+                    if key in claimed_keys:
+                        raise RuntimePluginError("runtime_plugin_conflict")
+                    claimed_keys.add(key)
+            for manifest in manifests:
                 plugin = ProcessRuntimePlugin(
                     manifest,
                     socket_dir=Path(self.socket_dir),
@@ -448,7 +608,11 @@ class RuntimePluginHost:
                     call_timeout=self.call_timeout,
                 )
                 await plugin.start()
-                self.register(plugin)
+                try:
+                    self.register(plugin)
+                except Exception:
+                    await plugin.close()
+                    raise
                 self._process_plugins.append(plugin)
         except Exception:
             await self.close()
@@ -476,6 +640,10 @@ class RuntimePluginHost:
         except KeyError as exc:
             raise RuntimePluginError("runtime_plugin_not_found") from exc
 
+    def supports(self, package: CapabilityPackageVersion) -> bool:
+        key = (package.package_type, package.execution.kind, package.execution.version)
+        return key in self.plugins
+
     def descriptors(self) -> list[RuntimePluginDescriptor]:
         unique = {id(plugin): plugin for plugin in self.plugins.values()}
         return [plugin.descriptor for plugin in unique.values()]
@@ -486,17 +654,27 @@ class RuntimePluginHost:
     async def invoke(
         self,
         package: CapabilityPackageVersion,
-        endpoint: HttpServiceEndpoint,
+        capability_export: CapabilityExport,
         payload: dict[str, Any],
         *,
         activation: dict[str, Any],
         attempt_id: str,
         deadline_seconds: float | None = None,
     ) -> dict[str, Any]:
-        return await self.get(package).invoke(package, endpoint, payload, activation=activation, attempt_id=attempt_id, deadline_seconds=deadline_seconds)
+        return await self.get(package).invoke(package, capability_export, payload, activation=activation, attempt_id=attempt_id, deadline_seconds=deadline_seconds)
 
     async def inspect(self, package: CapabilityPackageVersion, activation: dict[str, Any]) -> dict[str, Any]:
-        return await self.get(package).inspect(activation)
+        payload = dict(activation)
+        payload.update(
+            {
+                "package_type": package.package_type,
+                "execution": package.execution.model_dump(mode="json"),
+                "package_version_ref": package.version_ref,
+                "package_digest": package.package_digest,
+                "package_payload": package.model_dump(mode="json"),
+            }
+        )
+        return await self.get(package).inspect(payload)
 
     async def deprovision(self, package: CapabilityPackageVersion, command: CapabilityDeprovisionCommand) -> dict[str, Any]:
         return await self.get(package).deprovision(command)

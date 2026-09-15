@@ -29,6 +29,7 @@ class ExecutionResult:
 
 @dataclass(frozen=True)
 class ExecutorDescriptor:
+    package_type: str
     kind: str
     version: str = "1"
     operations: frozenset[str] = frozenset()
@@ -37,12 +38,12 @@ class ExecutorDescriptor:
 
     @property
     def descriptor_ref(self) -> str:
-        return f"executor://{self.kind}/{self.version}"
+        return f"executor://{self.package_type}/{self.kind}/{self.version}"
 
     @property
     def digest(self) -> str:
         return digest_json(
-            {"kind": self.kind, "version": self.version, "operations": sorted(self.operations), "replay_safety": self.replay_safety, "effect_class": self.effect_class},
+            {"package_type": self.package_type, "kind": self.kind, "version": self.version, "operations": sorted(self.operations), "replay_safety": self.replay_safety, "effect_class": self.effect_class},
             domain="loom/executor-descriptor/v1",
         )
 
@@ -63,7 +64,7 @@ def _result(value: Any, replay_safety: str = "Idempotent") -> ExecutionResult:
 
 
 class ProcessJSONStdioV1Adapter:
-    descriptor = ExecutorDescriptor(kind="process:json_stdio", operations=frozenset({"run_code"}), replay_safety="DeclaredByPackage", effect_class="Sandboxed")
+    descriptor = ExecutorDescriptor(package_type="function", kind="process:json_stdio", operations=frozenset({"run_code"}), replay_safety="DeclaredByPackage", effect_class="Sandboxed")
 
     def __init__(self, timeout_seconds: float | None = None) -> None:
         # Keep the timeout on the child-operation adapter, independent from
@@ -106,24 +107,47 @@ class ProcessJSONStdioV1Adapter:
 
 class ExecutorRegistry:
     def __init__(self, adapters: list[ExecutorAdapter] | None = None, *, capability_timeout_seconds: float | None = None) -> None:
-        self._adapters: dict[tuple[str, str], ExecutorAdapter] = {}
+        self._adapters: dict[tuple[str, str, str], ExecutorAdapter] = {}
         for adapter in adapters if adapters is not None else [ProcessJSONStdioV1Adapter(capability_timeout_seconds)]:
             self.register(adapter)
 
     def register(self, adapter: ExecutorAdapter) -> None:
-        self._adapters[(adapter.descriptor.kind, adapter.descriptor.version)] = adapter
+        descriptor = adapter.descriptor
+        key = (descriptor.package_type, descriptor.kind, descriptor.version)
+        existing = self._adapters.get(key)
+        if existing is not None and existing is not adapter:
+            raise ValueError(
+                f"executor_conflict:{descriptor.package_type}/{descriptor.kind}/{descriptor.version}"
+            )
+        self._adapters[key] = adapter
 
-    def get(self, execution: ExecutionContract) -> ExecutorAdapter:
+    def get_for(self, package_type: str, execution: ExecutionContract) -> ExecutorAdapter:
         try:
-            return self._adapters[(execution.kind, execution.version)]
+            return self._adapters[(package_type, execution.kind, execution.version)]
         except KeyError as exc:
-            raise ValueError(f"unsupported_executor:{execution.kind}/{execution.version}") from exc
+            raise ValueError(
+                f"unsupported_executor:{package_type}/{execution.kind}/{execution.version}"
+            ) from exc
+
+    def supports(self, package_type: str, execution: ExecutionContract) -> bool:
+        try:
+            self.get_for(package_type, execution)
+        except ValueError:
+            return False
+        return True
 
     def descriptors(self) -> list[ExecutorDescriptor]:
         return [adapter.descriptor for adapter in self._adapters.values()]
 
-    async def invoke(self, execution: ExecutionContract, payload: dict[str, Any], *, program: bytes | None = None) -> ExecutionResult:
-        adapter = self.get(execution)
+    async def invoke_for(
+        self,
+        package_type: str,
+        execution: ExecutionContract,
+        payload: dict[str, Any],
+        *,
+        program: bytes | None = None,
+    ) -> ExecutionResult:
+        adapter = self.get_for(package_type, execution)
         return await adapter.invoke(payload, program=program)
 
 

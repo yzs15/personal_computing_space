@@ -4,6 +4,7 @@ from loom_v2.contracts.types import ClosureContract, ComputeBinding, ResourceRef
 from loom_v2.driver.service import DriverService
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.slave.service import SlaveService
+from tests.support.package_fixture import process_package_value
 
 
 @pytest.mark.asyncio
@@ -63,14 +64,7 @@ async def test_content_refs_drive_readiness_dispatch_and_terminal_evidence():
             {"kind": "add_typed_hole", "value": {"hole_id": "h_average"}},
             {
                 "kind": "materialize_capability_package_candidate",
-                "value": {
-                             "package_id": "scores-package",
-                             "body": {
-                                 "program_content_ref": program_ref.model_dump(mode="json"),
-                                 "io_contract_ref": io_contract_ref.model_dump(mode="json"),
-                                 "operation_descriptor_ref": "loom://average",
-                             },
-                         },
+                "value": process_package_value(repo, package_id="scores-package", operation_ref="loom://average", program_content_ref=program_ref, io_contract_ref=io_contract_ref),
             },
         ],
     )
@@ -78,9 +72,9 @@ async def test_content_refs_drive_readiness_dispatch_and_terminal_evidence():
     binding = ComputeBinding(
         binding_id="binding-scores-e2e",
         hole_id="h_average",
-        capability_descriptor_ref=ResourceRef(resource_id="executor://process:json_stdio/1"),
+        capability_descriptor_ref=package.capability_exports[0].capability_descriptor_ref,
         capability_package_ref=ResourceRef(
-            resource_id=package.package_closure_version_ref,
+            resource_id=package.version_ref,
             version_or_digest=package.package_digest,
         ),
         target_resource_ref=ResourceRef(resource_id="slave-a"),

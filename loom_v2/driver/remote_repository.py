@@ -4,9 +4,10 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-from loom_v2.content_store import ContentStore, canonical_json_bytes
+from loom_v2.content_store import ContentStore, put_typed_content
 from loom_v2.settings import Settings
 from loom_v2.contracts.types import (
+    CapabilityExport,
     CapabilityHealthReport,
     CapabilityPackageActivation,
     CapabilityPackageVersion,
@@ -157,6 +158,9 @@ class RemoteObserverRepository:
             self.slave_capabilities[slave_id] = {
                 **capabilities,
                 "operations": set(operations),
+                "base_operations": set(
+                    capabilities.get("base_operations", operations)
+                ),
             }
         return agents
 
@@ -164,41 +168,39 @@ class RemoteObserverRepository:
         agent = self.slave_agents.get(slave_id)
         if agent is None or agent.get("lease_state") != "active":
             return False
-        execution = package.execution
-        execution_kind = execution.kind
-        operation = "run_code" if execution_kind == "process:json_stdio" else ""
         details = self.slave_capabilities.get(slave_id, {})
-        if operation and operation not in details.get("operations", set()):
-            return False
         declared_executors = (
             details.get("executor_kinds")
             or details.get("executors")
             or details.get("executor_descriptors")
         )
-        package_type = getattr(package, "package_type", "function")
-        if package_type != "service" and declared_executors:
+        if declared_executors:
             raw_executors = [declared_executors] if isinstance(declared_executors, str) else declared_executors
-            return any(
-                ((str(item.get("kind")), str(item.get("version", "1"))) == (execution.kind, execution.version))
-                if isinstance(item, dict) else str(item) == execution.kind
+            if any(
+                isinstance(item, dict)
+                and (
+                    str(item.get("package_type") or ""),
+                    str(item.get("kind") or ""),
+                    str(item.get("version") or "1"),
+                )
+                == (package.package_type, package.execution.kind, package.execution.version)
                 for item in raw_executors
-            )
-        if package_type == "service":
-            descriptors = details.get("runtime_plugin_descriptors") or details.get("runtime_plugins") or []
-            for descriptor in descriptors if isinstance(descriptors, list) else []:
-                supports = descriptor.get("supports", []) if isinstance(descriptor, dict) else []
-                for support in supports if isinstance(supports, list) else []:
-                    if not isinstance(support, dict):
-                        continue
-                    execution = support.get("execution") if isinstance(support.get("execution"), dict) else support
-                    if (
-                        str(support.get("package_type") or "") == package.package_type
-                        and str(support.get("execution_kind") or execution.get("kind") or "") == package.execution.kind
-                        and str(support.get("execution_version") or execution.get("version") or "1") == package.execution.version
-                    ):
-                        return True
-            return False
-        return True
+            ):
+                return True
+        descriptors = details.get("runtime_plugin_descriptors") or details.get("runtime_plugins") or []
+        for descriptor in descriptors if isinstance(descriptors, list) else []:
+            supports = descriptor.get("supports", []) if isinstance(descriptor, dict) else []
+            for support in supports if isinstance(supports, list) else []:
+                if not isinstance(support, dict):
+                    continue
+                execution = support.get("execution") if isinstance(support.get("execution"), dict) else support
+                if (
+                    str(support.get("package_type") or "") == package.package_type
+                    and str(support.get("execution_kind") or execution.get("kind") or "") == package.execution.kind
+                    and str(support.get("execution_version") or execution.get("version") or "1") == package.execution.version
+                ):
+                    return True
+        return False
 
     async def accept_node_intent(self, run_id: str, intent: NodeIntent, *, selected_target: str) -> DynamicNode:
         payload = await self.control.command(
@@ -237,6 +239,42 @@ class RemoteObserverRepository:
         )
         return CapabilityPackageActivation.model_validate(payload)
 
+    async def set_capability_desired(
+        self,
+        package_ref: str | ResourceRef,
+        target_slave: str,
+        *,
+        desired_state: str,
+        idempotency_key: str,
+        run_id: str | None = None,
+        activation_closure_version_ref: str = "",
+        compute_binding_ref: str = "",
+        rebuild: bool = False,
+    ) -> CapabilityPackageActivation:
+        ref = (
+            package_ref.model_dump(mode="json")
+            if isinstance(package_ref, ResourceRef)
+            else package_ref
+        )
+        payload = await self.control.command(
+            "capability.desire",
+            {
+                "package_ref": ref,
+                "target_slave": target_slave,
+                "desired_state": desired_state,
+                "idempotency_key": idempotency_key,
+                "run_id": run_id,
+                "activation_closure_version_ref": activation_closure_version_ref,
+                "compute_binding_ref": compute_binding_ref,
+                "rebuild": rebuild,
+            },
+            request_id=(
+                f"capability-desire:{target_slave}:{desired_state}:"
+                f"{idempotency_key}"
+            ),
+        )
+        return CapabilityPackageActivation.model_validate(payload)
+
     async def record_result(self, run_id: str, result: dict[str, Any]) -> RemoteRunRecord:
         payload = await self.control.command("run.result", {"run_id": run_id, "result": result})
         return _decode_run(payload)
@@ -267,13 +305,7 @@ class RemoteObserverRepository:
         return _decode_run(payload)
 
     async def put_content(self, content: Any, *, media_type: str) -> ResourceRef:
-        if isinstance(content, bytes):
-            body = content
-        elif isinstance(content, str):
-            body = content.encode("utf-8")
-        else:
-            body = canonical_json_bytes(content)
-        return await self.content_store.put(body, media_type=media_type)
+        return await put_typed_content(self.content_store, content, media_type=media_type)
 
     async def _load_json_content(self, ref: ResourceRef) -> Any:
         raw = await self.content_store.get(ref)
@@ -289,3 +321,24 @@ class RemoteObserverRepository:
     @staticmethod
     def _operation_name(operation_ref: str) -> str:
         return str(operation_ref or "").rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+
+    @staticmethod
+    def _single_export(package: CapabilityPackageVersion) -> CapabilityExport:
+        """Return the sole export for an execution package.
+
+        Dynamic orchestration uses the same package-shape validation for the
+        in-process and remote Observer repositories.  Keeping this helper on
+        the remote read model avoids making the Driver reach into Observer's
+        persistence implementation while preserving the exact error raised
+        for multi-export packages that require an explicit descriptor.
+        """
+        if len(package.capability_exports) != 1:
+            raise ValueError("capability_export_selection_required")
+        return package.capability_exports[0]
+
+    @staticmethod
+    def _package_body_ref(package: CapabilityPackageVersion, field_name: str) -> ResourceRef:
+        try:
+            return ResourceRef.model_validate(package.body[field_name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name}_required") from exc

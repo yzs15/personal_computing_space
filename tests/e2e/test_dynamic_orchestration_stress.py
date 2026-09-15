@@ -8,6 +8,7 @@ from loom_v2.driver.service import DriverService
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.driver.worker import WorkerSession
 from loom_v2.slave.app import create_app as create_slave_app
+from tests.support.package_fixture import orchestration_package_value, process_package_value
 
 
 async def _put(mcp: DriverMCP, content, media_type: str) -> ResourceRef:
@@ -79,24 +80,17 @@ async def test_dynamic_orchestration_single_node_stress_and_admission():
                 {"kind": "set_execution_payload", "value": {"node_id": "loom://orchestrate", "input_ref": input_ref.model_dump(mode="json")}},
                 {
                     "kind": "materialize_capability_package_candidate",
-                    "value": {
-                                 "package_id": "summarize",
-                                 "package_version": "v1",
-                                 "body": {
-                                     "program_content_ref": node_program.model_dump(mode="json"),
-                                     "io_contract_ref": node_contract.model_dump(mode="json"),
-                                     "operation_descriptor_ref": "loom://summarize",
-                                 },
-                             },
+                    "value": process_package_value(repo, package_id="summarize", operation_ref="loom://summarize", program_content_ref=node_program, io_contract_ref=node_contract),
                 },
             ]
         },
     )
     node_package = next(item for item in (await repo.get_run(run_id)).capability_packages if item.package_id == "summarize")
     package_ref = ResourceRef(resource_id=node_package.version_ref, version_or_digest=node_package.package_digest)
+    node_descriptor_ref = node_package.capability_exports[0].capability_descriptor_ref
     orchestration_program = await _put(
         mcp,
-        f'PACKAGE_REF = {package_ref.model_dump(mode="json")}\n\nasync def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> "ResourceRef":\n    document = await ctx.read_json(input_ref)\n    handle = ctx.emit_node(PACKAGE_REF, [document["partition"]])\n    return await ctx.result(handle)\n',
+        f'PACKAGE_REF = {package_ref.model_dump(mode="json")}\nDESCRIPTOR_REF = {node_descriptor_ref.model_dump(mode="json")}\n\nasync def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> "ResourceRef":\n    document = await ctx.read_json(input_ref)\n    handle = ctx.emit_node(PACKAGE_REF, DESCRIPTOR_REF, [document["partition"]])\n    return await ctx.result(handle)\n',
         "text/x-python",
     )
     patched = await mcp.call(
@@ -105,19 +99,7 @@ async def test_dynamic_orchestration_single_node_stress_and_admission():
             "ops": [
                 {
                     "kind": "materialize_capability_package_candidate",
-                    "value": {
-                                 "package_id": "orchestrate",
-                                 "package_version": "v1",
-                                 "execution": {"kind": "container:python_orchestrator", "version": "1"},
-                                 "body": {
-                                     "program_content_ref": orchestration_program.model_dump(mode="json"),
-                                     "io_contract_ref": parent_contract.model_dump(mode="json"),
-                                     "operation_descriptor_ref": "loom://orchestrate",
-                                     "allowed_node_package_refs": [package_ref.model_dump(mode="json")],
-                                     "max_nodes": 2,
-                                     "max_live_nodes": 1,
-                                 },
-                             },
+                    "value": orchestration_package_value(repo, package_id="orchestrate", operation_ref="loom://orchestrate", program_content_ref=orchestration_program, io_contract_ref=parent_contract, allowed_node_package_refs=[package_ref], max_nodes=2, max_live_nodes=1),
                 }
             ]
         },

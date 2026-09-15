@@ -342,10 +342,11 @@ async def test_worker_session_provision_sends_only_content_references():
         assert isinstance(package, dict)
         return {"accepted": True, "health_report": CapabilityHealthReport(
             report_id="health-test",
-            package_version_ref=str(package["version_ref"] if "version_ref" in package else package["package_id"] + ":" + package["package_version"]),
+            package_version_ref=f"capability-package://{package['package_id']}/{package['package_version']}",
             package_digest=str(package["package_digest"]),
             target_slave="slave-a",
             activation_state="ready",
+            activation_revision=1,
         ).model_dump(mode="json")}
 
     store = ContentStore(
@@ -365,7 +366,15 @@ async def test_worker_session_provision_sends_only_content_references():
         package_closure_version_ref="closure",
         source_run_ref="run",
         source_closure_version_ref="version",
-        body={"operation_descriptor_ref": ResourceRef(resource_id="loom://check"), "program_content_ref": program_ref, "io_contract_ref": contract_ref},
+        capability_exports=[{
+            "capability_descriptor_ref": ResourceRef(resource_id="loom://check", version_or_digest="a" * 64, identity_criterion="descriptor_digest"),
+            "io_contract_ref": contract_ref,
+            "effect_class": "Sandboxed",
+            "permissions": [],
+            "replay_safety": "DeclaredByPackage",
+            "runtime_binding": {},
+        }],
+        body={"program_content_ref": program_ref.model_dump(mode="json")},
     )
     session = WorkerSession("slave-a", "http://slave-a", transport=httpx.ASGITransport(app=app))
     await session.provision(
@@ -374,6 +383,8 @@ async def test_worker_session_provision_sends_only_content_references():
             package_version_ref=package.version_ref,
             package_digest=package.package_digest,
             target_slave="slave-a",
+            idempotency_key="command-reference-only",
+            activation_revision=1,
         ),
         package=package,
     )

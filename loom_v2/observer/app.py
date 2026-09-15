@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from loom_v2.db.session import make_engine
 from loom_v2.settings import Settings
-from loom_v2.contracts.types import ClosureContract
+from loom_v2.contracts.types import CapabilityHealthReport, ClosureContract
 from loom_v2.content_store import ContentStore
 from loom_v2.contracts.agents import AgentRegistration, DriverCommand
 from loom_v2.contracts.errors import DomainError
@@ -223,7 +223,54 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
     @app.get("/internal/v1/agents/slaves")
     async def list_slaves(request: Request, workspace_id: str | None = None) -> list[dict[str, Any]]:
         require_internal(request)
-        return await app.state.repo.list_agents(workspace_id or settings.workspace_id, role="slave")
+        agents = await app.state.repo.refresh_slaves(workspace_id or settings.workspace_id)
+        for agent in agents:
+            projected = app.state.repo.slave_capabilities.get(str(agent.get("agent_id") or ""))
+            if projected is None:
+                continue
+            capabilities = dict(agent.get("capabilities") or {})
+            capabilities["operations"] = sorted(projected.get("operations", set()))
+            agent["capabilities"] = capabilities
+        return agents
+
+    @app.post("/internal/v1/capability-health")
+    async def capability_health(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+        require_internal(request)
+        report: CapabilityHealthReport | None = None
+        try:
+            report = CapabilityHealthReport.model_validate(payload["report"])
+            agent_id = str(payload["agent_id"])
+            workspace_id = str(payload["workspace_id"])
+            if report.target_slave != agent_id:
+                raise ValueError("target_slave_mismatch")
+            await app.state.repo.heartbeat_agent(
+                agent_id,
+                str(payload["instance_id"]),
+                str(payload["lease_id"]),
+                int(payload["epoch"]),
+                workspace_id=workspace_id,
+                role="slave",
+            )
+            # Health reports are scoped by the lease workspace as well as by
+            # package identity.  Do this check before mutating the activation
+            # projection so a valid Slave lease cannot report on another
+            # workspace's package.
+            try:
+                await app.state.repo._assert_package_workspace(
+                    report.package_version_ref,
+                    workspace_id,
+                )
+            except KeyError as exc:
+                raise HTTPException(
+                    status_code=404,
+                    detail="capability_package_not_found",
+                ) from exc
+            activation = await app.state.repo.record_capability_health(report)
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=f"missing_field:{exc.args[0]}") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"accepted": True, "activation": activation.model_dump(mode="json")}
 
     @app.post("/internal/v1/driver/commands")
     async def driver_command(payload: dict[str, Any], request: Request) -> dict[str, Any]:
@@ -538,7 +585,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
                         "slave_id": agent["agent_id"],
                         "available": agent.get("lease_state") == "active",
                         "replica": "ready" if agent.get("lease_state") == "active" else "unavailable",
-                        "operations": sorted(set(caps.get("operations", []))),
+                        "operations": sorted(app.state.repo.slave_capabilities.get(str(agent["agent_id"]), {}).get("operations", set())),
                         "term_support": caps.get("term_support", []),
                         "activations": [activation.model_dump(mode="json") for record in records for activation in record.capability_activations if activation.target_slave == agent["agent_id"] and activation.activation_state == "ready"],
                         "executor_descriptors": caps.get("executor_descriptors", []),
@@ -549,19 +596,32 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         if not legacy_embedded:
             return []
         records = await app.state.repo._all_records()
-        return [
-            {
-                "slave_id": slave_id,
-                "available": slave.available,
-                "replica": slave.replica.state,
-                "operations": sorted(set(slave.supported_operations) | set(app.state.repo.slave_capabilities.get(slave_id, {}).get("operations", set()))),
-                "term_support": [support.model_dump(mode="json") for support in slave.term_support()],
-                "activations": [activation.model_dump(mode="json") for activation in slave.activations.values()] + [activation.model_dump(mode="json") for record in records for activation in record.capability_activations if activation.target_slave == slave_id and activation.activation_state == "ready"],
-                "executor_descriptors": [{"kind": descriptor.kind, "version": descriptor.version, "operations": sorted(descriptor.operations), "descriptor_ref": descriptor.descriptor_ref, "digest": descriptor.digest} for descriptor in slave.executor_registry.descriptors()],
-                "runtime_plugin_descriptors": [descriptor.__dict__ | {"supports": [support.to_mapping() for support in descriptor.supports]} for descriptor in slave.runtime_plugin_host.descriptors()] if slave.runtime_plugin_host is not None else [],
+        result = []
+        for slave_id, slave in app.state.slaves.items():
+            activation_map = {
+                (activation.package_version_ref, activation.target_slave): activation
+                for activation in slave.activations.values()
             }
-            for slave_id, slave in app.state.slaves.items()
-        ]
+            for record in records:
+                for activation in record.capability_activations:
+                    if activation.target_slave == slave_id and activation.activation_state == "ready":
+                        activation_map.setdefault(
+                            (activation.package_version_ref, activation.target_slave),
+                            activation,
+                        )
+            result.append(
+                {
+                    "slave_id": slave_id,
+                    "available": slave.available,
+                    "replica": slave.replica.state,
+                    "operations": sorted(slave.capability_snapshot()),
+                    "term_support": [support.model_dump(mode="json") for support in slave.term_support()],
+                    "activations": [activation.model_dump(mode="json") for activation in activation_map.values()],
+                    "executor_descriptors": [{"package_type": descriptor.package_type, "kind": descriptor.kind, "version": descriptor.version, "operations": sorted(descriptor.operations), "descriptor_ref": descriptor.descriptor_ref, "digest": descriptor.digest} for descriptor in slave.executor_registry.descriptors()],
+                    "runtime_plugin_descriptors": [descriptor.__dict__ | {"supports": [support.to_mapping() for support in descriptor.supports]} for descriptor in slave.runtime_plugin_host.descriptors()] if slave.runtime_plugin_host is not None else [],
+                }
+            )
+        return result
 
     @app.get("/api/v1/capability-packages")
     async def capability_packages(run_id: str | None = None, include_abandoned: bool = False) -> list[dict[str, Any]]:
@@ -570,8 +630,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         records = await app.state.repo._all_records()
         for package in packages:
             item = package.model_dump(mode="json")
-            refs = {f"{package.package_id}:{package.package_version}", package.version_ref}
-            item["activations"] = [activation.model_dump(mode="json") for record in records for activation in record.capability_activations if activation.package_version_ref in refs]
+            item["activations"] = [activation.model_dump(mode="json") for record in records for activation in record.capability_activations if activation.package_version_ref == package.version_ref]
             result.append(item)
         return result
 
@@ -582,7 +641,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="run_not_found") from exc
         record = await app.state.repo.get_run(run_id)
-        return [{**package.model_dump(mode="json"), "activations": [activation.model_dump(mode="json") for activation in record.capability_activations if activation.package_version_ref in {f"{package.package_id}:{package.package_version}", package.version_ref}]} for package in packages]
+        return [{**package.model_dump(mode="json"), "activations": [activation.model_dump(mode="json") for activation in record.capability_activations if activation.package_version_ref == package.version_ref]} for package in packages]
 
     @app.post("/api/v1/capability-packages/{package_ref:path}/promote")
     async def promote_capability_package(package_ref: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -620,15 +679,26 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         for target in targets:
             worker = app.state.workers.get(target)
             slave = app.state.slaves.get(target)
+            requested_idempotency_key = payload.get("idempotency_key") or f"promote-{package.package_digest}-{target}"
+            desired = await app.state.repo.set_capability_desired(
+                package.version_ref,
+                str(target),
+                desired_state="running",
+                idempotency_key=requested_idempotency_key,
+                workspace_id=settings.workspace_id,
+                activation_closure_version_ref=package.package_closure_version_ref,
+                compute_binding_ref=str((payload.get("compute_binding") or {}).get("binding_id") or ""),
+            )
             command = {
                 "command_id": f"provision-{package.package_id}-{target}",
-                "package_version_ref": f"{package.package_id}:{package.package_version}",
+                "package_version_ref": package.version_ref,
                 "package_digest": package.package_digest,
                 "target_slave": target,
                 "workspace_id": settings.workspace_id,
                 "activation_closure_version_ref": package.package_closure_version_ref,
                 "compute_binding": payload.get("compute_binding"),
-                "idempotency_key": payload.get("idempotency_key") or f"promote-{package.package_digest}-{target}",
+                "idempotency_key": desired.last_idempotency_key,
+                "activation_revision": desired.activation_revision,
             }
             from loom_v2.contracts.types import CapabilityProvisionCommand
             provision_command = CapabilityProvisionCommand.model_validate(command)
@@ -688,13 +758,22 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         for target in targets:
             worker = app.state.workers.get(target)
             slave = app.state.slaves.get(target)
+            requested_idempotency_key = payload.get("idempotency_key") or f"deactivate-{package.package_digest}-{target}"
+            desired = await app.state.repo.set_capability_desired(
+                package.version_ref,
+                str(target),
+                desired_state="stopped",
+                idempotency_key=requested_idempotency_key,
+                workspace_id=settings.workspace_id,
+            )
             command = {
                 "command_id": f"deprovision-{package.package_id}-{target}",
-                "package_version_ref": f"{package.package_id}:{package.package_version}",
+                "package_version_ref": package.version_ref,
                 "package_digest": package.package_digest,
                 "target_slave": target,
                 "workspace_id": settings.workspace_id,
-                "idempotency_key": payload.get("idempotency_key") or f"deactivate-{package.package_digest}-{target}",
+                "idempotency_key": desired.last_idempotency_key,
+                "activation_revision": desired.activation_revision,
             }
             from loom_v2.contracts.types import CapabilityDeprovisionCommand
             deprovision_command = CapabilityDeprovisionCommand.model_validate(command)

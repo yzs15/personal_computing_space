@@ -30,6 +30,7 @@ def create_app(slave_id: str | None = None, *, observer_transport: httpx.AsyncBa
     )
     app.state.lease: AgentLease | None = None
     app.state.registration_task: asyncio.Task[None] | None = None
+    app.state.capability_health_task: asyncio.Task[None] | None = None
     app.state.driver_epochs: dict[str, int] = {}
 
     def require_internal(request: Request) -> None:
@@ -48,9 +49,20 @@ def create_app(slave_id: str | None = None, *, observer_transport: httpx.AsyncBa
         instance_id = f"{slave_id}-{uuid4().hex[:12]}"
         endpoint_url = os.getenv("LOOM_SLAVE_ENDPOINT_URL", f"http://{slave_id}:8081" if slave_id == "slave-a" else f"http://{slave_id}:8082")
         runtime_descriptors = [descriptor.__dict__ | {"supports": [support.to_mapping() for support in descriptor.supports]} for descriptor in app.state.service.runtime_plugin_host.descriptors()] if app.state.service.runtime_plugin_host is not None else []
-        registration = AgentRegistration(role="slave", agent_id=slave_id, instance_id=instance_id, workspace_id=app.state.service.workspace_id, endpoint_url=endpoint_url, protocol_version=settings.agent_protocol_version, capabilities={"operations": sorted(app.state.service.supported_operations), "executor_descriptors": [descriptor.kind for descriptor in app.state.service.executor_registry.descriptors()], "runtime_plugin_descriptors": runtime_descriptors, "runtime_plugins": runtime_descriptors, "term_support": [item.model_dump(mode="json") for item in app.state.service.term_support()]})
+        executor_descriptors = [
+            {
+                "package_type": descriptor.package_type,
+                "kind": descriptor.kind,
+                "version": descriptor.version,
+                "operations": sorted(descriptor.operations),
+                "descriptor_ref": descriptor.descriptor_ref,
+                "digest": descriptor.digest,
+            }
+            for descriptor in app.state.service.executor_registry.descriptors()
+        ]
         while True:
             try:
+                registration = AgentRegistration(role="slave", agent_id=slave_id, instance_id=instance_id, workspace_id=app.state.service.workspace_id, endpoint_url=endpoint_url, protocol_version=settings.agent_protocol_version, capabilities={"operations": sorted(app.state.service.capability_snapshot()), "base_operations": sorted(app.state.service.supported_operations), "executor_descriptors": executor_descriptors, "runtime_plugin_descriptors": runtime_descriptors, "runtime_plugins": runtime_descriptors, "term_support": [item.model_dump(mode="json") for item in app.state.service.term_support()]})
                 headers = {"X-Loom-Internal-Token": settings.internal_api_secret} if settings.internal_api_secret else {}
                 async with httpx.AsyncClient(timeout=5, transport=observer_transport) as client:
                     response = await client.post(f"{settings.observer_url.rstrip('/')}/internal/v1/agents/register", json=registration.model_dump(mode="json"), headers=headers)
@@ -74,18 +86,53 @@ def create_app(slave_id: str | None = None, *, observer_transport: httpx.AsyncBa
                 except Exception:
                     continue
 
+    async def capability_health_loop() -> None:
+        interval = max(0.1, settings.capability_health_interval_seconds)
+        while True:
+            lease = app.state.lease
+            if lease is None:
+                await asyncio.sleep(interval)
+                continue
+            try:
+                reports = await app.state.service.inspect_activation_health()
+                for report in reports:
+                    current_lease = app.state.lease
+                    if current_lease is None:
+                        break
+                    headers = {"X-Loom-Internal-Token": settings.internal_api_secret} if settings.internal_api_secret else {}
+                    payload = {
+                        "agent_id": slave_id,
+                        "instance_id": current_lease.instance_id,
+                        "lease_id": current_lease.lease_id,
+                        "epoch": current_lease.epoch,
+                        "workspace_id": current_lease.workspace_id,
+                        "report": report.model_dump(mode="json"),
+                    }
+                    async with httpx.AsyncClient(timeout=5, transport=observer_transport) as client:
+                        response = await client.post(
+                            f"{settings.observer_url.rstrip('/')}/internal/v1/capability-health",
+                            json=payload,
+                            headers=headers,
+                        )
+                    if response.status_code < 400:
+                        app.state.service.acknowledge_health_report(report.report_id)
+            except Exception:
+                pass
+            await asyncio.sleep(interval)
+
     @app.on_event("startup")
     async def initialize_database() -> None:
         await app.state.service.init_db()
         app.state.registration_task = asyncio.create_task(register_loop())
+        app.state.capability_health_task = asyncio.create_task(capability_health_loop())
 
     @app.on_event("shutdown")
     async def close_database() -> None:
-        task = app.state.registration_task
-        if task is not None:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        for task in (app.state.capability_health_task, app.state.registration_task):
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
         lease = app.state.lease
         if lease is not None:
             try:
@@ -237,7 +284,8 @@ def create_app(slave_id: str | None = None, *, observer_transport: httpx.AsyncBa
             "workspace_id": service.workspace_id,
             "available": service.available,
             "replica": service.replica.state,
-            "operations": sorted(service.supported_operations),
+            "operations": sorted(service.capability_snapshot()),
+            "base_operations": sorted(service.supported_operations),
             "executor_descriptors": [descriptor.__dict__ | {"operations": sorted(descriptor.operations), "digest": descriptor.digest, "descriptor_ref": descriptor.descriptor_ref} for descriptor in service.executor_registry.descriptors()],
             "runtime_plugin_descriptors": [descriptor.__dict__ | {"supports": [support.to_mapping() for support in descriptor.supports]} for descriptor in service.runtime_plugin_host.descriptors()] if service.runtime_plugin_host is not None else [],
             "runtime_plugins": [descriptor.__dict__ | {"supports": [support.to_mapping() for support in descriptor.supports]} for descriptor in service.runtime_plugin_host.descriptors()] if service.runtime_plugin_host is not None else [],

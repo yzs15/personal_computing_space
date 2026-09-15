@@ -12,6 +12,7 @@ from sqlalchemy import inspect
 
 from loom_v2.contracts.terms import TermSupport
 from loom_v2.contracts.types import (
+    CapabilityExport,
     CapabilityHealthReport,
     CapabilityDeprovisionCommand,
     CapabilityPackageActivation,
@@ -35,6 +36,7 @@ from .runtime_plugins import RuntimePluginError, RuntimePluginHost
 from loom_v2.content_store import ContentStore
 from loom_v2.digest import canonical_json_bytes, digest_bytes
 from loom_v2.contracts.io_schema import ValidationError as SchemaValidationError, validate, validate_schema
+from loom_v2.contracts.package_contracts import DRIVER_ORCHESTRATOR_KEY
 
 
 @dataclass
@@ -60,6 +62,8 @@ class SlaveService:
     resource_events: list[ResourceEventFrame] = field(default_factory=list)
     runtime_plugin_host: RuntimePluginHost | None = None
     _activation_locks: dict[str, asyncio.Lock] = field(default_factory=dict, init=False, repr=False)
+    _pending_health_reports: dict[str, CapabilityHealthReport] = field(default_factory=dict, init=False, repr=False)
+    _last_reported_health: dict[str, tuple[int, str]] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.sessions = make_session_factory(self.engine) if self.engine is not None else None
@@ -122,7 +126,9 @@ class SlaveService:
                         target_slave=item.get("slave_id", self.slave_id),
                         activation_closure_version_ref=item.get("activation_closure_version_ref", ""),
                         compute_binding_ref=item.get("compute_binding_ref", ""),
-                        session_generation=int(item.get("session_generation", 1)),
+                        desired_state=item["desired_state"],
+                        activation_revision=int(item["activation_revision"]),
+                        last_idempotency_key=str(item["last_idempotency_key"]),
                         activation_state=item.get("activation_state", "provisioning"),
                         evidence_refs=list(item.get("evidence_refs") or []),
                         runtime_profile=dict(item.get("runtime_profile") or {}),
@@ -130,7 +136,7 @@ class SlaveService:
                 except (TypeError, ValueError):
                     continue
                 self._cache_package(package, package.version_ref)
-                self.activations[str(item.get("activation_key") or self._package_cache_key(package.version_ref, package.package_digest))] = activation
+                self.activations[self._activation_key(package.version_ref)] = activation
         finally:
             if owns_session:
                 await session.__aexit__(None, None, None)
@@ -140,15 +146,13 @@ class SlaveService:
         package: CapabilityPackageVersion,
         activation: CapabilityPackageActivation,
         *,
-        desired_state: str,
         runtime_plugin_id: str = "",
         runtime_handle: dict[str, Any] | None = None,
-        idempotency_key: str = "",
         last_error_code: str = "",
     ) -> None:
         if self.sessions is None:
             return
-        key = self._package_cache_key(activation.package_version_ref, activation.package_digest)
+        key = self._activation_key(activation.package_version_ref)
         now = datetime.now(timezone.utc)
         values = {
             "activation_key": key,
@@ -158,15 +162,15 @@ class SlaveService:
             "package_digest": activation.package_digest.lower(),
             "package_payload": package.model_dump(mode="json"),
             "runtime_plugin_id": runtime_plugin_id,
-            "desired_state": desired_state,
+            "desired_state": activation.desired_state,
             "activation_state": activation.activation_state,
             "activation_closure_version_ref": activation.activation_closure_version_ref,
             "compute_binding_ref": activation.compute_binding_ref,
-            "session_generation": activation.session_generation,
+            "activation_revision": activation.activation_revision,
             "evidence_refs": list(activation.evidence_refs),
             "runtime_profile": dict(activation.runtime_profile),
             "runtime_handle": dict(runtime_handle or {}),
-            "last_idempotency_key": idempotency_key,
+            "last_idempotency_key": activation.last_idempotency_key,
             "last_error_code": last_error_code,
             "updated_at": now.isoformat(),
         }
@@ -191,28 +195,36 @@ class SlaveService:
                 replica_row = await session.get(SlaveReplicaRow, self.slave_id)
                 for row in (replica_row.capability_activations if replica_row is not None else []):
                     package_payload = row.get("package_payload") or {}
-                    # Runtime plugins own long-lived service activations;
-                    # one-shot function executions do not need reconciliation
-                    # and must retain their existing activation facts.
-                    if package_payload.get("package_type", "function") != "service":
+                    try:
+                        package = CapabilityPackageVersion.model_validate(package_payload)
+                    except (TypeError, ValueError):
                         continue
-                    packages[row["activation_key"]] = self._find_cached_package(row["package_version_ref"], row["package_digest"])  # type: ignore[assignment]
+                    # Runtime plugins own long-lived activations. One-shot
+                    # executors do not need reconciliation.
+                    if not self._uses_runtime_plugin(package):
+                        continue
+                    activation_key = self._activation_key(package.version_ref)
+                    packages[activation_key] = package
                     entries.append({
-                        "activation_key": row["activation_key"],
+                        "activation_key": activation_key,
                         "workspace_id": row.get("workspace_id", self.workspace_id),
                         "slave_id": row.get("slave_id", self.slave_id),
+                        "target_slave": row.get("slave_id", self.slave_id),
+                        "package_version_ref": package.version_ref,
+                        "package_digest": package.package_digest,
                         "package_type": package_payload.get("package_type"),
                         "execution": package_payload.get("execution"),
                         "package_payload": package_payload,
-                        "desired_state": row.get("desired_state", "running"),
+                        "desired_state": row["desired_state"],
+                        "activation_revision": row["activation_revision"],
                         "runtime_profile": row.get("runtime_profile") or {},
                     })
         else:
             for key, activation in self.activations.items():
                 package = self._find_cached_package(activation.package_version_ref, activation.package_digest)
-                if package is None or package.package_type != "service":
+                if package is None or not self._uses_runtime_plugin(package):
                     continue
-                entries.append({"activation_key": key, "workspace_id": self.workspace_id, "slave_id": self.slave_id, "package_type": package.package_type, "execution": package.execution.model_dump(mode="json"), "package_payload": package.model_dump(mode="json"), "desired_state": "running" if activation.activation_state != "stopped" else "stopped", "runtime_profile": activation.runtime_profile})
+                entries.append({"activation_key": key, "workspace_id": self.workspace_id, "slave_id": self.slave_id, "target_slave": self.slave_id, "package_version_ref": package.version_ref, "package_digest": package.package_digest, "package_type": package.package_type, "execution": package.execution.model_dump(mode="json"), "package_payload": package.model_dump(mode="json"), "desired_state": activation.desired_state, "activation_revision": activation.activation_revision, "runtime_profile": activation.runtime_profile})
         try:
             response = await self.runtime_plugin_host.reconcile(entries)
         except RuntimePluginError:
@@ -235,7 +247,7 @@ class SlaveService:
                     self.activations[key] = updated
                     package = packages.get(key) or self._find_cached_package(updated.package_version_ref, updated.package_digest)
                     if package is not None:
-                        await self._persist_activation(package, updated, desired_state="running", runtime_plugin_id="", last_error_code="runtime_plugin_not_found")
+                        await self._persist_activation(package, updated, runtime_plugin_id="", last_error_code="runtime_plugin_not_found")
                 continue
             state = str(item.get("activation_state") or ("ready" if (item.get("inspect") or {}).get("running") else activation.activation_state))
             update_fields: dict[str, Any] = {"activation_state": state if state in {"ready", "degraded", "failed", "stopped", "lost"} else activation.activation_state}
@@ -245,7 +257,7 @@ class SlaveService:
             self.activations[key] = updated
             package = packages.get(key) or self._find_cached_package(updated.package_version_ref, updated.package_digest)
             if package is not None:
-                await self._persist_activation(package, updated, desired_state=entry.get("desired_state", "running"), runtime_plugin_id=str((item or {}).get("runtime_plugin_id") or ""))
+                await self._persist_activation(package, updated, runtime_plugin_id=str((item or {}).get("runtime_plugin_id") or ""))
         return response
 
     async def close(self) -> None:
@@ -263,16 +275,15 @@ class SlaveService:
         return f"{package_ref}#digest:{package_digest.lower()}"
 
     @staticmethod
+    def _activation_key(package_ref: str) -> str:
+        return package_ref
+
+    @staticmethod
     def _package_aliases(package: CapabilityPackageVersion, command_ref: str) -> set[str]:
-        return {
-            command_ref,
-            package.version_ref,
-            f"{package.package_id}:{package.package_version}",
-            package.package_closure_version_ref,
-            package.package_version,
-            package.package_id,
-            package.package_digest,
-        }
+        # Lifecycle and dispatch use one canonical coordinate. ``command_ref``
+        # is retained in this helper only because callers cache immediately
+        # after validating it equals ``package.version_ref``.
+        return {command_ref, package.version_ref}
 
     def _cache_package(self, package: CapabilityPackageVersion, command_ref: str) -> None:
         aliases = self._package_aliases(package, command_ref)
@@ -289,13 +300,7 @@ class SlaveService:
             for item in self.package_cache.values():
                 if item.package_digest.lower() != requested_digest:
                     continue
-                if package_ref in {
-                    item.package_id,
-                    item.version_ref,
-                    f"{item.package_id}:{item.package_version}",
-                    item.package_closure_version_ref,
-                    item.package_version,
-                }:
+                if package_ref == item.version_ref:
                     return item
             return None
         return self.package_cache.get(package_ref)
@@ -304,47 +309,109 @@ class SlaveService:
     def _operation_name(operation_ref: str) -> str:
         return operation_ref.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
 
-    @staticmethod
-    def _service_endpoint(
-        package: CapabilityPackageVersion,
-        operation: str,
-        binding: ComputeBinding | None,
-    ) -> Any:
-        body = package.body
-        if not hasattr(body, "endpoints"):
-            raise RuntimeError("service_package_body_invalid")
-        endpoints = list(body.endpoints)
-        descriptor = binding.capability_descriptor_ref if binding is not None else None
-        if descriptor is not None:
-            matches = [
-                endpoint
-                for endpoint in endpoints
-                if endpoint.operation_descriptor_ref.resource_id == descriptor.resource_id
-                and endpoint.operation_descriptor_ref.digest == descriptor.digest
-            ]
-            if len(matches) == 1:
-                return matches[0]
-            if len(matches) > 1:
-                raise RuntimeError("service_endpoint_binding_mismatch")
-            raise RuntimeError("service_endpoint_binding_mismatch")
-        candidates = {operation, SlaveService._operation_name(operation)}
-        matches = [
-            endpoint
-            for endpoint in endpoints
-            if endpoint.endpoint_id in candidates
-            or endpoint.path in candidates
-            or endpoint.operation_descriptor_ref.resource_id in candidates
-            or SlaveService._operation_name(endpoint.operation_descriptor_ref.resource_id) in candidates
-        ]
-        if len(matches) != 1:
-            raise RuntimeError("service_endpoint_not_found")
-        return matches[0]
+    def capability_snapshot(self) -> set[str]:
+        operations = set(self.supported_operations)
+        for activation in self.activations.values():
+            if activation.desired_state != "running" or activation.activation_state != "ready":
+                continue
+            package = self._find_cached_package(
+                activation.package_version_ref, activation.package_digest
+            )
+            if package is None:
+                continue
+            operations.update(
+                self._operation_name(item.capability_descriptor_ref.resource_id)
+                for item in package.capability_exports
+            )
+        return operations
 
-    async def _validate_service_package(self, package: CapabilityPackageVersion) -> None:
-        if package.package_type != "service" or not hasattr(package.body, "endpoints"):
-            raise RuntimeError("service_package_body_invalid")
-        for endpoint in package.body.endpoints:
-            contract = await self._load_io_contract(endpoint.io_contract_ref)
+    @staticmethod
+    def _lifecycle_retry(
+        existing: CapabilityPackageActivation | None,
+        *,
+        desired_state: str,
+        package_digest: str,
+        activation_revision: int,
+        idempotency_key: str,
+    ) -> bool:
+        if existing is None:
+            return False
+        if existing.package_digest.lower() != package_digest.lower():
+            raise RuntimeError("capability_package_identity_conflict")
+        if activation_revision < existing.activation_revision:
+            raise RuntimeError("stale_activation_revision")
+        if activation_revision == existing.activation_revision:
+            if existing.desired_state != desired_state:
+                raise RuntimeError("activation_revision_conflict")
+            # A package activation is immutable and may be reused by a later
+            # Run.  Observer revisions are scoped to that Run, while the
+            # Slave keeps the ready/stopped projection across Runs.  Once the
+            # requested terminal state is already established, a different
+            # per-Run idempotency key is therefore a safe replay rather than
+            # a conflicting command.  Non-terminal states remain fenced so a
+            # stale command cannot overwrite an in-flight lifecycle change.
+            terminal_state = (
+                existing.activation_state == "ready"
+                if desired_state == "running"
+                else existing.activation_state == "stopped"
+            )
+            if existing.last_idempotency_key != idempotency_key and not terminal_state:
+                raise RuntimeError("activation_revision_conflict")
+            return True
+        return False
+
+    def _accept_activation_revision(self, activation_key: str, *, retry: bool) -> None:
+        if retry:
+            return
+        self._pending_health_reports.pop(activation_key, None)
+
+    def _remember_health_report(
+        self, activation_key: str, report: CapabilityHealthReport
+    ) -> CapabilityHealthReport:
+        """Record a synchronous lifecycle report as already observed.
+
+        ``provision``/``deprovision`` return their health report to the
+        caller synchronously.  The background health loop must therefore not
+        emit a second report for the same revision and state before any
+        actual runtime transition occurs.
+        """
+        self._last_reported_health[activation_key] = (
+            report.activation_revision,
+            report.activation_state,
+        )
+        return report
+
+    @staticmethod
+    def _selected_export(
+        package: CapabilityPackageVersion,
+        binding: ComputeBinding | None,
+    ) -> CapabilityExport:
+        if binding is None:
+            raise RuntimeError("capability_descriptor_binding_required")
+        try:
+            return package.export_for(binding.capability_descriptor_ref)
+        except ValueError as exc:
+            raise RuntimeError("capability_descriptor_binding_mismatch") from exc
+
+    @staticmethod
+    def _body_ref(package: CapabilityPackageVersion, field_name: str) -> ResourceRef:
+        try:
+            return ResourceRef.model_validate(package.body[field_name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"{field_name}_required") from exc
+
+    def _uses_runtime_plugin(self, package: CapabilityPackageVersion) -> bool:
+        if (
+            package.package_type,
+            package.execution.kind,
+            package.execution.version,
+        ) == DRIVER_ORCHESTRATOR_KEY:
+            return False
+        return not self.executor_registry.supports(package.package_type, package.execution)
+
+    async def _validate_package_exports(self, package: CapabilityPackageVersion) -> None:
+        for capability_export in package.capability_exports:
+            contract = await self._load_io_contract(capability_export.io_contract_ref)
             for schema_ref in (contract.input_schema_ref, contract.output_schema_ref):
                 if schema_ref is None:
                     continue
@@ -353,17 +420,18 @@ class SlaveService:
                     validate_schema(schema)
                 except (FileNotFoundError, TypeError, ValueError, json.JSONDecodeError) as exc:
                     raise RuntimeError("io_contract_invalid") from exc
+            if contract.success_validator_ref is not None:
+                try:
+                    await self.content_store.get(contract.success_validator_ref)
+                except (FileNotFoundError, ValueError) as exc:
+                    raise RuntimeError("io_contract_invalid") from exc
 
-    async def _validate_service_input_payload(
+    async def _validate_input_payload(
         self,
-        package: CapabilityPackageVersion,
-        operation: str,
+        capability_export: CapabilityExport,
         payload: dict[str, Any],
-        binding: ComputeBinding | None,
     ) -> None:
-        """Validate direct service dispatches even without a closure binding."""
-        endpoint = self._service_endpoint(package, operation, binding)
-        contract = await self._load_io_contract(endpoint.io_contract_ref)
+        contract = await self._load_io_contract(capability_export.io_contract_ref)
         if contract.input_schema_ref is None:
             return
         try:
@@ -374,112 +442,109 @@ class SlaveService:
             raise RuntimeError("payload_schema_mismatch") from exc
         if errors:
             raise RuntimeError("payload_schema_mismatch")
-            if contract.success_validator_ref is not None:
-                try:
-                    await self.content_store.get(contract.success_validator_ref)
-                except (FileNotFoundError, ValueError) as exc:
-                    raise RuntimeError("io_contract_invalid") from exc
 
-    async def _provision_service(
-        self,
-        command: CapabilityProvisionCommand,
-        package: CapabilityPackageVersion,
-    ) -> CapabilityHealthReport:
-        key = self._package_cache_key(package.version_ref, package.package_digest)
-        lock = self._activation_locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            return await self._provision_service_locked(command, package)
-
-    async def _provision_service_locked(
+    async def _provision_runtime_locked(
         self,
         command: CapabilityProvisionCommand,
         package: CapabilityPackageVersion,
     ) -> CapabilityHealthReport:
         if self.runtime_plugin_host is None:
-            raise RuntimeError("service_runtime_unavailable")
+            raise RuntimeError("runtime_plugin_not_found")
         if package.package_digest.lower() != command.package_digest.lower():
             raise RuntimeError("capability_package_digest_mismatch")
-        await self._validate_service_package(package)
+        await self._validate_package_exports(package)
         ref = package.version_ref
-        coordinate_refs = {ref, f"{package.package_id}:{package.package_version}"}
         for item in self.activations.values():
-            if item.package_version_ref in coordinate_refs and item.package_digest.lower() != package.package_digest.lower():
+            if item.package_version_ref == ref and item.package_digest.lower() != package.package_digest.lower():
                 # A package coordinate is immutable.  Never start a second
                 # container for the same coordinate under another digest.
                 raise RuntimeError("capability_package_identity_conflict")
-        activation_key = self._package_cache_key(ref, package.package_digest)
+        activation_key = self._activation_key(ref)
         existing = self.activations.get(activation_key)
+        retry = self._lifecycle_retry(
+            existing,
+            desired_state="running",
+            package_digest=package.package_digest,
+            activation_revision=command.activation_revision,
+            idempotency_key=command.idempotency_key,
+        )
+        self._accept_activation_revision(activation_key, retry=retry)
+        if retry and existing is not None and existing.activation_state == "ready":
+            return self._remember_health_report(activation_key, CapabilityHealthReport(
+                report_id=f"health-{uuid4().hex}",
+                package_version_ref=ref,
+                package_digest=package.package_digest,
+                target_slave=self.slave_id,
+                activation_state="ready",
+                activation_revision=command.activation_revision,
+                evidence_refs=list(existing.evidence_refs),
+                details={"idempotent": True},
+            ))
         # Write desired-running before touching the runtime.  A crash between
         # this write and plugin completion is recovered by startup reconcile.
-        pending = existing or CapabilityPackageActivation(
-            package_version_ref=ref,
-            package_digest=package.package_digest,
-            target_slave=self.slave_id,
-            activation_closure_version_ref=command.activation_closure_version_ref or package.package_closure_version_ref,
-            compute_binding_ref=command.compute_binding.binding_id if command.compute_binding else "",
-            session_generation=command.session_generation,
-            activation_state="provisioning",
-            evidence_refs=[],
-            runtime_profile={},
+        values = {
+            "activation_closure_version_ref": command.activation_closure_version_ref
+            or package.package_closure_version_ref,
+            "compute_binding_ref": command.compute_binding.binding_id
+            if command.compute_binding
+            else "",
+            "desired_state": "running",
+            "activation_revision": command.activation_revision,
+            "last_idempotency_key": command.idempotency_key,
+            "activation_state": "provisioning",
+        }
+        pending = (
+            existing.model_copy(update=values)
+            if existing is not None
+            else CapabilityPackageActivation(
+                package_version_ref=ref,
+                package_digest=package.package_digest,
+                target_slave=self.slave_id,
+                evidence_refs=[],
+                runtime_profile={},
+                **values,
+            )
         )
-        if pending.activation_state != "provisioning":
-            pending = pending.model_copy(update={"activation_state": "provisioning", "session_generation": command.session_generation})
         self._cache_package(package, command.package_version_ref)
         self.activations[activation_key] = pending
-        await self._persist_activation(package, pending, desired_state="running", idempotency_key=command.idempotency_key)
+        await self._persist_activation(package, pending)
         try:
             response = await self.runtime_plugin_host.provision(package, command)
         except (RuntimePluginError, RuntimeError) as exc:
             code = getattr(exc, "code", None) or str(exc) or "runtime_plugin_unavailable"
             failed = pending.model_copy(update={"activation_state": "failed"})
             self.activations[activation_key] = failed
-            await self._persist_activation(package, failed, desired_state="running", idempotency_key=command.idempotency_key, last_error_code=code)
+            await self._persist_activation(package, failed, last_error_code=code)
             raise RuntimeError(code) from exc
         state = str(response.get("activation_state") or response.get("state") or "ready")
-        if state not in {"ready", "degraded", "failed", "stopped"}:
+        if state not in {"ready", "degraded", "failed"}:
             raise RuntimeError("runtime_plugin_protocol_error")
-        if existing is not None and existing.activation_state == "ready" and state == "ready":
-            await self._persist_activation(package, existing, desired_state="running", runtime_plugin_id=str(response.get("runtime_plugin_id") or ""), idempotency_key=command.idempotency_key)
-            return CapabilityHealthReport(
-                report_id=f"health-{package.package_id}-{self.slave_id}",
-                package_version_ref=ref,
-                package_digest=package.package_digest,
-                target_slave=self.slave_id,
-                activation_state="ready",
-                evidence_refs=list(existing.evidence_refs),
-                details={"idempotent": True, "runtime_plugin_id": str(response.get("runtime_plugin_id") or "")},
-                session_generation=command.session_generation,
-            )
-        activation = CapabilityPackageActivation(
-            package_version_ref=ref,
-            package_digest=package.package_digest,
-            target_slave=self.slave_id,
-            activation_closure_version_ref=command.activation_closure_version_ref or package.package_closure_version_ref,
-            compute_binding_ref=command.compute_binding.binding_id if command.compute_binding else "",
-            session_generation=command.session_generation,
-            activation_state=state,
-            evidence_refs=[str(item) for item in response.get("evidence_refs", []) if item is not None],
-            runtime_profile=dict(response.get("runtime_profile") or {}),
+        activation = pending.model_copy(
+            update={
+                "activation_state": state,
+                "evidence_refs": [
+                    str(item)
+                    for item in response.get("evidence_refs", [])
+                    if item is not None
+                ],
+                "runtime_profile": dict(response.get("runtime_profile") or {}),
+            }
         )
         self.activations[activation_key] = activation
         await self._persist_activation(
             package,
             activation,
-            desired_state="running" if state != "stopped" else "stopped",
             runtime_plugin_id=str(response.get("runtime_plugin_id") or ""),
             runtime_handle=dict(response.get("runtime_handle") or {}),
-            idempotency_key=command.idempotency_key,
             last_error_code=str((response.get("details") or {}).get("code") or "") if state == "failed" else "",
         )
-        if package.scope == "workspace_reusable" and package.publication_state == "published" and state == "ready":
-            for endpoint in package.body.endpoints:
-                self.supported_operations.add(self._operation_name(endpoint.operation_descriptor_ref.resource_id))
         report = CapabilityHealthReport(
-            report_id=f"health-{package.package_id}-{self.slave_id}",
+            report_id=f"health-{uuid4().hex}",
             package_version_ref=ref,
             package_digest=package.package_digest,
             target_slave=self.slave_id,
             activation_state=state,
+            activation_revision=command.activation_revision,
             evidence_refs=activation.evidence_refs,
             details={
                 "runtime_plugin_id": str(response.get("runtime_plugin_id") or ""),
@@ -487,7 +552,6 @@ class SlaveService:
                 "package_digest": package.package_digest,
                 **dict(response.get("details") or {}),
             },
-            session_generation=command.session_generation,
         )
         self.resource_events.append(
             ResourceEventFrame(
@@ -500,7 +564,7 @@ class SlaveService:
                 evidence_refs=report.evidence_refs,
             )
         )
-        return report
+        return self._remember_health_report(activation_key, report)
 
     async def provision(self, command: CapabilityProvisionCommand, package: CapabilityPackageVersion | None = None) -> CapabilityHealthReport:
         if command.target_slave != self.slave_id:
@@ -510,72 +574,128 @@ class SlaveService:
         package = package or self._find_cached_package(command.package_version_ref, command.package_digest)
         if package is None:
             raise RuntimeError("capability_package_not_found")
-        if package.package_type == "service":
-            return await self._provision_service(command, package)
-        if package.execution.kind == "container:python_orchestrator":
-            raise RuntimeError("driver_side_executor_required")
-        if package.function_body.io_contract_ref is None:
-            raise RuntimeError("io_contract_required")
         try:
-            await self._load_io_contract(package.function_body.io_contract_ref)
+            package = CapabilityPackageVersion.model_validate(package.model_dump(mode="json"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("capability_package_invalid") from exc
+        if command.package_version_ref != package.version_ref:
+            raise RuntimeError("capability_package_ref_mismatch")
+        if (
+            package.package_type,
+            package.execution.kind,
+            package.execution.version,
+        ) == DRIVER_ORCHESTRATOR_KEY:
+            raise RuntimeError("driver_side_executor_required")
+        activation_key = self._activation_key(package.version_ref)
+        lock = self._activation_locks.setdefault(activation_key, asyncio.Lock())
+        async with lock:
+            if self._uses_runtime_plugin(package):
+                return await self._provision_runtime_locked(command, package)
+            return await self._provision_executor_locked(command, package)
+
+    async def _provision_executor_locked(
+        self,
+        command: CapabilityProvisionCommand,
+        package: CapabilityPackageVersion,
+    ) -> CapabilityHealthReport:
+        try:
+            await self._validate_package_exports(package)
         except (FileNotFoundError, RuntimeError, ValueError, TypeError) as exc:
             raise RuntimeError("io_contract_invalid") from exc
         if package.package_digest.lower() != command.package_digest.lower():
             raise RuntimeError("capability_package_digest_mismatch")
-        if package.function_body.provider_fillable_hole_refs and (command.compute_binding is None or not command.compute_binding.runtime_profile):
+        provider_fillable = list(package.body.get("provider_fillable_hole_refs") or [])
+        if provider_fillable and (command.compute_binding is None or not command.compute_binding.runtime_profile):
             raise RuntimeError("provider_fillable_binding_required")
         ref = package.version_ref
-        activation_key = self._package_cache_key(ref, package.package_digest)
+        activation_key = self._activation_key(ref)
         existing_activation = self.activations.get(activation_key)
-        if existing_activation is not None and existing_activation.activation_state == "ready":
-            return CapabilityHealthReport(
-                report_id=f"health-{package.package_id}-{self.slave_id}",
+        retry = self._lifecycle_retry(
+            existing_activation,
+            desired_state="running",
+            package_digest=package.package_digest,
+            activation_revision=command.activation_revision,
+            idempotency_key=command.idempotency_key,
+        )
+        self._accept_activation_revision(activation_key, retry=retry)
+        if retry and existing_activation is not None and existing_activation.activation_state == "ready":
+            return self._remember_health_report(activation_key, CapabilityHealthReport(
+                report_id=f"health-{uuid4().hex}",
                 package_version_ref=ref,
                 package_digest=package.package_digest,
                 target_slave=self.slave_id,
                 activation_state="ready",
+                activation_revision=command.activation_revision,
                 evidence_refs=list(existing_activation.evidence_refs),
                 details={"idempotent": True},
-                session_generation=command.session_generation,
+            ))
+        pending_values = {
+            "activation_closure_version_ref": command.activation_closure_version_ref
+            or package.package_closure_version_ref,
+            "compute_binding_ref": command.compute_binding.binding_id
+            if command.compute_binding
+            else "",
+            "desired_state": "running",
+            "activation_revision": command.activation_revision,
+            "last_idempotency_key": command.idempotency_key,
+            "activation_state": "provisioning",
+        }
+        pending = (
+            existing_activation.model_copy(update=pending_values)
+            if existing_activation is not None
+            else CapabilityPackageActivation(
+                package_version_ref=ref,
+                package_digest=package.package_digest,
+                target_slave=self.slave_id,
+                evidence_refs=[],
+                runtime_profile={},
+                **pending_values,
             )
-        stat = await self.content_store.stat(package.function_body.program_content_ref)
-        if stat is None or not stat.integrity_verified or stat.declared_digest != package.function_body.program_digest:
-            raise RuntimeError("program_content_unavailable")
-        activation = CapabilityPackageActivation(
-            package_version_ref=ref,
-            package_digest=package.package_digest,
-            target_slave=self.slave_id,
-            activation_closure_version_ref=command.activation_closure_version_ref or package.package_closure_version_ref,
-            compute_binding_ref=command.compute_binding.binding_id if command.compute_binding else "",
-            session_generation=command.session_generation,
-            activation_state="ready",
-            evidence_refs=[f"package-test:{package.package_digest[:16]}", f"health:{package.package_digest[:16]}"],
         )
         self._cache_package(package, command.package_version_ref)
+        self.activations[activation_key] = pending
+        await self._persist_activation(package, pending)
+        program_ref = self._body_ref(package, "program_content_ref")
+        stat = await self.content_store.stat(program_ref)
+        if stat is None or not stat.integrity_verified or stat.declared_digest != program_ref.digest:
+            failed = pending.model_copy(update={"activation_state": "failed"})
+            self.activations[activation_key] = failed
+            await self._persist_activation(
+                package, failed, last_error_code="program_content_unavailable"
+            )
+            raise RuntimeError("program_content_unavailable")
+        activation = pending.model_copy(
+            update={
+                "activation_state": "ready",
+                "evidence_refs": [
+                    f"package-test:{package.package_digest[:16]}",
+                    f"health:{package.package_digest[:16]}",
+                ],
+            }
+        )
         self.activations[activation_key] = activation
-        await self._persist_activation(package, activation, desired_state="running", idempotency_key=command.idempotency_key)
-        operation_ref = package.function_body.operation_descriptor_ref
-        operation_name = operation_ref.resource_id if isinstance(operation_ref, ResourceRef) else str(operation_ref)
-        if package.scope == "workspace_reusable" and package.publication_state == "published":
-            self.supported_operations.add(operation_name.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+        await self._persist_activation(package, activation)
+        operation_name = package.capability_exports[0].capability_descriptor_ref.resource_id
         report = CapabilityHealthReport(
-            report_id=f"health-{package.package_id}-{self.slave_id}",
+            report_id=f"health-{uuid4().hex}",
             package_version_ref=ref,
             package_digest=package.package_digest,
             target_slave=self.slave_id,
             activation_state="ready",
+            activation_revision=command.activation_revision,
             evidence_refs=activation.evidence_refs,
             details={
                 "operation": operation_name,
                 "execution": package.execution.model_dump(mode="json"),
-                "executor_descriptor_ref": self.executor_registry.get(package.execution).descriptor.descriptor_ref,
+                "executor_descriptor_ref": self.executor_registry.get_for(
+                    package.package_type, package.execution
+                ).descriptor.descriptor_ref,
                 "package_version_ref": package.version_ref,
                 "package_digest": package.package_digest,
             },
-            session_generation=command.session_generation,
         )
         self.resource_events.append(ResourceEventFrame(event_id=f"resource-{report.report_id}", resource_ref=ref, event_type="activation_ready", package_version_ref=ref, package_digest=package.package_digest, target_slave=self.slave_id, evidence_refs=report.evidence_refs))
-        return report
+        return self._remember_health_report(activation_key, report)
 
     async def deprovision(
         self,
@@ -587,9 +707,15 @@ class SlaveService:
         package = package or self._find_cached_package(command.package_version_ref, command.package_digest)
         if package is None:
             raise RuntimeError("capability_package_not_found")
-        if package.package_type != "service":
+        try:
+            package = CapabilityPackageVersion.model_validate(package.model_dump(mode="json"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("capability_package_invalid") from exc
+        if command.package_version_ref != package.version_ref:
+            raise RuntimeError("capability_package_ref_mismatch")
+        if not self._uses_runtime_plugin(package):
             raise RuntimeError("unsupported_deprovision_contract")
-        lock = self._activation_locks.setdefault(self._package_cache_key(package.version_ref, package.package_digest), asyncio.Lock())
+        lock = self._activation_locks.setdefault(self._activation_key(package.version_ref), asyncio.Lock())
         async with lock:
             return await self._deprovision_locked(command, package)
 
@@ -601,59 +727,79 @@ class SlaveService:
         if package.package_digest.lower() != command.package_digest.lower():
             raise RuntimeError("capability_package_digest_mismatch")
         if self.runtime_plugin_host is None:
-            raise RuntimeError("service_runtime_unavailable")
-        try:
-            response = await self.runtime_plugin_host.deprovision(package, command)
-        except (RuntimePluginError, RuntimeError) as exc:
-            raise RuntimeError(getattr(exc, "code", None) or str(exc) or "runtime_plugin_unavailable") from exc
+            raise RuntimeError("runtime_plugin_not_found")
         ref = package.version_ref
-        activation_key = self._package_cache_key(ref, package.package_digest)
+        activation_key = self._activation_key(ref)
         existing = self.activations.get(activation_key)
-        evidence_refs = list(existing.evidence_refs) if existing is not None else [f"deprovision:{package.package_digest[:16]}"]
-        if existing is None:
-            activation = CapabilityPackageActivation(
+        retry = self._lifecycle_retry(
+            existing,
+            desired_state="stopped",
+            package_digest=package.package_digest,
+            activation_revision=command.activation_revision,
+            idempotency_key=command.idempotency_key,
+        )
+        self._accept_activation_revision(activation_key, retry=retry)
+        evidence_refs = (
+            list(existing.evidence_refs)
+            if existing is not None
+            else [f"deprovision:{package.package_digest[:16]}"]
+        )
+        desired_values = {
+            "desired_state": "stopped",
+            "activation_revision": command.activation_revision,
+            "last_idempotency_key": command.idempotency_key,
+        }
+        desired = (
+            existing.model_copy(update=desired_values)
+            if existing is not None
+            else CapabilityPackageActivation(
                 package_version_ref=ref,
                 package_digest=package.package_digest,
                 target_slave=self.slave_id,
                 activation_closure_version_ref=package.package_closure_version_ref,
                 compute_binding_ref="",
-                session_generation=command.session_generation,
-                activation_state="stopped",
+                activation_state="not_installed",
                 evidence_refs=evidence_refs,
+                runtime_profile={},
+                **desired_values,
             )
-        else:
-            activation = existing.model_copy(update={"activation_state": "stopped", "session_generation": command.session_generation})
+        )
+        self._cache_package(package, command.package_version_ref)
+        self.activations[activation_key] = desired
+        await self._persist_activation(package, desired)
+        if retry and existing is not None and existing.activation_state == "stopped":
+            return self._remember_health_report(activation_key, CapabilityHealthReport(
+                report_id=f"health-{uuid4().hex}",
+                package_version_ref=ref,
+                package_digest=package.package_digest,
+                target_slave=self.slave_id,
+                activation_state="stopped",
+                activation_revision=command.activation_revision,
+                evidence_refs=evidence_refs,
+                details={"idempotent": True},
+            ))
+        try:
+            response = await self.runtime_plugin_host.deprovision(package, command)
+        except (RuntimePluginError, RuntimeError) as exc:
+            code = getattr(exc, "code", None) or str(exc) or "runtime_plugin_unavailable"
+            await self._persist_activation(package, desired, last_error_code=code)
+            raise RuntimeError(code) from exc
+        activation = desired.model_copy(update={"activation_state": "stopped"})
         self.activations[activation_key] = activation
-        # Keep the local capability projection aligned with desired state;
-        # a stopped service must not continue to advertise its operations.
-        for endpoint in package.body.endpoints:
-            operation_name = self._operation_name(endpoint.operation_descriptor_ref.resource_id)
-            still_ready = any(
-                item.activation_state == "ready"
-                and (cached := self._find_cached_package(item.package_version_ref, item.package_digest)) is not None
-                and cached.package_type == "service"
-                and any(self._operation_name(other.operation_descriptor_ref.resource_id) == operation_name for other in cached.body.endpoints)
-                for key, item in self.activations.items()
-                if key != activation_key
-            )
-            if not still_ready:
-                self.supported_operations.discard(operation_name)
         await self._persist_activation(
             package,
             activation,
-            desired_state="stopped",
             runtime_plugin_id=str(response.get("runtime_plugin_id") or ""),
-            idempotency_key=command.idempotency_key,
         )
         report = CapabilityHealthReport(
-            report_id=f"health-{package.package_id}-{self.slave_id}-stopped",
+            report_id=f"health-{uuid4().hex}",
             package_version_ref=ref,
             package_digest=package.package_digest,
             target_slave=self.slave_id,
             activation_state="stopped",
+            activation_revision=command.activation_revision,
             evidence_refs=evidence_refs,
             details={"runtime_plugin_id": str(response.get("runtime_plugin_id") or ""), "idempotent": bool(response.get("idempotent", False))},
-            session_generation=command.session_generation,
         )
         self.resource_events.append(
             ResourceEventFrame(
@@ -666,7 +812,96 @@ class SlaveService:
                 evidence_refs=evidence_refs,
             )
         )
-        return report
+        return self._remember_health_report(activation_key, report)
+
+    async def inspect_activation_health(self) -> list[CapabilityHealthReport]:
+        reports: list[CapabilityHealthReport] = []
+        for activation_key, pending in list(self._pending_health_reports.items()):
+            lock = self._activation_locks.setdefault(activation_key, asyncio.Lock())
+            async with lock:
+                activation = self.activations.get(activation_key)
+                if (
+                    activation is None
+                    or activation.desired_state != "running"
+                    or activation.activation_revision != pending.activation_revision
+                ):
+                    self._pending_health_reports.pop(activation_key, None)
+                    continue
+                reports.append(pending)
+
+        for activation_key in list(self.activations):
+            lock = self._activation_locks.setdefault(activation_key, asyncio.Lock())
+            async with lock:
+                activation = self.activations.get(activation_key)
+                if activation is None or (
+                    activation_key in self._pending_health_reports
+                    or activation.desired_state != "running"
+                ):
+                    continue
+                package = self._find_cached_package(
+                    activation.package_version_ref, activation.package_digest
+                )
+                if package is None or not self._uses_runtime_plugin(package):
+                    continue
+
+                details: dict[str, Any] = {}
+                if activation.activation_state == "failed":
+                    state = "failed"
+                elif self.runtime_plugin_host is None:
+                    state = "failed"
+                    details["code"] = "runtime_plugin_not_found"
+                else:
+                    try:
+                        inspected = await self.runtime_plugin_host.inspect(
+                            package,
+                            {
+                                **activation.model_dump(mode="json"),
+                                "workspace_id": self.workspace_id,
+                                "slave_id": self.slave_id,
+                            },
+                        )
+                        details["inspect"] = inspected
+                        if inspected.get("identity_match") and inspected.get("healthy"):
+                            state = "ready"
+                        elif inspected.get("exists") and inspected.get("running"):
+                            state = "degraded"
+                        else:
+                            state = "failed"
+                    except (RuntimePluginError, RuntimeError) as exc:
+                        state = "failed"
+                        details["code"] = getattr(exc, "code", None) or str(exc)
+
+                health = (activation.activation_revision, state)
+                if self._last_reported_health.get(activation_key) == health:
+                    continue
+                if state != activation.activation_state:
+                    activation = activation.model_copy(update={"activation_state": state})
+                    self.activations[activation_key] = activation
+                    await self._persist_activation(package, activation)
+                report = CapabilityHealthReport(
+                    report_id=f"health-{uuid4().hex}",
+                    package_version_ref=activation.package_version_ref,
+                    package_digest=activation.package_digest,
+                    target_slave=self.slave_id,
+                    activation_state=state,
+                    activation_revision=activation.activation_revision,
+                    evidence_refs=list(activation.evidence_refs),
+                    details=details,
+                )
+                self._pending_health_reports[activation_key] = report
+                reports.append(report)
+        return reports
+
+    def acknowledge_health_report(self, report_id: str) -> None:
+        for activation_key, report in list(self._pending_health_reports.items()):
+            if report.report_id != report_id:
+                continue
+            self._last_reported_health[activation_key] = (
+                report.activation_revision,
+                report.activation_state,
+            )
+            self._pending_health_reports.pop(activation_key, None)
+            return
 
     async def _load_io_contract(self, ref: ResourceRef) -> IoContract:
         raw = await self.content_store.get(ref)
@@ -681,8 +916,7 @@ class SlaveService:
         *,
         operation: str,
         closure: TaskClosure | None,
-        package: CapabilityPackageVersion | None,
-        binding: ComputeBinding | None = None,
+        capability_export: CapabilityExport | None,
     ) -> dict[str, Any]:
         """Resolve and validate the immutable input binding at the Slave.
 
@@ -697,22 +931,14 @@ class SlaveService:
         operation_ref = closure.program.operation_ref or closure.compute.operation_ref
         operation_name = operation_ref.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1] if operation_ref else operation
         candidates = {operation_ref, operation_name, operation, "default"}
-        binding = next((item for item in closure.node_input_bindings if item.node_id in candidates), None)
-        if binding is None:
+        input_binding = next((item for item in closure.node_input_bindings if item.node_id in candidates), None)
+        if input_binding is None:
             raise RuntimeError("input_binding_missing")
 
-        if package is not None and package.package_type == "service":
-            endpoint = self._service_endpoint(package, operation, binding)
-            contract_ref = endpoint.io_contract_ref
-        else:
-            contract_ref = (
-                package.function_body.io_contract_ref
-                if package is not None and package.function_body.io_contract_ref is not None
-                else closure.program.io_contract_ref
-            )
+        contract_ref = capability_export.io_contract_ref if capability_export is not None else closure.program.io_contract_ref
         contract = await self._load_io_contract(contract_ref) if contract_ref is not None else None
         try:
-            raw = await self.content_store.get(binding.input_ref)
+            raw = await self.content_store.get(input_binding.input_ref)
             value = json.loads(raw)
         except (FileNotFoundError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError("payload_schema_mismatch") from exc
@@ -763,14 +989,9 @@ class SlaveService:
         execution_epoch: int,
         operation: str = "",
         closure: TaskClosure | None,
-        package: CapabilityPackageVersion | None,
-        binding: ComputeBinding | None,
+        capability_export: CapabilityExport | None,
     ) -> ExecutionResult:
-        if package is not None and package.package_type == "service":
-            endpoint = self._service_endpoint(package, operation or (closure.program.operation_ref if closure is not None else ""), binding)
-            contract_ref = endpoint.io_contract_ref
-        else:
-            contract_ref = package.function_body.io_contract_ref if package is not None and package.function_body.io_contract_ref is not None else closure.program.io_contract_ref if closure is not None else None
+        contract_ref = capability_export.io_contract_ref if capability_export is not None else closure.program.io_contract_ref if closure is not None else None
         if contract_ref is None:
             return result
         contract = await self._load_io_contract(contract_ref)
@@ -828,7 +1049,12 @@ class SlaveService:
         if contract.success_validator_ref is not None:
             plugin = await self.content_store.get(contract.success_validator_ref)
             plugin_input = result.value if isinstance(result.value, dict) else {"value": result.value}
-            plugin_result = await self.executor_registry.invoke(ExecutionContract(kind="process:json_stdio", version="1"), plugin_input, program=plugin)
+            plugin_result = await self.executor_registry.invoke_for(
+                "function",
+                ExecutionContract(kind="process:json_stdio", version="1"),
+                plugin_input,
+                program=plugin,
+            )
             payload = plugin_result.value if isinstance(plugin_result.value, dict) else {}
             plugin_status = payload.get("result")
             plugin_errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
@@ -901,6 +1127,17 @@ class SlaveService:
                 raise RuntimeError("binding_target_mismatch")
         if package_required:
             raise RuntimeError("capability_package_required")
+        if package is not None:
+            try:
+                # Cached package objects contain mutable JSON collections.
+                # Reconstruct at the dispatch boundary so an in-process
+                # mutation cannot bypass contract or digest validation.
+                package = CapabilityPackageVersion.model_validate(
+                    package.model_dump(mode="json")
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("capability_package_invalid") from exc
+        capability_export = self._selected_export(package, binding) if package is not None else None
         if attempt_id in self.attempts:
             return self.attempts[attempt_id]
         if self.sessions is not None:
@@ -919,16 +1156,17 @@ class SlaveService:
                     )
                     self.attempts[attempt_id] = result
                     return result
-        payload = await self._admission_payload(payload, operation=operation, closure=closure, package=package, binding=binding)
-        if package is not None and package.package_type == "service":
-            activation_key = self._package_cache_key(package.version_ref, package.package_digest)
+        payload = await self._admission_payload(payload, operation=operation, closure=closure, capability_export=capability_export)
+        if capability_export is not None:
+            await self._validate_input_payload(capability_export, payload)
+        if package is not None and self._uses_runtime_plugin(package):
+            activation_key = self._activation_key(package.version_ref)
             activation = self.activations.get(activation_key)
             if activation is None or activation.activation_state != "ready":
-                raise RuntimeError("service_activation_not_ready")
-            endpoint = self._service_endpoint(package, operation, binding)
-            await self._validate_service_input_payload(package, operation, payload, binding)
+                raise RuntimeError("capability_activation_not_ready")
+            assert capability_export is not None
             if self.runtime_plugin_host is None:
-                raise RuntimeError("service_runtime_unavailable")
+                raise RuntimeError("runtime_plugin_not_found")
             try:
                 activation_payload = activation.model_dump(mode="json")
                 # Workspace/Slave identity is role-local context rather than
@@ -938,7 +1176,7 @@ class SlaveService:
                 activation_payload.update({"workspace_id": self.workspace_id, "slave_id": self.slave_id})
                 response = await self.runtime_plugin_host.invoke(
                     package,
-                    endpoint,
+                    capability_export,
                     payload,
                     activation=activation_payload,
                     attempt_id=attempt_id,
@@ -955,30 +1193,30 @@ class SlaveService:
                     identity_criterion="content_digest",
                 ),
                 value=value,
-                replay_safety=str(response.get("replay_safety") or endpoint.replay_safety),
+                replay_safety=str(response.get("replay_safety") or capability_export.replay_safety),
                 terminal_state=str(response.get("terminal_state") or "completed"),
                 terminal_error=response.get("terminal_error"),
                 provenance={
                     "package_version_ref": package.version_ref,
                     "package_digest": package.package_digest,
-                    "endpoint_id": endpoint.endpoint_id,
-                    "operation_descriptor_ref": endpoint.operation_descriptor_ref.model_dump(mode="json"),
-                    "image_ref": package.body.image_ref,
+                    "capability_descriptor_ref": capability_export.capability_descriptor_ref.model_dump(mode="json"),
                     "execution": package.execution.model_dump(mode="json"),
                     "runtime_plugin_id": str(response.get("runtime_plugin_id") or ""),
                     **dict(response.get("provenance") or {}),
                 },
             )
         elif package is not None:
-            program = await self.content_store.get(package.function_body.program_content_ref, expected_digest=package.function_body.program_digest)
-            result = await self.executor_registry.invoke(package.execution, payload, program=program)
-            descriptor = self.executor_registry.get(package.execution).descriptor
+            program_ref = self._body_ref(package, "program_content_ref")
+            program = await self.content_store.get(program_ref, expected_digest=program_ref.digest)
+            adapter = self.executor_registry.get_for(package.package_type, package.execution)
+            result = await adapter.invoke(payload, program=program)
+            descriptor = adapter.descriptor
             result = replace(
                 result,
                 provenance={
                     "package_version_ref": package.version_ref,
                     "package_digest": package.package_digest,
-                    "program_content_ref": package.function_body.program_content_ref.model_dump(mode="json"),
+                    "program_content_ref": program_ref.model_dump(mode="json"),
                     "execution": package.execution.model_dump(mode="json"),
                     "executor_descriptor_ref": descriptor.descriptor_ref,
                 },
@@ -993,8 +1231,7 @@ class SlaveService:
             execution_epoch=execution_epoch,
             operation=operation,
             closure=closure,
-            package=package,
-            binding=binding,
+            capability_export=capability_export,
         )
         self.attempts[attempt_id] = result
         if self.sessions is not None:

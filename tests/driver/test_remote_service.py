@@ -21,6 +21,11 @@ class DynamicToolProvider:
 
     async def send_turn(self, user_message: str):
         assert "loom_open_run" in self.tool_names
+        operation_ref = "loom://test_double"
+        descriptor = await self.tool_handler(
+            "loom_put_content",
+            {"content": {"schema_version": "operation.v1", "resource_id": operation_ref, "name": "test_double"}, "media_type": "application/vnd.loom.operation-descriptor+json"},
+        )
         program = await self.tool_handler(
             "loom_put_content",
             {"content": "import json,sys; d=json.load(sys.stdin); print(json.dumps({'value': d.get('value', 0) * 2}))", "media_type": "text/x-python"},
@@ -35,7 +40,6 @@ class DynamicToolProvider:
         input_content = await self.tool_handler(
             "loom_put_content", {"content": {"value": 3}, "media_type": "application/json"}
         )
-        operation_ref = "loom://test_double"
         await self.tool_handler(
             "loom_open_run",
             {
@@ -67,11 +71,18 @@ class DynamicToolProvider:
                 "ops": [{"kind": "materialize_capability_package_candidate", "value": {
                                                                                           "package_id": "remote-run-code",
                                                                                           "package_version": "v1",
+                                                                                          "package_type": "function",
                                                                                           "execution": {"kind": "process:json_stdio", "version": "1"},
-                                                                                          "body": {
-                                                                                              "operation_descriptor_ref": operation_ref,
-                                                                                              "program_content_ref": program["resource_ref"],
+                                                                                          "capability_exports": [{
+                                                                                              "capability_descriptor_ref": descriptor["resource_ref"],
                                                                                               "io_contract_ref": contract["resource_ref"],
+                                                                                              "effect_class": "Sandboxed",
+                                                                                              "permissions": [],
+                                                                                              "replay_safety": "DeclaredByPackage",
+                                                                                              "runtime_binding": {},
+                                                                                          }],
+                                                                                          "body": {
+                                                                                              "program_content_ref": program["resource_ref"],
                                                                                           },
                                                                                       }}]
             },
@@ -83,7 +94,7 @@ class DynamicToolProvider:
                 "ops": [{"kind": "bind_compute_hole", "value": {
                     "binding_id": "binding-dynamic",
                     "hole_id": "h_dynamic",
-                    "capability_descriptor_ref": {"resource_id": "executor://process:json_stdio/1"},
+                    "capability_descriptor_ref": descriptor["resource_ref"],
                     "capability_package_ref": {"resource_id": "capability-package://remote-run-code/v1"},
                     "target_resource_ref": {"resource_id": "slave-a"},
                 }}, {"kind": "set_execution_payload", "value": {"node_id": operation_ref, "input_ref": input_content["resource_ref"]}}]

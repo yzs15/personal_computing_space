@@ -51,6 +51,11 @@ def test_orchestration_program_rejects_imports_and_side_effect_calls():
 async def test_docker_executor_runs_orchestration_protocol():
     input_ref = _ref("content://sha256/" + "a" * 64, "a" * 64)
     package_ref = _ref("capability-package://summarize/v1", "b" * 64)
+    descriptor_ref = ResourceRef(
+        resource_id="loom://summarize",
+        version_or_digest="d" * 64,
+        identity_criterion="descriptor_digest",
+    )
     final_ref = _ref("content://sha256/" + "c" * 64, "c" * 64)
     program = (
         b'''
@@ -60,12 +65,17 @@ PACKAGE_REF = {
         + b"b" * 64
         + b'''",
 }
+DESCRIPTOR_REF = {
+    "resource_id": "loom://summarize",
+    "version_or_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "identity_criterion": "descriptor_digest",
+}
 
 
 async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> "ResourceRef":
     print("program stdout must not corrupt the protocol")
     document = await ctx.read_json(input_ref)
-    handle = ctx.emit_node(PACKAGE_REF, [input_ref])
+    handle = ctx.emit_node(PACKAGE_REF, DESCRIPTOR_REF, [input_ref])
     result_ref = await ctx.result(handle)
     assert document["partitions"] == [input_ref]
     return result_ref
@@ -77,8 +87,9 @@ async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> 
         assert ref == input_ref
         return {"partitions": [input_ref.model_dump(mode="json")]}
 
-    async def emit_node(package, inputs):
+    async def emit_node(package, descriptor, inputs):
         assert package == package_ref
+        assert descriptor == descriptor_ref
         assert inputs == [input_ref]
         return "node-1"
 
@@ -111,7 +122,7 @@ async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> 
             program,
             input_ref,
             read_json=lambda ref: {},
-            emit_node=lambda package, inputs: "unused",
+            emit_node=lambda package, descriptor, inputs: "unused",
             result=lambda handle: input_ref,
         )
 

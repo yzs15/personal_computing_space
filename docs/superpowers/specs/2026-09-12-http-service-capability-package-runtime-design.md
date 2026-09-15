@@ -3,7 +3,7 @@
 **日期：** 2026-09-13  
 **状态：** 设计草案，Phase 2  
 **前置：** [契约与 digest](2026-09-12-http-service-capability-package-contract-and-digest-design.md)  
-**后续：** [动态编排与高级 fencing](2026-09-12-http-service-capability-package-orchestration-and-fencing-design.md)
+**后续：** [按需动态编排、健康投影与 activation revision](2026-09-12-http-service-capability-package-orchestration-and-fencing-design.md)
 
 ## 1. 目标与边界
 
@@ -11,7 +11,7 @@
 
 Slave 主体只新增一次通用的进程外 runtime plugin host。以后新增或升级 runtime 时，operator 放入插件 bundle 并重启 Slave，不需要修改或重新构建 Slave 主体代码。首个插件是 `container-http-v1`；本阶段不为未出现的 runtime 设计额外扩展点。
 
-本阶段不修改 `NodeIntent`、`DynamicNode` 或 `emit_node`，不引入高级 runtime attestation、Slave 后台直报、`session_generation` 或运行中热插拔。这些内容见 Phase 3。
+本阶段不修改 `NodeIntent`、`DynamicNode` 或 `emit_node`，不引入 runtime attestation、Slave 后台直报、Observer 签发的 `activation_revision` 或运行中热插拔。这些能力按 Phase 3 的独立增量实施。
 
 ## 2. 进程模型
 
@@ -45,6 +45,8 @@ service  + container:http/1     -> RuntimePluginHost -> container-http-v1
 
 `container:python_orchestrator/1` 仍只属于 Driver；`module` 暂无执行实现。Slave 不创建通用 Handler 类层次，也不把长期容器生命周期塞入 `ExecutorAdapter.invoke()`。
 
+Driver 对 `container:python_orchestrator/1` 的特殊处理只解释编排程序并生成通用动态节点请求。普通能力包的 provision、dispatch 和 deprovision 一律走 runtime-neutral Worker API；inspect/reconcile 留在 Slave Core 与 runtime plugin 之间。新增 package contract 或 runtime plugin 不得增加 Driver 的 package-type/body 分支。
+
 ## 3. 插件 bundle 与发现
 
 ### 3.1 Bundle 布局
@@ -52,9 +54,11 @@ service  + container:http/1     -> RuntimePluginHost -> container-http-v1
 operator 将插件安装到只读目录：
 
 ```text
-/opt/loom/runtime-plugins/container-http-v1/
+/opt/loom/runtime-plugins/container_http_v1/
   plugin.toml
   bin/runtime-plugin
+  runtime.py
+  server.py
 ```
 
 `plugin.toml` 至少包含：
@@ -70,7 +74,7 @@ execution_kind = "container:http"
 execution_version = "1"
 ```
 
-插件目录和命令只能来自 operator 配置的插件根目录。CapabilityPackage、用户请求和 agent 均不能提供 executable、插件路径、socket 或 Docker 参数。拥有 Docker socket 的插件与 Slave 基础设施同等受信任，不属于普通能力代码。
+插件目录和命令只能来自 operator 配置的插件根目录。Bundle 自带具体 runtime 与协议 server，不导入 `loom_v2.slave`，也不复算 package digest；它只消费 Core 已验证的 JSON manifest。CapabilityPackage、用户请求和 agent 均不能提供 executable、插件路径、socket 或 Docker 参数。拥有 Docker socket 的插件与 Slave 基础设施同等受信任，不属于普通能力代码。
 
 ### 3.2 启动发现
 
@@ -78,7 +82,7 @@ Slave 启动时执行一次确定性发现：
 
 1. 按目录名排序读取直接子目录中的 `plugin.toml`；不递归搜索。
 2. 拒绝未知字段、绝对/越界 command、不可执行文件和不支持的 protocol version。
-3. `(package_type, execution_kind, execution_version)` 只能由一个插件提供；冲突时 Slave 启动失败，不按目录顺序覆盖。
+3. `(package_type, execution_kind, execution_version)` 只能由一个插件提供；冲突时 Slave 启动失败，不按目录顺序覆盖。该键也必须存在于 operator contract registry，且绑定 schema 不可变。
 4. 使用参数数组启动插件，不经过 shell；为每个实例分配仅 Core 和该插件可访问的私有 Unix socket 和最小环境变量。
 5. 等待 `/healthz` 和 `/v1/descriptor`，验证返回能力与 manifest 一致后才宣布支持该 execution contract。
 
@@ -133,9 +137,9 @@ details 只允许 identity、状态、HTTP status 和受限计数，不返回 cr
 | Slave Core | Runtime plugin |
 | --- | --- |
 | internal auth、Driver epoch、Worker lease、workspace/target | Docker/runtime/network probe |
-| package/ref/digest 唯一权威校验和 package 解析 | 使用 Core 签发的 package digest 核对 image/labels |
+| package/ref/digest、execution contract 和通用 export 唯一权威校验 | 使用 Core 签发的 package digest 核对 image/labels，并按受支持 execution contract 解释 body/runtime binding |
 | 通用 activation desired state 与幂等记录 | image inspect/pull 和 RepoDigest 校验 |
-| ComputeBinding、descriptor 所属关系 | 容器 create/start/inspect/stop/remove |
+| ComputeBinding、descriptor 是否属于 `capability_exports` | HTTP path 等 runtime binding、容器 create/start/inspect/stop/remove |
 | input/output schema、success validator | health endpoint 和业务 HTTP 调用 |
 | Attempt、ExecutionResult、ValidationEvidence、provenance | 返回结构化 runtime state/evidence |
 
@@ -166,7 +170,7 @@ operator 为插件配置专属 internal Docker network。插件进程运行在 S
 
 Core 先校验身份与契约并写入 `desired_state=running`，再调用插件：
 
-1. 插件确认请求由私有 Host 通道发出，并校验自己声明支持 `service + container:http/1`；package digest 已由 Core 验证。
+1. 插件确认请求由私有 Host 通道发出，并校验自己声明支持 package 的 type 和 execution；package digest 和 contract schema 已由 Core 验证。插件在任何 Docker mutation 前校验 HTTP path 唯一且不与 health path 冲突。
 2. probe Docker CLI/socket 和 internal network。
 3. inspect 本地镜像；缺失时精确 pull `image_ref`，随后验证 RepoDigest。
 4. 根据 workspace、Slave id 和 package digest 派生容器名。
@@ -179,7 +183,7 @@ Core 先校验身份与契约并写入 `desired_state=running`，再调用插件
 
 ### 6.3 Invoke
 
-Core 校验 activation、binding、input ref 和 input schema，再把精确 endpoint 与业务 JSON 发给插件。插件重新检查容器 labels/image digest 和 ready 状态，调用内部 `POST <path>`，并返回 HTTP status 与解析后的 JSON value。
+Core 校验 activation、binding、input ref 和 input schema，并确认 binding 的完整 descriptor ref 精确属于 package `capability_exports`，再把选中的完整 export 与业务 JSON 发给插件。Core 不读取 `runtime_binding`。插件重新检查 package contract、容器 labels/image digest 和 ready 状态，从 export 的 `runtime_binding.path` 解析入口，调用内部 `POST <path>`，并返回 HTTP status 与解析后的 JSON value。
 
 Core 负责 output schema、success validator、结果 ContentStore 写入、ValidationEvidence 和 provenance。请求可能已经到达服务后，timeout、连接中断和 5xx 不在同一 Attempt 内自动重放。
 
@@ -212,7 +216,7 @@ created_at / updated_at
 
 每个 activation key 使用一个异步 lock 串行化 lifecycle mutation；不同 activation 可以并行。数据库先写 desired state，再调用插件。插件返回的 `runtime_handle` 只能用于后续 inspect/invoke 提示，Core 仍以 package digest、target 和插件重新检查的 labels 为准。
 
-Phase 2 使用现有 Driver epoch 和 Worker lease。失去有效 lease 时停止接受 dispatch，并要求插件按部署策略停止受管容器。`session_generation` 和旧 manager 精确 fencing 在 Phase 3 引入。
+Phase 2 使用现有 Driver epoch 和 Worker lease，不引入 activation 级 revision。lease 失效不改变持久 desired state；是否在控制面长期失联后停止托管容器由独立、显式的部署策略决定。乱序 lifecycle command/report 的隔离在 Phase 3B 使用 Observer 签发的 `activation_revision` 实现。
 
 ## 8. API 和错误
 
@@ -249,6 +253,7 @@ runtime_plugin_capability_mismatch
 Slave Core 只新增通用插件配置：
 
 ```text
+LOOM_PACKAGE_CONTRACT_DIR             default /opt/loom/package-contracts
 LOOM_RUNTIME_PLUGIN_DIR              default /opt/loom/runtime-plugins
 LOOM_RUNTIME_PLUGIN_SOCKET_DIR       default /run/loom/runtime-plugins
 LOOM_RUNTIME_PLUGIN_STARTUP_TIMEOUT  default 10
@@ -266,19 +271,20 @@ LOOM_RUNTIME_PLUGIN_CALL_TIMEOUT     bounded by operation deadline
 - `slave/app.py`：startup/shutdown 管理 Host，Worker API 不出现 Docker 分支；
 - `runtime_plugins/container_http_v1/`：独立插件 bundle，包含 Docker/HTTP 实现；
 - `db/models.py`：runtime-neutral activation row；
-- `driver/worker.py`、`driver/service.py`：转发 runtime-neutral provision/deprovision；
-- `observer/repository.py`、`observer/app.py`：按 package type promotion/provision/deactivate；
+- `driver/worker.py`、`driver/service.py`：转发 runtime-neutral provision/dispatch/deprovision；除 `container:python_orchestrator/1` 编排入口外，不按 package type 分派或解析 package body；
+- `observer/repository.py`、`observer/app.py`：通过受信任 contract registry 和通用 capability exports 处理 promotion/provision/deactivate，不按 package type 分派；
 - Compose/deployment：挂载插件 bundle、socket 目录、Docker socket和 internal network。
 
-删除 generic provision 中的 `program_content_ref` 和对 `package.function_body` 的无条件访问。Slave Core 不导入 `container_http_v1` 模块，也不包含 Docker command、HTTP endpoint 或容器 label 的实现细节。
+删除 generic provision 中的 `program_content_ref`、对 `package.function_body` 的无条件访问，以及 Observer/Driver/Slave Core 中按 `service` 判断的路由分支。Slave Core 不导入 `container_http_v1` 模块，也不包含 Docker command、HTTP endpoint 或容器 label 的实现细节。
 
 ## 11. 测试与验收
 
-- manifest 未知字段、越界 command、重复 provider、协议版本错误和 descriptor 不匹配均拒绝。
+- manifest 未知字段、越界 command、重复 provider、协议版本错误、package contract 不匹配和 descriptor 不匹配均拒绝。
 - fake plugin process 验证启动、health handshake、超时、崩溃重启、协议错误隔离和 reconcile。
 - 不安装插件时函数执行正常；放入 bundle 并重启后才宣布 `service + container:http/1`。
+- 新增一个 fake package contract/runtime plugin 后，Driver 无源码改动即可完成 generic provision/dispatch/deprovision；测试应检查 Driver 不出现该 package 的类型或 body 分支。
 - Slave Core 测试不 import Docker plugin；插件替换不需要修改 Core 测试 fixture 或 Worker API。
 - recording Docker runner 验证 inspect-hit、pull-miss、digest mismatch、固定安全参数和无 host port/mount/socket。
-- provision 幂等、同名 identity conflict、endpoint 路由、schema/validator、response limit 和无隐式重放。
+- provision 幂等、同名 identity conflict、重复 path/health 冲突的 mutation 前拒绝、export 路由、schema/validator、response limit 和无隐式重放。
 - activation DB 重启恢复、desired stopped 不重建、deprovision 精确删除且不删除 image。
 - Compose E2E 使用真实 plugin process、dockerd 和测试镜像，覆盖两个 endpoint、Slave/plugin 重启恢复和 deactivate。

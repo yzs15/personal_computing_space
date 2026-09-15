@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from loom_v2.coding_agents.base import CodingAgentError, CodingAgentProvider
 from loom_v2.contracts.types import CapabilityDeprovisionCommand, CapabilityProvisionCommand, ComputeBinding, ResourceRef, TaskClosure
+from loom_v2.contracts.package_contracts import DRIVER_ORCHESTRATOR_KEY
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.driver.worker import WorkerSession
 from loom_v2.slave.service import SlaveService
@@ -679,8 +680,14 @@ class DriverService:
     def _ensure_orchestration_runtime(run_payload: dict[str, Any]) -> None:
         snapshot = run_payload.get("snapshot") if isinstance(run_payload, dict) else None
         systems = snapshot.get("program_systems") if isinstance(snapshot, dict) else None
+        execution = systems.get("execution") if isinstance(systems, dict) else None
         orchestration = bool(run_payload.get("orchestration")) or (
-            isinstance(systems, dict) and (systems.get("execution") or {}).get("kind") == "container:python_orchestrator"
+            isinstance(execution, dict)
+            and (
+                str(execution.get("kind") or ""),
+                str(execution.get("version") or ""),
+            )
+            == DRIVER_ORCHESTRATOR_KEY[1:]
         )
         if orchestration and shutil.which("docker") is None:
             raise RuntimeError("orchestrator_runtime_unavailable")
@@ -704,7 +711,10 @@ class DriverService:
         if not snapshot_payload:
             return
         snapshot = TaskClosure.model_validate(snapshot_payload)
-        if snapshot.program_systems.execution.kind == "container:python_orchestrator":
+        if (
+            snapshot.program_systems.execution.kind,
+            snapshot.program_systems.execution.version,
+        ) == DRIVER_ORCHESTRATOR_KEY[1:]:
             assert self.remote_repository is not None
             await self.remote_repository.refresh_slaves()
             runtime = DynamicOrchestrationRuntime(
@@ -728,15 +738,26 @@ class DriverService:
         binding = snapshot.compute_bindings[0] if snapshot.compute_bindings else None
         if binding is not None and binding.capability_package_ref is not None and self.remote_repository is not None:
             package = await self.remote_repository.get_capability_package(binding.capability_package_ref, run_id=run_id)
+            idempotency_key = f"run-{execution_id}-{package.package_digest}-{target}"
+            desired = await self.remote_repository.set_capability_desired(
+                binding.capability_package_ref,
+                target,
+                desired_state="running",
+                idempotency_key=idempotency_key,
+                run_id=run_id,
+                activation_closure_version_ref=(current.get("committed") or {}).get("version_id") or package.package_closure_version_ref,
+                compute_binding_ref=binding.binding_id,
+            )
             provision_command = CapabilityProvisionCommand(
                 command_id=f"provision-{package.package_id}-{target}",
-                package_version_ref=f"{package.package_id}:{package.package_version}",
+                package_version_ref=package.version_ref,
                 package_digest=package.package_digest,
                 target_slave=target,
                 workspace_id=getattr(control, "workspace_id", "workspace-default"),
                 activation_closure_version_ref=(current.get("committed") or {}).get("version_id") or package.package_closure_version_ref,
                 compute_binding=binding,
-                idempotency_key=f"run-{execution_id}-{package.package_digest}-{target}",
+                idempotency_key=desired.last_idempotency_key,
+                activation_revision=desired.activation_revision,
             )
             report = await worker.provision(
                 command=provision_command,
@@ -783,15 +804,25 @@ class DriverService:
         if worker is None:
             raise RuntimeError("slave_not_found")
         package = await self.remote_repository.get_capability_package(package_ref)
+        requested_idempotency_key = idempotency_key or f"promote-{package.package_digest}-{target_slave}"
+        desired = await self.remote_repository.set_capability_desired(
+            package.version_ref,
+            target_slave,
+            desired_state="running",
+            idempotency_key=requested_idempotency_key,
+            activation_closure_version_ref=package.package_closure_version_ref,
+            compute_binding_ref=compute_binding.binding_id if compute_binding is not None else "",
+        )
         command = CapabilityProvisionCommand(
             command_id=f"provision-{package.package_id}-{target_slave}",
-            package_version_ref=f"{package.package_id}:{package.package_version}",
+            package_version_ref=package.version_ref,
             package_digest=package.package_digest,
             target_slave=target_slave,
             workspace_id=self.control_client.workspace_id,
             activation_closure_version_ref=package.package_closure_version_ref,
             compute_binding=compute_binding,
-            idempotency_key=idempotency_key or f"promote-{package.package_digest}-{target_slave}",
+            idempotency_key=desired.last_idempotency_key,
+            activation_revision=desired.activation_revision,
         )
         report = await worker.provision(
             command=command,
@@ -814,7 +845,7 @@ class DriverService:
         approved_digest: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Stop one exact service package activation on a Slave."""
+        """Stop one exact package activation on a Slave."""
         if self.control_client is None or self.remote_repository is None:
             raise RuntimeError("driver_control_unavailable")
         await self._refresh_remote_workers()
@@ -822,17 +853,23 @@ class DriverService:
         if worker is None:
             raise RuntimeError("slave_not_found")
         package = await self.remote_repository.get_capability_package(package_ref)
-        if package.package_type != "service":
-            raise RuntimeError("unsupported_deprovision_contract")
         if approved_digest is not None and approved_digest.lower() != package.package_digest.lower():
             raise RuntimeError("capability_package_digest_mismatch")
+        requested_idempotency_key = idempotency_key or f"deactivate-{package.package_digest}-{target_slave}"
+        desired = await self.remote_repository.set_capability_desired(
+            package.version_ref,
+            target_slave,
+            desired_state="stopped",
+            idempotency_key=requested_idempotency_key,
+        )
         command = CapabilityDeprovisionCommand(
             command_id=f"deprovision-{package.package_id}-{target_slave}",
-            package_version_ref=f"{package.package_id}:{package.package_version}",
+            package_version_ref=package.version_ref,
             package_digest=package.package_digest,
             target_slave=target_slave,
             workspace_id=self.control_client.workspace_id,
-            idempotency_key=idempotency_key or f"deactivate-{package.package_digest}-{target_slave}",
+            idempotency_key=desired.last_idempotency_key,
+            activation_revision=desired.activation_revision,
         )
         report = await worker.deprovision(
             command=command,
@@ -957,7 +994,10 @@ class DriverService:
         execution_id = record.execution_id
         execution_epoch = record.execution_epoch
         snapshot = record.committed.snapshot if record.committed is not None else TaskClosure.minimal()
-        if snapshot.program_systems.execution.kind == "container:python_orchestrator":
+        if (
+            snapshot.program_systems.execution.kind,
+            snapshot.program_systems.execution.version,
+        ) == DRIVER_ORCHESTRATOR_KEY[1:]:
             runtime = DynamicOrchestrationRuntime(
                 repository=self.repository,
                 executor=self.orchestration_executor,
@@ -999,15 +1039,26 @@ class DriverService:
             if worker is not None:
                 if binding is not None and binding.capability_package_ref is not None:
                     package = await self.repository.get_capability_package(binding.capability_package_ref, run_id=run_id)
+                    idempotency_key = f"run-{execution_id}-{package.package_digest}-{target}"
+                    desired = await self.repository.set_capability_desired(
+                        binding.capability_package_ref,
+                        target,
+                        desired_state="running",
+                        idempotency_key=idempotency_key,
+                        run_id=run_id,
+                        activation_closure_version_ref=record.committed.version_id if record.committed else package.package_closure_version_ref,
+                        compute_binding_ref=binding.binding_id,
+                    )
                     command = CapabilityProvisionCommand(
                         command_id=f"provision-{package.package_id}-{target}",
-                        package_version_ref=f"{package.package_id}:{package.package_version}",
+                        package_version_ref=package.version_ref,
                         package_digest=package.package_digest,
                         target_slave=target,
                         workspace_id=record.closure_contract.workspace_id if record.closure_contract else "workspace-default",
                         activation_closure_version_ref=record.committed.version_id if record.committed else package.package_closure_version_ref,
                         compute_binding=binding,
-                        idempotency_key=f"run-{execution_id}-{package.package_digest}-{target}",
+                        idempotency_key=desired.last_idempotency_key,
+                        activation_revision=desired.activation_revision,
                     )
                     report = await worker.provision(command=command, package=package, driver_id=getattr(self.control_client, "driver_id", None), driver_epoch=getattr(self.control_client, "driver_epoch", None))
                     await self.repository.record_capability_health(report, run_id=run_id)
@@ -1030,15 +1081,26 @@ class DriverService:
                     raise RuntimeError(f"capability_unavailable:{target}")
                 if binding is not None and binding.capability_package_ref is not None:
                     package = await self.repository.get_capability_package(binding.capability_package_ref, run_id=run_id)
+                    idempotency_key = f"run-{execution_id}-{package.package_digest}-{target}"
+                    desired = await self.repository.set_capability_desired(
+                        binding.capability_package_ref,
+                        target,
+                        desired_state="running",
+                        idempotency_key=idempotency_key,
+                        run_id=run_id,
+                        activation_closure_version_ref=record.committed.version_id if record.committed else package.package_closure_version_ref,
+                        compute_binding_ref=binding.binding_id,
+                    )
                     command = CapabilityProvisionCommand(
                         command_id=f"provision-{package.package_id}-{target}",
-                        package_version_ref=f"{package.package_id}:{package.package_version}",
+                        package_version_ref=package.version_ref,
                         package_digest=package.package_digest,
                         target_slave=target,
                         workspace_id=record.closure_contract.workspace_id if record.closure_contract else "workspace-default",
                         activation_closure_version_ref=record.committed.version_id if record.committed else package.package_closure_version_ref,
                         compute_binding=binding,
-                        idempotency_key=f"run-{execution_id}-{package.package_digest}-{target}",
+                        idempotency_key=desired.last_idempotency_key,
+                        activation_revision=desired.activation_revision,
                     )
                     report = await slave.provision(command, package)
                     await self.repository.record_capability_health(report, run_id=run_id)

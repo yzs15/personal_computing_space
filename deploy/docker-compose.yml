@@ -75,11 +75,14 @@ services:
       LOOM_S3_ACCESS_KEY: loom
       LOOM_S3_SECRET_KEY: loom-content-secret
       LOOM_S3_REGION: us-east-1
+      LOOM_PACKAGE_CONTRACT_DIR: /opt/loom/package-contracts
     secrets: [internal_api_secret]
     depends_on:
       observer-db: {condition: service_healthy}
       minio-init: {condition: service_completed_successfully}
     ports: ["18080:8080"]
+    volumes:
+      - ../package_contracts:/opt/loom/package-contracts:ro
 
   driver:
     build:
@@ -110,6 +113,7 @@ services:
       LOOM_S3_ACCESS_KEY: loom
       LOOM_S3_SECRET_KEY: loom-content-secret
       LOOM_S3_REGION: us-east-1
+      LOOM_PACKAGE_CONTRACT_DIR: /opt/loom/package-contracts
     secrets: [internal_api_secret]
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -117,6 +121,7 @@ services:
       - ${LOOM_WORKSPACE_PATH:-..}:/workspace
       - driver-codex-state:/var/lib/loom/codex
       - ${LOOM_CODEX_MODEL_CATALOG_PATH:-../../.codex/model_catalog.json}:/var/lib/loom/codex/model_catalog.json:ro
+      - ../package_contracts:/opt/loom/package-contracts:ro
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       minio-init: {condition: service_completed_successfully}
@@ -135,6 +140,7 @@ services:
       LOOM_S3_ACCESS_KEY: loom
       LOOM_S3_SECRET_KEY: loom-content-secret
       LOOM_S3_REGION: us-east-1
+      LOOM_PACKAGE_CONTRACT_DIR: /opt/loom/package-contracts
       LOOM_RUNTIME_PLUGIN_DIR: /opt/loom/runtime-plugins
       LOOM_RUNTIME_PLUGIN_SOCKET_DIR: /run/loom/runtime-plugins
       LOOM_RUNTIME_PLUGIN_NETWORK: loom-internal
@@ -148,6 +154,7 @@ services:
       minio-init: {condition: service_completed_successfully}
     volumes:
       - ../runtime_plugins:/opt/loom/runtime-plugins:ro
+      - ../package_contracts:/opt/loom/package-contracts:ro
       - slave-a-runtime-plugin-sockets:/run/loom/runtime-plugins
       - /var/run/docker.sock:/var/run/docker.sock
     networks: [default, loom-internal]
@@ -166,6 +173,7 @@ services:
       LOOM_S3_ACCESS_KEY: loom
       LOOM_S3_SECRET_KEY: loom-content-secret
       LOOM_S3_REGION: us-east-1
+      LOOM_PACKAGE_CONTRACT_DIR: /opt/loom/package-contracts
       LOOM_RUNTIME_PLUGIN_DIR: /opt/loom/runtime-plugins
       LOOM_RUNTIME_PLUGIN_SOCKET_DIR: /run/loom/runtime-plugins
       LOOM_RUNTIME_PLUGIN_NETWORK: loom-internal
@@ -179,6 +187,7 @@ services:
       minio-init: {condition: service_completed_successfully}
     volumes:
       - ../runtime_plugins:/opt/loom/runtime-plugins:ro
+      - ../package_contracts:/opt/loom/package-contracts:ro
       - slave-b-runtime-plugin-sockets:/run/loom/runtime-plugins
       - /var/run/docker.sock:/var/run/docker.sock
     networks: [default, loom-internal]

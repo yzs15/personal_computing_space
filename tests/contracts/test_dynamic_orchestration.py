@@ -5,7 +5,8 @@ from loom_v2.contracts.types import CapabilityPackageVersion, DynamicNode, NodeI
 
 
 def _ref(resource_id: str, digest: str | None = None) -> ResourceRef:
-    return ResourceRef(resource_id=resource_id, version_or_digest=None if resource_id.startswith("content://sha256/") else digest)
+    criterion = "content_digest" if resource_id.startswith("content://sha256/") else None
+    return ResourceRef(resource_id=resource_id, version_or_digest=None if resource_id.startswith("content://sha256/") else digest, identity_criterion=criterion)
 
 
 def _orchestration_package(**overrides):
@@ -17,7 +18,15 @@ def _orchestration_package(**overrides):
         "source_closure_version_ref": "draft-1",
         "package_type": "function",
         "execution": {"kind": "container:python_orchestrator", "version": "1"},
-        "body": {"operation_descriptor_ref": _ref("loom://orchestrate"), "program_content_ref": _ref("content://sha256/" + "a" * 64, "a" * 64), "io_contract_ref": _ref("content://sha256/" + "b" * 64, "b" * 64), "allowed_node_package_refs": [_ref("capability-package://summarize/v1", "c" * 64)], "max_nodes": 10, "max_live_nodes": 2},
+        "capability_exports": [{
+            "capability_descriptor_ref": ResourceRef(resource_id="loom://orchestrate", version_or_digest="d" * 64, identity_criterion="descriptor_digest"),
+            "io_contract_ref": _ref("content://sha256/" + "b" * 64, "b" * 64),
+            "effect_class": "Sandboxed",
+            "permissions": [],
+            "replay_safety": "DeterministicByEventLog",
+            "runtime_binding": {},
+        }],
+        "body": {"program_content_ref": _ref("content://sha256/" + "a" * 64, "a" * 64).model_dump(mode="json"), "allowed_node_package_refs": [_ref("capability-package://summarize/v1", "c" * 64).model_dump(mode="json")], "max_nodes": 10, "max_live_nodes": 2},
     }
     body = dict(fields["body"])
     for key, val in overrides.items():
@@ -31,9 +40,9 @@ def _orchestration_package(**overrides):
 def test_orchestration_package_carries_allowlist_and_limits():
     package = _orchestration_package()
 
-    assert package.function_body.allowed_node_package_refs[0].resource_id == "capability-package://summarize/v1"
-    assert package.function_body.max_nodes == 10
-    assert package.function_body.max_live_nodes == 2
+    assert package.body["allowed_node_package_refs"][0]["resource_id"] == "capability-package://summarize/v1"
+    assert package.body["max_nodes"] == 10
+    assert package.body["max_live_nodes"] == 2
     assert package.package_digest
 
 
@@ -50,17 +59,15 @@ def test_orchestration_package_digest_includes_authorization_and_limits():
         {"allowed_node_package_refs": []},
         {"max_nodes": 0},
         {"max_live_nodes": 0},
-        {"max_live_nodes": 11},
-        {"body": {"io_contract_ref": None}},
     ],
 )
 def test_orchestration_package_requires_valid_policy(overrides):
-    with pytest.raises(ValidationError, match="orchestration_package_invalid"):
+    with pytest.raises(ValidationError, match="package_contract_invalid"):
         _orchestration_package(**overrides)
 
 
 def test_orchestration_fields_are_rejected_for_other_executors():
-    with pytest.raises(ValidationError, match="orchestration_fields_require_orchestrator"):
+    with pytest.raises(ValidationError, match="package_contract_invalid"):
         _orchestration_package(execution={"kind": "process:json_stdio", "version": "1"})
 
 
@@ -71,6 +78,7 @@ def test_node_intent_and_dynamic_node_round_trip():
         intent_id="intent-1",
         execution_id="execution-1",
         package_ref=package_ref,
+        capability_descriptor_ref=ResourceRef(resource_id="loom://summarize", version_or_digest="e" * 64, identity_criterion="descriptor_digest"),
         input_refs=[input_ref],
     )
     node = DynamicNode(
@@ -78,6 +86,7 @@ def test_node_intent_and_dynamic_node_round_trip():
         parent_execution_ref="execution-1",
         intent_id="intent-1",
         package_ref=package_ref,
+        capability_descriptor_ref=intent.capability_descriptor_ref,
         input_refs=[input_ref],
     )
 

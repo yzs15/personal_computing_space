@@ -38,7 +38,7 @@ class RunCodeFixture:
         input_refs: list[ResourceRef] | None = None,
         closure_id: str = "closure-run-code",
     ) -> TaskClosure:
-        contract_ref = io_contract_ref or self.package.function_body.io_contract_ref
+        contract_ref = io_contract_ref or self.package.capability_exports[0].io_contract_ref
         assert contract_ref is not None
         hole = TypedHole(
             hole_id=self.binding.hole_id,
@@ -78,8 +78,16 @@ async def make_run_code_fixture(
         )
     else:
         contract_ref = io_contract_ref
+    from loom_v2.digest import digest_json
+
+    descriptor_payload = {
+        "schema_version": "operation.v1",
+        "resource_id": f"loom://{operation}",
+        "name": operation,
+    }
     operation_ref = ResourceRef(
         resource_id=f"loom://{operation}",
+        version_or_digest=digest_json(descriptor_payload, domain="loom/operation-descriptor/v1"),
         identity_criterion="descriptor_digest",
     )
     package = CapabilityPackageVersion(
@@ -89,18 +97,22 @@ async def make_run_code_fixture(
         source_run_ref="test-run",
         source_closure_version_ref="test-closure-v1",
         execution={"kind": "process:json_stdio", "version": "1"},
-        body={
-            "operation_descriptor_ref": operation_ref,
-            "program_content_ref": program_ref,
+        capability_exports=[{
+            "capability_descriptor_ref": operation_ref,
             "io_contract_ref": contract_ref,
+            "effect_class": "Sandboxed",
+            "permissions": [],
+            "replay_safety": "DeclaredByPackage",
+            "runtime_binding": {},
+        }],
+        body={
+            "program_content_ref": program_ref.model_dump(mode="json"),
         },
     )
     binding = ComputeBinding(
         binding_id=f"binding-{operation}",
         hole_id=f"hole-{operation}",
-        capability_descriptor_ref=ResourceRef(
-            resource_id="executor://process:json_stdio/1",
-        ),
+        capability_descriptor_ref=operation_ref,
         capability_package_ref=ResourceRef(
             resource_id=package.version_ref,
             version_or_digest=package.package_digest,
@@ -125,6 +137,8 @@ async def provision_run_code_fixture(
             package_version_ref=fixture.package.version_ref,
             package_digest=fixture.package.package_digest,
             target_slave=service.slave_id,
+            idempotency_key=f"provision-{fixture.package.package_id}",
+            activation_revision=1,
         ),
         fixture.package,
     )

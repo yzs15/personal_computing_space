@@ -74,8 +74,17 @@ async def test_control_client_lists_capability_packages():
         "package_closure_version_ref": "package-closure-1",
         "source_run_ref": "run-1",
         "source_closure_version_ref": "committed-1",
-        "body": {"operation_descriptor_ref": "loom://summarize", "program_content_ref": {"resource_id": "content://sha256/program"}, "io_contract_ref": {"resource_id": "content://sha256/io"}},
+        "package_type": "function",
         "execution": {"kind": "process:json_stdio", "version": "1"},
+        "capability_exports": [{
+            "capability_descriptor_ref": {"resource_id": "loom://summarize", "version_or_digest": "a" * 64, "identity_criterion": "descriptor_digest"},
+            "io_contract_ref": {"resource_id": "content://sha256/" + "b" * 64, "identity_criterion": "content_digest"},
+            "effect_class": "Sandboxed",
+            "permissions": [],
+            "replay_safety": "DeclaredByPackage",
+            "runtime_binding": {},
+        }],
+        "body": {"program_content_ref": {"resource_id": "content://sha256/" + "c" * 64, "identity_criterion": "content_digest"}},
     }
     transport = RecordingTransport(httpx.Response(200, json={"packages": [package]}))
     client = ObserverControlClient(

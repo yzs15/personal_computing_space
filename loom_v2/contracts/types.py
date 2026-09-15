@@ -4,9 +4,10 @@ import json
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from .constraints import Constraint, ConstraintRef
+from .package_contracts import package_contract_registry
 from .terms import TypedTerm
 from loom_v2.digest import digest_json
 
@@ -24,12 +25,18 @@ class ResourceRef(ContractModel):
 
     @model_validator(mode="after")
     def validate_identity(self) -> "ResourceRef":
-        if self.resource_id.startswith("content://sha256/") and self.version_or_digest is not None:
+        if (
+            self.resource_id.startswith("content://sha256/")
+            and self.version_or_digest is not None
+            and self.identity_criterion != "descriptor_digest"
+        ):
             raise ValueError("redundant_content_digest")
         return self
 
     @property
     def digest(self) -> str | None:
+        if self.identity_criterion == "descriptor_digest" and self.version_or_digest:
+            return self.version_or_digest.lower()
         if self.resource_id.startswith("content://sha256/"):
             return self.resource_id.removeprefix("content://sha256/").lower()
         return self.version_or_digest.lower() if self.version_or_digest else None
@@ -161,110 +168,44 @@ class ComputeBinding(ContractModel):
     activation_ref: str | None = None
 
 
-class CapabilityPackageBody(ContractModel):
-    """Marker base for package-specific bodies."""
+class CapabilityExport(ContractModel):
+    """Runtime-neutral operation projection exported by a package."""
 
-
-class FunctionCapabilityPackageBody(CapabilityPackageBody):
-    operation_descriptor_ref: ResourceRef | str
-    program_content_ref: ResourceRef
-    io_contract_ref: ResourceRef | None = None
-    effective_constraint_refs: list[ConstraintRef] = Field(default_factory=list)
-    provider_fillable_hole_refs: list[str] = Field(default_factory=list)
-    effect_class: str = "Sandboxed"
-    permissions: list[str] = Field(default_factory=list)
-    replay_safety: str = "DeclaredByPackage"
-    captures_run_state: bool = False
-    captured_secret_refs: list[str] = Field(default_factory=list)
-    captured_path_refs: list[str] = Field(default_factory=list)
-    semantic_closed: bool = True
-    allowed_node_package_refs: list[ResourceRef] = Field(default_factory=list)
-    max_nodes: int | None = None
-    max_live_nodes: int | None = None
-
-    @property
-    def program_digest(self) -> str:
-        return self.program_content_ref.digest or ""
-
-
-class HttpServiceEndpoint(ContractModel):
-    endpoint_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
-    operation_descriptor_ref: ResourceRef
-    path: str
+    capability_descriptor_ref: ResourceRef
     io_contract_ref: ResourceRef
     effect_class: str
     permissions: list[str] = Field(default_factory=list)
     replay_safety: str
+    runtime_binding: dict[str, JsonValue] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def validate_refs(self) -> "HttpServiceEndpoint":
-        descriptor_digest = self.operation_descriptor_ref.digest
-        if not self.operation_descriptor_ref.resource_id or self.operation_descriptor_ref.identity_criterion != "descriptor_digest" or not _is_sha256(descriptor_digest):
-            raise ValueError("service_operation_descriptor_invalid")
+    def validate_refs(self) -> "CapabilityExport":
+        descriptor_digest = self.capability_descriptor_ref.version_or_digest
+        if (
+            not self.capability_descriptor_ref.resource_id
+            or self.capability_descriptor_ref.identity_criterion != "descriptor_digest"
+            or not _is_sha256(descriptor_digest)
+        ):
+            raise ValueError("capability_descriptor_invalid")
         if (
             self.io_contract_ref.identity_criterion != "content_digest"
-            or not self.io_contract_ref.resource_id.startswith("content://sha256/")
-            or not _is_sha256(self.io_contract_ref.digest)
+            or not re.fullmatch(
+                r"content://sha256/[0-9a-f]{64}", self.io_contract_ref.resource_id
+            )
+            or self.io_contract_ref.version_or_digest is not None
         ):
-            raise ValueError("service_io_contract_ref_invalid")
-        _validate_http_path(self.path, "service_endpoint_path_invalid")
-        return self
-
-
-class ServiceCapabilityPackageBody(CapabilityPackageBody):
-    """Strict body for a long-lived, multi-endpoint HTTP capability service."""
-
-    image_ref: str
-    container_port: int = Field(ge=1, le=65535)
-    health_path: str
-    endpoints: list[HttpServiceEndpoint] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def validate_service(self) -> "ServiceCapabilityPackageBody":
-        if not re.fullmatch(r"[^@/]+(?:/[^@/]+)*/[^@/]+@sha256:[0-9a-f]{64}", self.image_ref):
-            raise ValueError("service_image_ref_invalid")
-        _validate_http_path(self.health_path, "service_health_path_invalid")
-        ids = [endpoint.endpoint_id for endpoint in self.endpoints]
-        paths = [endpoint.path for endpoint in self.endpoints]
-        descriptors = [(endpoint.operation_descriptor_ref.digest or "").lower() for endpoint in self.endpoints]
-        if len(set(ids)) != len(ids) or len(set(paths)) != len(paths) or len(set(descriptors)) != len(descriptors):
-            raise ValueError("service_endpoint_duplicate")
-        if self.health_path in paths:
-            raise ValueError("service_health_endpoint_conflict")
+            raise ValueError("capability_io_contract_ref_invalid")
+        if len(self.permissions) != len(set(self.permissions)):
+            raise ValueError("capability_permissions_duplicate")
         return self
 
 
 def _is_sha256(value: str | None) -> bool:
-    return bool(value and re.fullmatch(r"[0-9a-fA-F]{64}", value))
-
-
-def _validate_http_path(value: str, error: str) -> None:
-    # v1 paths are origin-form paths only; query, fragment, host and scheme
-    # are not part of an endpoint identity.
-    if (
-        not value.startswith("/")
-        or "?" in value
-        or "#" in value
-        or "://" in value
-        or "\\" in value
-        or any(ord(char) <= 0x20 or ord(char) == 0x7F for char in value)
-    ):
-        raise ValueError(error)
-
-
-class PythonModuleCapabilityPackageBody(CapabilityPackageBody):
-    module_content_ref: ResourceRef
-    exported_symbols: list[str] = Field(default_factory=list)
-    dependency_manifest: dict[str, Any] = Field(default_factory=dict)
+    return bool(value and re.fullmatch(r"[0-9a-f]{64}", value))
 
 
 class CapabilityPackageVersion(ContractModel):
-    """Immutable package envelope with a type-specific body.
-
-    New wire data uses ``package_type``, ``execution`` and ``body``.  The body
-    is owned by the package type and is intentionally not flattened into this
-    envelope.
-    """
+    """Immutable runtime-neutral package envelope."""
 
     package_type: str = "function"
     package_id: str
@@ -276,59 +217,51 @@ class CapabilityPackageVersion(ContractModel):
     publication_state: Literal["candidate", "published", "abandoned"] = "candidate"
     provenance: list[dict[str, Any]] = Field(default_factory=list)
     execution: ExecutionContract = Field(default_factory=ExecutionContract)
-    body: FunctionCapabilityPackageBody | ServiceCapabilityPackageBody | PythonModuleCapabilityPackageBody
+    capability_exports: list[CapabilityExport] = Field(min_length=1)
+    body: dict[str, JsonValue]
     package_digest: str = ""
 
-    @model_validator(mode="before")
-    @classmethod
-    def parse_body(cls, value: Any) -> Any:
-        if not isinstance(value, dict):
-            return value
-        body_types = {
-            "function": FunctionCapabilityPackageBody,
-            "service": ServiceCapabilityPackageBody,
-            "module": PythonModuleCapabilityPackageBody,
-        }
-        package_type = value.get("package_type", "function")
-        if package_type not in body_types:
-            raise ValueError(f"unsupported_package_type:{package_type}")
-        if "body" in value:
-            return {**value, "body": body_types[package_type].model_validate(value["body"])}
-        return value
-
     @model_validator(mode="after")
-    def validate_orchestration_policy(self) -> "CapabilityPackageVersion":
-        if self.package_type == "service":
-            if self.execution.kind != "container:http" or self.execution.version != "1":
-                raise ValueError("unsupported_execution_contract")
-            if not isinstance(self.body, ServiceCapabilityPackageBody):
-                raise ValueError("service_package_body_invalid")
-            return self
-        if not isinstance(self.body, FunctionCapabilityPackageBody):
-            return self
-        body = self.function_body
-        fields_set = bool(body.allowed_node_package_refs or body.max_nodes is not None or body.max_live_nodes is not None)
-        if self.execution.kind != "container:python_orchestrator":
-            if fields_set:
-                raise ValueError("orchestration_fields_require_orchestrator")
-            return self
-        if (
-            not body.allowed_node_package_refs
-            or body.max_nodes is None
-            or body.max_live_nodes is None
-            or body.max_nodes <= 0
-            or body.max_live_nodes <= 0
-            or body.max_live_nodes > body.max_nodes
-            or body.io_contract_ref is None
-        ):
-            raise ValueError("orchestration_package_invalid")
+    def validate_contract(self) -> "CapabilityPackageVersion":
+        descriptor_keys = [
+            (item.capability_descriptor_ref.resource_id, item.capability_descriptor_ref.digest)
+            for item in self.capability_exports
+        ]
+        if len(descriptor_keys) != len(set(descriptor_keys)):
+            raise ValueError("capability_export_duplicate")
+        package_contract_registry.validate(
+            (self.package_type, self.execution.kind, self.execution.version),
+            self.model_dump(
+                mode="json",
+                include={"package_type", "execution", "capability_exports", "body"},
+            ),
+        )
         return self
 
-    @property
-    def function_body(self) -> FunctionCapabilityPackageBody:
-        if not isinstance(self.body, FunctionCapabilityPackageBody):
-            raise TypeError(f"package_type_has_no_function_body:{self.package_type}")
-        return self.body
+    def export_for(self, descriptor_ref: ResourceRef) -> CapabilityExport:
+        # Descriptor refs are a distinct identity class.  Do not accept a
+        # bare resource id or a digest carried under another criterion just
+        # because its derived ``digest`` happens to match an export.  This is
+        # the boundary that keeps a dynamic node bound to the exact public
+        # capability export selected by the caller.
+        if (
+            descriptor_ref.identity_criterion != "descriptor_digest"
+            or not descriptor_ref.resource_id
+            or not _is_sha256(descriptor_ref.version_or_digest)
+        ):
+            raise ValueError("capability_descriptor_invalid")
+        matches = [
+            item
+            for item in self.capability_exports
+            if item.capability_descriptor_ref.resource_id == descriptor_ref.resource_id
+            and item.capability_descriptor_ref.identity_criterion
+            == descriptor_ref.identity_criterion
+            and item.capability_descriptor_ref.version_or_digest
+            == descriptor_ref.version_or_digest
+        ]
+        if len(matches) != 1:
+            raise ValueError("capability_export_not_found")
+        return matches[0]
 
     @property
     def version_ref(self) -> str:
@@ -349,18 +282,40 @@ class CapabilityPackageVersion(ContractModel):
 
     def _identity_payload(self) -> dict[str, Any]:
         """Immutable execution identity; lifecycle/provenance are excluded."""
-        payload = self.model_dump(mode="json", include={"package_type", "execution", "body"})
+        payload = self.model_dump(mode="json", include={"package_type", "execution", "capability_exports", "body"})
+        resource_ref_fields = {
+            "resource_id",
+            "version_or_digest",
+            "access_binding",
+            "identity_criterion",
+            "provenance",
+        }
 
         def normalize(value: Any, key: str | None = None) -> Any:
             if isinstance(value, dict):
                 # ResourceRef carries deployment-local access/provenance data;
                 # only its immutable identity belongs in package_digest.
-                if "resource_id" in value:
+                # Do not infer a ref from ``resource_id`` alone when the
+                # object also has contract-specific fields: a plugin body is
+                # allowed to use that ordinary property name, and discarding
+                # its siblings would create digest collisions.
+                if "resource_id" in value and set(value) <= resource_ref_fields:
                     resource_id = str(value.get("resource_id") or "")
                     version_or_digest = value.get("version_or_digest")
                     if resource_id.startswith("content://sha256/"):
                         resource_id = resource_id.lower()
-                        version_or_digest = None
+                        # A content-backed operation descriptor has two
+                        # distinct hashes: the ContentStore object identity
+                        # in resource_id and the domain-separated descriptor
+                        # identity in version_or_digest. Preserve both.
+                        if value.get("identity_criterion") == "descriptor_digest":
+                            version_or_digest = (
+                                str(version_or_digest).lower()
+                                if version_or_digest is not None
+                                else None
+                            )
+                        else:
+                            version_or_digest = None
                     elif isinstance(version_or_digest, str) and re.fullmatch(r"[0-9a-fA-F]{64}", version_or_digest):
                         version_or_digest = version_or_digest.lower()
                     return {
@@ -371,12 +326,26 @@ class CapabilityPackageVersion(ContractModel):
                 return {item_key: normalize(item, item_key) for item_key, item in value.items()}
             if isinstance(value, list):
                 normalized = [normalize(item, key) for item in value]
-                # Endpoint and permission/ref lists have set-like identity in
-                # the service manifest.  Canonical ordering prevents a
-                # harmless input reorder from changing package identity.
-                if key == "endpoints":
-                    normalized.sort(key=lambda item: str(item.get("endpoint_id", "")) if isinstance(item, dict) else str(item))
-                elif key in {"permissions", "provider_fillable_hole_refs", "allowed_node_package_refs", "captured_secret_refs", "captured_path_refs", "effective_constraint_refs"}:
+                # Capability exports and common permission lists have set
+                # semantics. Package-specific body arrays retain the order
+                # declared by their contract.
+                if key == "capability_exports":
+                    normalized.sort(
+                        key=lambda item: (
+                            str((item.get("capability_descriptor_ref") or {}).get("resource_id", "")),
+                            str((item.get("capability_descriptor_ref") or {}).get("version_or_digest", "")),
+                        )
+                        if isinstance(item, dict)
+                        else str(item)
+                    )
+                elif key in {
+                    "permissions",
+                    "provider_fillable_hole_refs",
+                    "allowed_node_package_refs",
+                    "captured_secret_refs",
+                    "captured_path_refs",
+                    "effective_constraint_refs",
+                }:
                     normalized.sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
                 return normalized
             return value
@@ -390,7 +359,9 @@ class CapabilityPackageActivation(ContractModel):
     target_slave: str
     activation_closure_version_ref: str
     compute_binding_ref: str
-    session_generation: int = 1
+    desired_state: Literal["running", "stopped"]
+    activation_revision: int = Field(ge=1)
+    last_idempotency_key: str
     evidence_refs: list[str] = Field(default_factory=list)
     activation_state: Literal[
         "not_installed", "provisioning", "ready", "degraded", "stopped", "failed", "lost"
@@ -416,8 +387,8 @@ class CapabilityProvisionCommand(ContractModel):
     workspace_id: str = "workspace-default"
     activation_closure_version_ref: str = ""
     compute_binding: ComputeBinding | None = None
-    idempotency_key: str = ""
-    session_generation: int = 1
+    idempotency_key: str = Field(min_length=1)
+    activation_revision: int = Field(ge=1)
 
 
 class CapabilityDeprovisionCommand(ContractModel):
@@ -426,8 +397,8 @@ class CapabilityDeprovisionCommand(ContractModel):
     package_digest: str
     target_slave: str
     workspace_id: str = "workspace-default"
-    idempotency_key: str = ""
-    session_generation: int = 1
+    idempotency_key: str = Field(min_length=1)
+    activation_revision: int = Field(ge=1)
 
 
 class CapabilityHealthReport(ContractModel):
@@ -438,7 +409,7 @@ class CapabilityHealthReport(ContractModel):
     activation_state: Literal["ready", "degraded", "failed", "stopped"]
     evidence_refs: list[str] = Field(default_factory=list)
     details: dict[str, Any] = Field(default_factory=dict)
-    session_generation: int = 1
+    activation_revision: int = Field(ge=1)
 
 
 class NodeIntent(ContractModel):
@@ -447,6 +418,7 @@ class NodeIntent(ContractModel):
     intent_id: str = Field(min_length=1)
     execution_id: str = Field(min_length=1)
     package_ref: ResourceRef
+    capability_descriptor_ref: ResourceRef
     input_refs: list[ResourceRef] = Field(default_factory=list)
 
 
@@ -457,6 +429,7 @@ class DynamicNode(ContractModel):
     parent_execution_ref: str = Field(min_length=1)
     intent_id: str = Field(min_length=1)
     package_ref: ResourceRef
+    capability_descriptor_ref: ResourceRef
     input_refs: list[ResourceRef] = Field(default_factory=list)
     state: Literal["accepted", "dispatched", "completed", "failed", "decision_required"] = "accepted"
 
@@ -473,7 +446,6 @@ class ResourceEventFrame(ContractModel):
     package_version_ref: str | None = None
     package_digest: str | None = None
     target_slave: str | None = None
-    session_generation: int = 1
     evidence_refs: list[str] = Field(default_factory=list)
     payload: dict[str, Any] = Field(default_factory=dict)
 

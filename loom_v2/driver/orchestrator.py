@@ -14,7 +14,7 @@ from loom_v2.observer.orchestration_preflight import validate_entry_signature
 
 
 ReadJsonCallback = Callable[[ResourceRef], Any]
-EmitNodeCallback = Callable[[ResourceRef, list[ResourceRef]], Any]
+EmitNodeCallback = Callable[[ResourceRef, ResourceRef, list[ResourceRef]], Any]
 ResultCallback = Callable[[str], Any]
 
 
@@ -88,10 +88,11 @@ class OrchestrationContext:
             raise OrchestrationFailure({"code": "orchestration_protocol_invalid"})
         return message["value"]
 
-    def emit_node(self, package_ref, input_refs):
+    def emit_node(self, package_ref, capability_descriptor_ref, input_refs):
         _send({
             "type": "emit_node",
             "package_ref": package_ref,
+            "capability_descriptor_ref": capability_descriptor_ref,
             "input_refs": input_refs,
         })
         message = _receive()
@@ -465,12 +466,22 @@ class DockerOrchestrationExecutor:
                     await self._write_message(process.stdin, {"type": "value", "value": value})
                 elif message_type == "emit_node":
                     package_ref = self._resource_ref(message.get("package_ref"), error_code="node_package_ref_invalid")
+                    capability_descriptor_ref = self._resource_ref(
+                        message.get("capability_descriptor_ref"),
+                        error_code="node_capability_descriptor_ref_invalid",
+                    )
                     input_refs = [
                         self._content_ref(item, error_code="node_input_ref_invalid")
                         for item in message.get("input_refs", [])
                     ]
                     try:
-                        handle = await self._maybe_await(emit_node(package_ref, input_refs))
+                        handle = await self._maybe_await(
+                            emit_node(
+                                package_ref,
+                                capability_descriptor_ref,
+                                input_refs,
+                            )
+                        )
                     except Exception as exc:
                         raise self._callback_error(exc, "orchestration_context_error") from exc
                     if not isinstance(handle, str) or not handle:

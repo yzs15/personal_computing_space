@@ -11,6 +11,11 @@ from loom_v2.driver.service import DriverService
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.driver.worker import WorkerSession, WorkerUnavailableError
 from loom_v2.slave.app import create_app as create_slave_app
+from tests.support.package_fixture import (
+    orchestration_package_value,
+    process_package_value,
+    register_test_descriptor,
+)
 
 
 async def _content(repo: ObserverRepository, value, media_type: str):
@@ -93,15 +98,7 @@ async def test_dynamic_orchestration_runtime_executes_docker_program_and_slave_n
             {"kind": "set_execution_payload", "value": {"node_id": "loom://orchestrate", "input_ref": parent_input.model_dump(mode="json")}},
             {
                 "kind": "materialize_capability_package_candidate",
-                "value": {
-                             "package_id": "summarize",
-                             "package_version": "v1",
-                             "body": {
-                                 "program_content_ref": node_program.model_dump(mode="json"),
-                                 "io_contract_ref": node_contract.model_dump(mode="json"),
-                                 "operation_descriptor_ref": "loom://summarize",
-                             },
-                         },
+                "value": process_package_value(repo, package_id="summarize", operation_ref="loom://summarize", program_content_ref=node_program, io_contract_ref=node_contract),
             },
         ],
     )
@@ -111,13 +108,16 @@ async def test_dynamic_orchestration_runtime_executes_docker_program_and_slave_n
         if package.package_id == "summarize"
     )
     package_ref = ResourceRef(resource_id=node_package.version_ref, version_or_digest=node_package.package_digest)
+    node_descriptor_ref = node_package.capability_exports[0].capability_descriptor_ref
+    orchestration_descriptor_ref = register_test_descriptor(repo, "loom://orchestrate")
     orchestration_source = f'''
 PACKAGE_REF = {package_ref.model_dump(mode="json")}
+NODE_DESCRIPTOR_REF = {node_descriptor_ref.model_dump(mode="json")}
 
 
 async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> "ResourceRef":
     document = await ctx.read_json(input_ref)
-    handle = ctx.emit_node(PACKAGE_REF, [document["partition"]])
+    handle = ctx.emit_node(PACKAGE_REF, NODE_DESCRIPTOR_REF, [document["partition"]])
     return await ctx.result(handle)
 '''
     orchestration_program = await _content(repo, orchestration_source, "text/x-python")
@@ -129,19 +129,7 @@ async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> 
         [
             {
                 "kind": "materialize_capability_package_candidate",
-                "value": {
-                             "package_id": "orchestrate",
-                             "package_version": "v1",
-                             "execution": {"kind": "container:python_orchestrator", "version": "1"},
-                             "body": {
-                                 "program_content_ref": orchestration_program.model_dump(mode="json"),
-                                 "io_contract_ref": parent_contract.model_dump(mode="json"),
-                                 "operation_descriptor_ref": "loom://orchestrate",
-                                 "allowed_node_package_refs": [package_ref.model_dump(mode="json")],
-                                 "max_nodes": 2,
-                                 "max_live_nodes": 1,
-                             },
-                         },
+                "value": orchestration_package_value(repo, package_id="orchestrate", operation_ref="loom://orchestrate", program_content_ref=orchestration_program, io_contract_ref=parent_contract, allowed_node_package_refs=[package_ref], max_nodes=2, max_live_nodes=1),
             },
         ],
     )
@@ -181,6 +169,7 @@ async def test_target_selection_applies_permissions_locality_and_round_robin():
     run, patched = await _dynamic_fixture_for_target_selection(repo)
     record = await repo.get_run(run.run_id)
     package = next(package for package in record.capability_packages if package.package_id == "summarize")
+    descriptor_ref = package.capability_exports[0].capability_descriptor_ref
     runtime = DynamicOrchestrationRuntime(
         repository=repo,
         executor=object(),
@@ -190,9 +179,12 @@ async def test_target_selection_applies_permissions_locality_and_round_robin():
         },
     )
 
-    denied = package.model_copy(update={"body": package.function_body.model_copy(update={"permissions": ["compute"]}), "package_digest": ""})
+    denied_payload = package.model_dump(mode="json")
+    denied_payload["capability_exports"][0]["permissions"] = ["compute"]
+    denied_payload["package_digest"] = ""
+    denied = type(package).model_validate(denied_payload)
     try:
-        runtime._select_target(denied, record)
+        runtime._select_target(denied, descriptor_ref, record)
     except RuntimeError as exc:
         assert str(exc) == "node_permission_denied"
     else:
@@ -201,11 +193,11 @@ async def test_target_selection_applies_permissions_locality_and_round_robin():
     record.committed.snapshot.compute.requirements.append(
         ComputeRequirement(key="loom.data.locality.v1", value="slave-b", view="systems")
     )
-    assert runtime._select_target(package, record) == "slave-b"
+    assert runtime._select_target(package, descriptor_ref, record) == "slave-b"
 
     localized = record.committed.snapshot.compute.requirements.pop()
     assert localized.value == "slave-b"
-    assert [runtime._select_target(package, record) for _ in range(2)] == ["slave-a", "slave-b"]
+    assert [runtime._select_target(package, descriptor_ref, record) for _ in range(2)] == ["slave-a", "slave-b"]
 
 
 @pytest.mark.asyncio
@@ -215,10 +207,11 @@ async def test_runtime_reuses_completed_nodes_after_driver_restart():
     record = await repo.get_run(run.run_id)
     package = next(package for package in record.capability_packages if package.package_id == "summarize")
     package_ref = ResourceRef(resource_id=package.version_ref, version_or_digest=package.package_digest)
+    descriptor_ref = package.capability_exports[0].capability_descriptor_ref
 
     class ReplayExecutor:
         async def run(self, program, input_ref, *, read_json, emit_node, result):
-            handle = await emit_node(package_ref, [input_ref])
+            handle = await emit_node(package_ref, descriptor_ref, [input_ref])
             return await result(handle)
 
     runtime = DynamicOrchestrationRuntime(
@@ -285,15 +278,7 @@ async def _dynamic_fixture_for_target_selection(
             {"kind": "set_execution_payload", "value": {"node_id": "loom://orchestrate", "input_ref": input_ref.model_dump(mode="json")}},
             {
                 "kind": "materialize_capability_package_candidate",
-                "value": {
-                             "package_id": "summarize",
-                             "package_version": "v1",
-                             "body": {
-                                 "program_content_ref": node_program.model_dump(mode="json"),
-                                 "io_contract_ref": contract.model_dump(mode="json"),
-                                 "operation_descriptor_ref": "loom://summarize",
-                             },
-                         },
+                "value": process_package_value(repo, package_id="summarize", operation_ref="loom://summarize", program_content_ref=node_program, io_contract_ref=contract),
             },
         ],
     )
@@ -311,19 +296,7 @@ async def _dynamic_fixture_for_target_selection(
         [
             {
                 "kind": "materialize_capability_package_candidate",
-                "value": {
-                             "package_id": "orchestrate",
-                             "package_version": "v1",
-                             "execution": {"kind": "container:python_orchestrator", "version": "1"},
-                             "body": {
-                                 "program_content_ref": program.model_dump(mode="json"),
-                                 "io_contract_ref": contract.model_dump(mode="json"),
-                                 "operation_descriptor_ref": "loom://orchestrate",
-                                 "allowed_node_package_refs": [package_ref.model_dump(mode="json")],
-                                 "max_nodes": 2,
-                                 "max_live_nodes": 2,
-                             },
-                         },
+                "value": orchestration_package_value(repo, package_id="orchestrate", operation_ref="loom://orchestrate", program_content_ref=program, io_contract_ref=contract, allowed_node_package_refs=[package_ref], max_nodes=2, max_live_nodes=2),
             },
         ],
     )
@@ -333,12 +306,13 @@ async def _dynamic_fixture_for_target_selection(
 
 
 class SingleNodeExecutor:
-    def __init__(self, node_ref: ResourceRef, parent_input: ResourceRef) -> None:
+    def __init__(self, node_ref: ResourceRef, descriptor_ref: ResourceRef, parent_input: ResourceRef) -> None:
         self.node_ref = node_ref
+        self.descriptor_ref = descriptor_ref
         self.parent_input = parent_input
 
     async def run(self, _program, _input_ref, *, read_json, emit_node, result):
-        handle = await emit_node(self.node_ref, [self.parent_input])
+        handle = await emit_node(self.node_ref, self.descriptor_ref, [self.parent_input])
         return await result(handle)
 
 
@@ -373,6 +347,7 @@ async def test_runtime_reassigns_lost_dynamic_attempt_without_bumping_epoch():
     record = await repo.get_run(run.run_id)
     package = next(item for item in record.capability_packages if item.package_id == "summarize")
     node_ref = ResourceRef(resource_id=package.version_ref, version_or_digest=package.package_digest)
+    descriptor_ref = package.capability_exports[0].capability_descriptor_ref
     parent_input = next(
         item.input_ref
         for item in record.committed.snapshot.node_input_bindings
@@ -390,7 +365,7 @@ async def test_runtime_reassigns_lost_dynamic_attempt_without_bumping_epoch():
     )
     runtime = DynamicOrchestrationRuntime(
         repository=repo,
-        executor=SingleNodeExecutor(node_ref, parent_input),
+        executor=SingleNodeExecutor(node_ref, descriptor_ref, parent_input),
         workers={"slave-a": LosingWorker(repo, slave_a), "slave-b": slave_b},
     )
 
@@ -404,13 +379,14 @@ async def test_runtime_reassigns_lost_dynamic_attempt_without_bumping_epoch():
 
 
 class TwoNodeExecutor:
-    def __init__(self, node_ref: ResourceRef, parent_input: ResourceRef) -> None:
+    def __init__(self, node_ref: ResourceRef, descriptor_ref: ResourceRef, parent_input: ResourceRef) -> None:
         self.node_ref = node_ref
+        self.descriptor_ref = descriptor_ref
         self.parent_input = parent_input
 
     async def run(self, _program, _input_ref, *, read_json, emit_node, result):
-        first = await emit_node(self.node_ref, [self.parent_input])
-        second = await emit_node(self.node_ref, [self.parent_input])
+        first = await emit_node(self.node_ref, self.descriptor_ref, [self.parent_input])
+        second = await emit_node(self.node_ref, self.descriptor_ref, [self.parent_input])
         first_ref, second_ref = await asyncio.gather(result(first), result(second))
         assert first_ref == second_ref
         return first_ref
@@ -423,6 +399,7 @@ async def test_runtime_keeps_healthy_sibling_valid_during_reassignment():
     record = await repo.get_run(run.run_id)
     package = next(item for item in record.capability_packages if item.package_id == "summarize")
     node_ref = ResourceRef(resource_id=package.version_ref, version_or_digest=package.package_digest)
+    descriptor_ref = package.capability_exports[0].capability_descriptor_ref
     parent_input = next(
         item.input_ref
         for item in record.committed.snapshot.node_input_bindings
@@ -440,7 +417,7 @@ async def test_runtime_keeps_healthy_sibling_valid_during_reassignment():
     )
     runtime = DynamicOrchestrationRuntime(
         repository=repo,
-        executor=TwoNodeExecutor(node_ref, parent_input),
+        executor=TwoNodeExecutor(node_ref, descriptor_ref, parent_input),
         workers={"slave-a": LosingWorker(repo, slave_a), "slave-b": slave_b},
     )
 
