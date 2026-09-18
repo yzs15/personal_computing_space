@@ -81,9 +81,12 @@ The production response is HTTP 202:
 ```
 
 `accepted` means the Observer persisted the receipt. It does not mean a Run
-started or completed. Receipt states can move through `accepted`, `queued`,
-`in_flight`, and `retryable` before reaching `completed`, `failed`, or
-`interrupted`.
+started or completed. The persisted receipt can move through `accepted`,
+`queued`, `in_flight`, and `retryable` before reaching `completed`, `failed`, or
+`interrupted`. The public conversation projection normalizes these states:
+`accepted`/`queued`/`retryable` appear as `queued`, while `in_flight` appears as
+`thinking`. Follow the projection status when polling; do not wait for the
+internal receipt spelling.
 
 ### Idempotent Retry
 
@@ -159,12 +162,15 @@ Read the latest matching Run from `runs`. Verify at least:
 - structured validation evidence and terminal errors;
 - content digest when the outcome returns a content-addressed reference.
 
-For `content://sha256/<digest>`, retrieve the immutable object with:
+For a content reference `content://sha256/<digest>`, extract the 64-character
+digest (do not pass the full URI as the path segment) and retrieve the immutable object with:
 
 ```http
 GET {OBSERVER_URL}/api/v1/content/{digest}
 ```
 
+Do not calculate or replace a digest yourself; use the `ResourceRef` returned
+by the Observer and verify the response `X-Content-Digest` when downloading.
 Do not report success solely because an assistant message says the task
 completed. Prefer the persisted Run outcome and evidence.
 

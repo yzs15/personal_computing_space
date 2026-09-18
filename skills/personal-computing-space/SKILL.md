@@ -20,6 +20,9 @@ tools, orchestrate work, and dispatch nodes to Slaves.
   or Slave `/worker/v1/*`. Those are internal control surfaces.
 - Never use direct Run mutation endpoints to open, patch, commit, or start a
   Run. The Driver's coding agent owns those decisions.
+- Treat `ResourceRef` and digest fields as server-owned facts. Do not calculate,
+  invent, or overwrite content/package/draft digests; obtain immutable refs from
+  the Observer data plane or persisted Run outcome.
 
 ## Workflow
 
