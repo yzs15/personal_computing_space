@@ -230,11 +230,14 @@ class DockerContainerHTTPRuntimeV1:
     def _labels(
         self, workspace_id: str, package_ref: str, package_digest: str
     ) -> dict[str, str]:
+        # The package digest is the immutable execution identity.  A promoted
+        # reusable coordinate intentionally keeps the same digest as its
+        # run-bound candidate, so the lifecycle coordinate must not fence the
+        # Docker container itself.
         return {
             "io.loom.managed": "container-http-v1",
             "io.loom.workspace": workspace_id,
             "io.loom.slave": self.slave_id,
-            "io.loom.package-ref": package_ref,
             "io.loom.package-digest": package_digest,
         }
 
@@ -384,7 +387,6 @@ class DockerContainerHTTPRuntimeV1:
                     "io.loom.managed": "container-http-v1",
                     "io.loom.workspace": workspace_id,
                     "io.loom.slave": self.slave_id,
-                    "io.loom.package-ref": package_ref,
                     "io.loom.package-digest": package_digest,
                 }.items()
             )

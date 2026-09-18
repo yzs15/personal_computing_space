@@ -41,6 +41,24 @@ class PublicRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+class PublicSlave(BaseModel):
+    """Workspace resource discovery, without internal routing or lease tokens."""
+
+    slave_id: str
+    available: bool
+    lease_state: str
+    last_seen_at: str | None = None
+    base_operations: list[str] = Field(default_factory=list)
+    executor_descriptors: list[dict[str, Any]] = Field(default_factory=list)
+    runtime_plugin_descriptors: list[dict[str, Any]] = Field(default_factory=list)
+    term_support: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class PublicSlaveList(BaseModel):
+    workspace_id: str
+    slaves: list[PublicSlave]
+
+
 class ContentPutRequest(PublicRequest):
     content: Any | None = None
     media_type: Any = ""

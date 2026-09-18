@@ -25,11 +25,14 @@ from loom_v2.contracts.api import (
     OpenRunRequest,
     PatchRequest,
     PublicMessageRequest,
+    PublicSlave,
+    PublicSlaveList,
     ResolveRequest,
     StartRequest,
 )
 from loom_v2.content_store import ContentStore
 from loom_v2.contracts.agents import AgentRegistration, DriverCommand
+from loom_v2.contracts.refs import select_slave_agents
 from loom_v2.contracts.errors import DomainError
 from loom_v2.observer.gateway import ObserverDriverGateway
 from loom_v2.observer.dispatcher import ObserverMessageDispatcher
@@ -530,6 +533,36 @@ def create_app(
             return _run_view(await app.state.repo.get_run(run_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="run_not_found") from exc
+
+    @app.get("/api/v1/slaves", response_model=PublicSlaveList)
+    async def public_slaves(
+        available_only: bool = False, workspace_id: str | None = None,
+    ) -> PublicSlaveList:
+        # Public access is bound to this Observer's workspace, not an arbitrary
+        # caller-supplied registry scope. Do not mutate the dispatcher's cache.
+        if workspace_id is not None and workspace_id != settings.workspace_id:
+            raise HTTPException(status_code=403, detail="workspace_binding_mismatch")
+        agents = await app.state.repo.list_agents(settings.workspace_id, role="slave")
+        # Prefer active instances; when all are offline show the latest report.
+        agents.sort(key=lambda agent: str(agent.get("last_seen_at") or ""), reverse=True)
+        selected = select_slave_agents(agents)
+        slaves = []
+        for slave_id, agent in sorted(selected.items()):
+            available = agent.get("lease_state") == "active"
+            if available_only and not available:
+                continue
+            caps = agent.get("capabilities") or {}
+            slaves.append(PublicSlave(
+                slave_id=slave_id,
+                available=available,
+                lease_state=agent["lease_state"],
+                last_seen_at=agent.get("last_seen_at"),
+                base_operations=sorted(caps.get("base_operations", caps.get("operations", []))),
+                executor_descriptors=caps.get("executor_descriptors", []),
+                runtime_plugin_descriptors=caps.get("runtime_plugin_descriptors", caps.get("runtime_plugins", [])),
+                term_support=caps.get("term_support", []),
+            ))
+        return PublicSlaveList(workspace_id=settings.workspace_id, slaves=slaves)
 
     @app.get("/api/v1/capabilities")
     async def capabilities() -> list[dict[str, Any]]:

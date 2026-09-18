@@ -56,6 +56,37 @@ def test_driver_project_wires_all_remote_services_and_docker_socket(tmp_path: Pa
     assert "internal-token" not in project.redacted_preview
 
 
+def test_driver_project_mounts_optional_codex_provider_secret(tmp_path: Path):
+    for filename, value in {
+        "internal.secret": "internal-token",
+        "postgres.secret": "pg-password",
+        "minio.secret": "minio-password",
+    }.items():
+        write_secret(tmp_path / filename, value)
+    write_secret(tmp_path / "ark.secret", "ark-key")
+    path = tmp_path / "deployment.toml"
+    path.write_text(
+        config_text().replace(
+            'codex_base_url = "http://codex.internal:8787"',
+            'codex_provider = "volcengine-agent-plan"\n'
+            'codex_base_url = "https://ark.cn-beijing.volces.com/api/plan/v3"\n'
+            'codex_api_key_env = "ARK_API_KEY"\n'
+            'codex_api_key_file = "ark.secret"',
+        ),
+        encoding="utf-8",
+    )
+    project = render_project(DeploymentConfig.from_file(path), "driver")
+    document = json.loads(project.compose_text)
+    driver = document["services"]["driver"]
+
+    assert driver["environment"]["LOOM_CODEX_PROVIDER"] == "volcengine-agent-plan"
+    assert driver["environment"]["LOOM_CODEX_API_KEY_ENV"] == "ARK_API_KEY"
+    assert "codex_api_key" in driver["secrets"]
+    assert document["secrets"]["codex_api_key"] == {"file": "./secrets/codex_api_key"}
+    assert project.secret_files["codex_api_key"] == "ark-key"
+    assert "ark-key" not in project.redacted_preview
+
+
 def test_minio_project_contains_bucket_initializer(tmp_path: Path):
     project = render_project(make_config(tmp_path), "storage")
     document = json.loads(project.compose_text)

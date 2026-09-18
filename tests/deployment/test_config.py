@@ -66,6 +66,36 @@ def test_loads_defaults_and_derives_cross_host_urls(tmp_path: Path):
     assert config.urls.observer == "http://10.0.0.11:8080"
     assert config.urls.slaves == {"slave-a": "http://10.0.0.13:8081"}
     assert config.postgres_password == "pg-password"
+    assert config.codex_api_key is None
+
+
+def test_loads_optional_codex_provider_secret(tmp_path: Path):
+    for filename, value in {
+        "internal.secret": "internal-token",
+        "postgres.secret": "pg-password",
+        "minio.secret": "minio-password",
+        "ark.secret": "ark-key",
+    }.items():
+        write_secret(tmp_path / filename, value)
+    path = tmp_path / "deployment.toml"
+    path.write_text(
+        config_text().replace(
+            'codex_base_url = "http://codex.internal:8787"',
+            'codex_provider = "volcengine-agent-plan"\n'
+            'codex_base_url = "https://ark.cn-beijing.volces.com/api/plan/v3"\n'
+            'codex_wire_api = "responses"\n'
+            'codex_api_key_env = "ARK_API_KEY"\n'
+            'codex_api_key_file = "ark.secret"',
+        ),
+        encoding="utf-8",
+    )
+
+    config = DeploymentConfig.from_file(path)
+
+    assert config.driver.codex_provider == "volcengine-agent-plan"
+    assert config.driver.codex_api_key_env == "ARK_API_KEY"
+    assert config.codex_api_key == "ark-key"
+    assert config.driver.codex_api_key_file == (tmp_path / "ark.secret").resolve()
 
 
 def test_rejects_missing_driver_or_duplicate_slave_id(tmp_path: Path):

@@ -54,7 +54,10 @@ async def test_capability_get_command_normalizes_resource_ref_dict():
         ],
     )
     package = (await repo.get_run(run.run_id)).capability_packages[0]
-    dict_ref = ResourceRef(resource_id=package.version_ref).model_dump(mode="json")
+    dict_ref = ResourceRef(
+        resource_id=package.version_ref,
+        version_or_digest=package.package_digest,
+    ).model_dump(mode="json")
     result = await repo.execute_driver_command(
         DriverCommand(
             request_id="capability-get-1",

@@ -151,32 +151,62 @@ class DriverMCP:
         raise ValueError(f"unknown_driver_tool:{tool_name}")
 
     async def _query_capabilities(self) -> dict[str, Any]:
+        def project_descriptors(capabilities: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            executors: list[dict[str, Any]] = []
+            plugins: list[dict[str, Any]] = []
+            seen_executors: set[str] = set()
+            seen_plugins: set[str] = set()
+
+            def add_unique(target: list[dict[str, Any]], seen: set[str], value: Any) -> None:
+                if not isinstance(value, dict):
+                    return
+                key = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                if key not in seen:
+                    seen.add(key)
+                    target.append(value)
+
+            for capability in capabilities:
+                for descriptor in capability.get("executor_descriptors", []):
+                    add_unique(executors, seen_executors, descriptor)
+                for descriptor in capability.get("runtime_plugin_descriptors", capability.get("runtime_plugins", [])):
+                    add_unique(plugins, seen_plugins, descriptor)
+            # This execution type is implemented by Driver itself.  Keep it
+            # visible as a reserved special case, but do not claim that a
+            # Slave runtime plugin provides it.
+            add_unique(
+                executors,
+                seen_executors,
+                {"package_type": "function", "kind": "container:python_orchestrator", "version": "1", "operations": ["orchestrate"], "driver_special": True},
+            )
+            return executors, plugins
+
         if self.control is not None:
             result = await self.control.command("capability.list", {})
+            executors, plugins = project_descriptors(result.get("capabilities", []))
             return {
                 "workspace_id": self.workspace_id,
                 "capabilities": result.get("capabilities", []),
                 "packages": result.get("packages", []),
-                "executor_descriptors": [
-                    {"package_type": "function", "kind": "process:json_stdio", "version": "1", "operations": ["run_code"]},
-                    {"package_type": "function", "kind": "container:python_orchestrator", "version": "1", "operations": ["orchestrate"], "driver_special": True},
-                ],
+                "executor_descriptors": executors,
+                "runtime_plugin_descriptors": plugins,
             }
         await self.repository.refresh_slaves(self.workspace_id)
+        capabilities = [
+            {
+                "resource_id": resource_id,
+                "available": self.repository._slave_is_active(resource_id),
+                "operations": sorted(details.get("operations", set())),
+                "executor_descriptors": details.get("executor_descriptors", []),
+                "runtime_plugin_descriptors": details.get("runtime_plugin_descriptors", details.get("runtime_plugins", [])),
+            }
+            for resource_id, details in sorted(self.repository.slave_capabilities.items())
+        ]
+        executors, plugins = project_descriptors(capabilities)
         return {
             "workspace_id": self.workspace_id,
-            "capabilities": [
-                {
-                    "resource_id": resource_id,
-                    "available": self.repository._slave_is_active(resource_id),
-                    "operations": sorted(details.get("operations", set())),
-                }
-                for resource_id, details in sorted(self.repository.slave_capabilities.items())
-            ],
-            "executor_descriptors": [
-                {"package_type": "function", "kind": "process:json_stdio", "version": "1", "operations": ["run_code"]},
-                {"package_type": "function", "kind": "container:python_orchestrator", "version": "1", "operations": ["orchestrate"], "driver_special": True},
-            ],
+            "capabilities": capabilities,
+            "executor_descriptors": executors,
+            "runtime_plugin_descriptors": plugins,
         }
 
     async def open_run(self, arguments: dict[str, Any]) -> dict[str, Any]:

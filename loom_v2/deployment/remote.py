@@ -274,7 +274,7 @@ def _make_archive(source_root: Path, project: RenderedProject, config: Deploymen
         _add_bytes(archive, ".env", project.env_text.encode("utf-8"), 0o600)
         allowed = {
             "minio": {"minio_secret_key"},
-            "driver": {"internal_api_secret", "minio_secret_key"},
+            "driver": {"internal_api_secret", "minio_secret_key", "codex_api_key"},
             "observer": {"internal_api_secret", "postgres_password", "minio_secret_key"},
             "slave": {"internal_api_secret", "postgres_password", "minio_secret_key"},
         }[project.role]
@@ -349,6 +349,7 @@ def _redact(value: str, config: DeploymentConfig) -> str:
         config.internal_api_secret,
         config.postgres_password,
         config.minio_secret_key,
+        config.codex_api_key,
         quote(config.postgres_password, safe=""),
         quote(config.minio_secret_key, safe=""),
     )

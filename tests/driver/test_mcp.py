@@ -58,6 +58,30 @@ async def test_query_capabilities_is_available_before_open_run():
 
     assert result["workspace_id"] == "workspace-default"
     assert {item["resource_id"] for item in result["capabilities"]} == {"slave-a", "slave-b"}
+    assert any(item["kind"] == "process:json_stdio" for item in result["executor_descriptors"])
+    assert any(item.get("driver_special") for item in result["executor_descriptors"])
+
+
+@pytest.mark.asyncio
+async def test_query_capabilities_projects_slave_runtime_descriptors():
+    repo = _seeded_repository()
+    repo.agents[("workspace-default", "slave", "slave-a", "embedded-slave-a")]["capabilities"][
+        "runtime_plugin_descriptors"
+    ] = [{
+        "plugin_id": "container-http-v1",
+        "runtime_descriptor_ref": "runtime://service/container:http/1",
+        "supports": [{"package_type": "service", "execution_kind": "container:http", "execution_version": "1"}],
+    }]
+    mcp = DriverMCP(repo, "conversation-capabilities-runtime")
+
+    result = await mcp.call("loom_query_capabilities")
+
+    assert result["runtime_plugin_descriptors"] == [{
+        "plugin_id": "container-http-v1",
+        "runtime_descriptor_ref": "runtime://service/container:http/1",
+        "supports": [{"package_type": "service", "execution_kind": "container:http", "execution_version": "1"}],
+    }]
+    assert all(item.get("kind") != "container:http" for item in result["executor_descriptors"])
 
 
 def test_driver_mcp_exposes_dynamic_tool_specs():

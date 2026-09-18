@@ -63,9 +63,17 @@ def seed_embedded_slaves(
                         "package_type": descriptor.package_type,
                         "kind": descriptor.kind,
                         "version": descriptor.version,
+                        "operations": sorted(descriptor.operations),
+                        "descriptor_ref": descriptor.descriptor_ref,
+                        "digest": descriptor.digest,
                     }
                     for descriptor in slave.executor_registry.descriptors()
                 ],
+                "runtime_plugin_descriptors": [
+                    descriptor.__dict__
+                    | {"supports": [support.to_mapping() for support in descriptor.supports]}
+                    for descriptor in slave.runtime_plugin_host.descriptors()
+                ] if slave.runtime_plugin_host is not None else [],
                 "term_support": [item.model_dump(mode="json") for item in slave.term_support()],
             },
             "epoch": 1,

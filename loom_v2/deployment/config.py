@@ -100,6 +100,8 @@ class DriverConfig(ConfigModel):
     codex_model: NonEmptyString = "deepseek-v4-flash"
     codex_provider: NonEmptyString = "proxy"
     codex_wire_api: NonEmptyString = "responses"
+    codex_api_key_env: NonEmptyString = "OPENAI_API_KEY"
+    codex_api_key_file: Path | None = None
 
     @field_validator("workspace_path")
     @classmethod
@@ -161,6 +163,7 @@ class DeploymentConfig:
     postgres_password: str
     minio_access_key: str
     minio_secret_key: str
+    codex_api_key: str | None
     machines: tuple[MachineConfig, ...]
     driver: DriverConfig
     secret_paths: tuple[Path, ...]
@@ -205,6 +208,14 @@ class DeploymentConfig:
         machines = parsed.machines
         _validate_topology(machines)
         driver = parsed.driver
+        codex_api_key_path = driver.codex_api_key_file
+        codex_api_key = None
+        if codex_api_key_path is not None:
+            if not codex_api_key_path.is_absolute():
+                codex_api_key_path = (base_dir / codex_api_key_path).resolve()
+            else:
+                codex_api_key_path = codex_api_key_path.resolve()
+            codex_api_key = _read_secret(codex_api_key_path, "driver.codex_api_key_file")
         catalog_path = driver.model_catalog_file
         if catalog_path is not None:
             if not catalog_path.is_absolute():
@@ -213,7 +224,15 @@ class DeploymentConfig:
                 catalog_path = catalog_path.resolve()
             if not catalog_path.is_file():
                 raise DeploymentConfigError(f"driver.model_catalog_file does not exist: {catalog_path}")
-        driver = driver.model_copy(update={"model_catalog_file": catalog_path})
+        driver = driver.model_copy(
+            update={
+                "model_catalog_file": catalog_path,
+                "codex_api_key_file": codex_api_key_path,
+            }
+        )
+        secret_paths = [internal_secret_path, postgres_password_path, minio_secret_path]
+        if codex_api_key_path is not None:
+            secret_paths.append(codex_api_key_path)
         return cls(
             config_path=config_path,
             name=name,
@@ -223,9 +242,10 @@ class DeploymentConfig:
             postgres_password=postgres_password,
             minio_access_key=minio_access_key.strip(),
             minio_secret_key=minio_secret,
+            codex_api_key=codex_api_key,
             machines=machines,
             driver=driver,
-            secret_paths=(internal_secret_path, postgres_password_path, minio_secret_path),
+            secret_paths=tuple(secret_paths),
             build_network=build_network,
         )
 

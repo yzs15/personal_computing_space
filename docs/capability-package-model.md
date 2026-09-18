@@ -96,7 +96,7 @@ Agent 使用 `loom_put_content` 上传程序、JSON Schema、IoContract 和 oper
 - IoContract：必须是可读取并通过 `io.v1` 校验的 content ref；
 - package：对规范化 execution manifest 使用项目的 `rfc8785` 库进行 JCS 序列化，再以 `loom/package/v1` 域分离计算 SHA-256。
 
-Package digest 只覆盖 `package_type`、`execution`、规范化后的 `capability_exports` 和 `body`。坐标、scope、publication state、provenance、activation、Slave 和容器状态不进入 package identity。
+Package digest 只覆盖 `package_type`、`execution`、规范化后的 `capability_exports` 和 `body`。坐标、scope、publication state、provenance、activation、Slave 和容器状态不进入 package identity。因而候选包 promotion 生成的 reusable 坐标可以复用同一 digest-backed runtime；Docker 容器身份按 workspace、Slave 和 package digest fencing，不按生命周期坐标 fencing。
 
 Export 按完整 descriptor identity 排序，permissions 按集合语义排序；`ResourceRef.access_binding` 和 provenance 不参与 digest。因此 export 顺序或部署位置变化不会改变同一 manifest 的 digest。
 

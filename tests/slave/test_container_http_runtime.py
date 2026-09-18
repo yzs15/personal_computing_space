@@ -144,6 +144,26 @@ async def test_provision_uses_fixed_container_security_arguments() -> None:
     assert create[-1] == IMAGE_REF
 
 
+def test_promoted_coordinate_reuses_digest_backed_container_identity() -> None:
+    package = _package(["/v1/echo"])
+    promoted_payload = package.model_dump(mode="json")
+    promoted_payload["package_version"] = "v1-reusable"
+    promoted = CapabilityPackageVersion.model_validate(promoted_payload)
+    assert promoted.package_digest == package.package_digest
+
+    runtime = DockerContainerHTTPRuntimeV1(
+        slave_id="slave-test", network="loom-test-internal"
+    )
+    assert runtime._container_name("workspace-default", package.package_digest) == runtime._container_name(
+        "workspace-default", promoted.package_digest
+    )
+    assert runtime._labels(
+        "workspace-default", package.version_ref, package.package_digest
+    ) == runtime._labels(
+        "workspace-default", promoted.version_ref, promoted.package_digest
+    )
+
+
 @pytest.mark.asyncio
 async def test_http_redirect_is_not_followed_or_replayed() -> None:
     package = _package(["/v1/echo"])
@@ -151,7 +171,6 @@ async def test_http_redirect_is_not_followed_or_replayed() -> None:
         "io.loom.managed": "container-http-v1",
         "io.loom.workspace": "workspace-default",
         "io.loom.slave": "slave-test",
-        "io.loom.package-ref": package.version_ref,
         "io.loom.package-digest": package.package_digest,
     }
     calls = 0

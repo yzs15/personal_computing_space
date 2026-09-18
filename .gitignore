@@ -9,3 +9,4 @@ secrets/*
 data/
 logs/
 .worktrees/
+production/

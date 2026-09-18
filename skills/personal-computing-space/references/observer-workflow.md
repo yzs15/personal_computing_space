@@ -18,6 +18,29 @@ Driver and coding-agent backend. HTTP 503 with `driver_unavailable` means the
 task cannot currently be planned or executed; report it or retry later. Do not
 fall back to Driver or Slave endpoints.
 
+## 1.1 Discover Workspace Slaves
+
+Before asking for distributed work, query the public resource view:
+
+```http
+GET {OBSERVER_URL}/api/v1/slaves
+GET {OBSERVER_URL}/api/v1/slaves?available_only=true
+```
+
+The response is scoped to the Observer's configured workspace and includes
+`slave_id`, `available`, `lease_state`, `last_seen_at`, `base_operations`,
+`executor_descriptors`, and `runtime_plugin_descriptors`. The same `slave_id`
+is returned once; an active instance is preferred over historical instances.
+`available` means the Observer has a current lease/heartbeat, not that a
+specific task is guaranteed to fit. Use the descriptors to shape a feasible
+prompt, then rely on Run readiness/admission as the authoritative check.
+
+The endpoint deliberately omits internal endpoints, lease tokens, instance
+identifiers, and resource quantities such as CPU or memory because those are
+not currently part of the Slave registration contract. A request with a
+different `workspace_id` is rejected; do not use the endpoint to enumerate
+other workspaces.
+
 ## 2. Prepare the Message
 
 Keep `conversation_ref` stable across a task and its follow-ups. Use a fresh,

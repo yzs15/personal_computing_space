@@ -771,6 +771,33 @@ class SlaveService:
                 evidence_refs=evidence_refs,
                 details={"idempotent": True},
             ))
+        # Promotion may create a second lifecycle coordinate for the same
+        # immutable package digest while the original activation is still
+        # serving.  Keep the shared runtime alive when stopping only one
+        # coordinate; the remaining activation owns the same digest-backed
+        # container.
+        shared_ready = any(
+            item is not existing
+            and item.package_digest.lower() == package.package_digest.lower()
+            and item.desired_state == "running"
+            and item.activation_state in {"ready", "degraded", "provisioning"}
+            for item in self.activations.values()
+        )
+        if shared_ready:
+            activation = desired.model_copy(update={"activation_state": "stopped"})
+            self.activations[activation_key] = activation
+            await self._persist_activation(package, activation)
+            report = CapabilityHealthReport(
+                report_id=f"health-{uuid4().hex}",
+                package_version_ref=ref,
+                package_digest=package.package_digest,
+                target_slave=self.slave_id,
+                activation_state="stopped",
+                activation_revision=command.activation_revision,
+                evidence_refs=evidence_refs,
+                details={"shared_runtime_preserved": True},
+            )
+            return self._remember_health_report(activation_key, report)
         try:
             response = await self.runtime_plugin_host.deprovision(package, command)
         except (RuntimePluginError, RuntimeError) as exc:
@@ -1226,6 +1253,18 @@ class SlaveService:
             closure=closure,
             capability_export=capability_export,
         )
+        # Every execution result is a content-addressed JSON artifact.  The
+        # executor/runtime may calculate a digest for its local protocol, but
+        # the shared ContentStore is the authoritative source of the public
+        # ResourceRef.  Persisting here covers both ordinary executors and
+        # runtime-plugin invocations (including container:http).
+        if self.content_store is None:
+            raise RuntimeError("content_store_unavailable")
+        result_ref = await self.content_store.put(
+            canonical_json_bytes(result.value),
+            media_type="application/json",
+        )
+        result = replace(result, resource_ref=result_ref)
         self.attempts[attempt_id] = result
         if self.sessions is not None:
             async with self.sessions() as session:

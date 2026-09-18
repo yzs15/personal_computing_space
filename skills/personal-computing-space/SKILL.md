@@ -28,20 +28,27 @@ tools, orchestrate work, and dispatch nodes to Slaves.
 
 1. Check `GET /healthz` and `GET /api/v1/runtime`. Stop and report
    `driver_unavailable` rather than bypassing the Observer.
-2. Reuse one stable `conversation_ref` for follow-up turns. Generate a new
+2. Discover workspace compute resources with `GET /api/v1/slaves` before
+   planning a distributed task. Use `?available_only=true` when only currently
+   leased Slaves matter. Treat `available` as a recent-lease signal, not a
+   promise of CPU/memory capacity or successful admission; inspect
+   `base_operations`, `executor_descriptors`, and
+   `runtime_plugin_descriptors` when choosing a feasible task. The endpoint is
+   workspace-scoped and does not expose internal endpoints or lease tokens.
+3. Reuse one stable `conversation_ref` for follow-up turns. Generate a new
    opaque `request_id` for each semantic message.
-3. Write a task message that states the goal, inputs visible to the workspace,
+4. Write a task message that states the goal, inputs visible to the workspace,
    required output, distribution requirement, constraints, and acceptance
    criteria. Do not include secrets.
-4. Submit the message and treat HTTP `202` as receipt acceptance, not task
+5. Submit the message and treat HTTP `202` as receipt acceptance, not task
    completion.
-5. Poll `GET /api/v1/conversations/{conversation_ref}` with a bounded interval.
+6. Poll `GET /api/v1/conversations/{conversation_ref}` with a bounded interval.
    Correlate the user message by `request_id`; inspect its status, assistant
    reply, Run outcome, dynamic nodes, and evidence.
-6. On `completed`, verify the requested acceptance criteria from the outcome.
+7. On `completed`, verify the requested acceptance criteria from the outcome.
    On `awaiting_decision`, follow the decision rules in the protocol reference.
    On `failed` or `interrupted`, report the structured reason without hiding it.
-7. For corrections or repair, send a new message in the same conversation with
+8. For corrections or repair, send a new message in the same conversation with
    a new `request_id`; do not mutate internal Run state directly.
 
 Retries after an uncertain HTTP result must reuse the same `request_id` with

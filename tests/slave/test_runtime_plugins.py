@@ -340,5 +340,8 @@ async def test_generic_plugin_provision_invoke_and_deprovision_without_core_type
 
     assert report.activation_state == "ready"
     assert result.value == {"echo": {"value": 3}, "configured": "configured"}
+    stored = await store.get(result.resource_ref)
+    assert stored == canonical_json_bytes(result.value)
+    assert result.resource_ref.digest == store.digest(stored)
     assert stopped.activation_state == "stopped"
     assert plugin.calls == ["provision", "invoke", "deprovision"]

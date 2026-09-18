@@ -46,17 +46,20 @@ def render_project(config: DeploymentConfig, machine_name: str) -> RenderedProje
         document, env = _render_minio(config, machine)
     else:  # pragma: no cover - config validation prevents this
         raise ValueError(f"unsupported role: {machine.role}")
+    secret_files = {
+        "internal_api_secret": config.internal_api_secret,
+        "postgres_password": config.postgres_password,
+        "minio_secret_key": config.minio_secret_key,
+    }
+    if config.codex_api_key is not None:
+        secret_files["codex_api_key"] = config.codex_api_key
     return RenderedProject(
         machine=machine.name,
         role=machine.role,
         project_name=project_name,
         compose_text=json.dumps(document, indent=2, sort_keys=True) + "\n",
         env_text=_env_text(env),
-        secret_files={
-            "internal_api_secret": config.internal_api_secret,
-            "postgres_password": config.postgres_password,
-            "minio_secret_key": config.minio_secret_key,
-        },
+        secret_files=secret_files,
         model_catalog_file=config.driver.model_catalog_file if machine.role == "driver" else None,
         redaction_values=(quote_password(config.postgres_password),),
     )
@@ -182,7 +185,7 @@ def _render_driver(config: DeploymentConfig, machine: MachineConfig) -> tuple[di
     app["build"]["args"] = {"CODEX_VERSION": config.driver.codex_version}
     environment = {
         "LOOM_AGENT_ID": "driver-default",
-        "LOOM_CODEX_API_KEY_ENV": "OPENAI_API_KEY",
+        "LOOM_CODEX_API_KEY_ENV": config.driver.codex_api_key_env,
         "LOOM_CODEX_BASE_URL": config.driver.codex_base_url,
         "LOOM_CODEX_MODEL": config.driver.codex_model,
         "LOOM_CODEX_MODEL_REASONING_EFFORT": "xhigh",
@@ -211,7 +214,10 @@ def _render_driver(config: DeploymentConfig, machine: MachineConfig) -> tuple[di
         {
             "environment": environment,
             "ports": [f"{machine.service_port}:8090"],
-            "secrets": ["internal_api_secret"],
+            "secrets": [
+                "internal_api_secret",
+                *(["codex_api_key"] if config.codex_api_key is not None else []),
+            ],
             "volumes": [
                 f"{config.driver.workspace_path}:/workspace",
                 "driver-codex-state:/var/lib/loom/codex",
@@ -224,7 +230,14 @@ def _render_driver(config: DeploymentConfig, machine: MachineConfig) -> tuple[di
         app["volumes"].insert(2, "./model_catalog.json:/var/lib/loom/codex/model_catalog.json:ro")
     document = {
         "services": {"driver": app},
-        "secrets": {"internal_api_secret": {"file": "./secrets/internal_api_secret"}},
+        "secrets": {
+            "internal_api_secret": {"file": "./secrets/internal_api_secret"},
+            **(
+                {"codex_api_key": {"file": "./secrets/codex_api_key"}}
+                if config.codex_api_key is not None
+                else {}
+            ),
+        },
         "volumes": {"driver-codex-state": {}},
     }
     env = {
@@ -239,7 +252,9 @@ def _render_driver(config: DeploymentConfig, machine: MachineConfig) -> tuple[di
 def _render_minio(config: DeploymentConfig, machine: MachineConfig) -> tuple[dict[str, Any], dict[str, str]]:
     assert machine.console_port is not None
     minio = {
-        "image": "minio/minio:latest",
+        # MinIO's current public images are published from quay.io; the old
+        # Docker Hub namespace now returns repository-not-found on fresh hosts.
+        "image": "quay.io/minio/minio:latest",
         "restart": "unless-stopped",
         "command": ["server", "/data", "--console-address", ":9001"],
         "environment": {
@@ -256,7 +271,7 @@ def _render_minio(config: DeploymentConfig, machine: MachineConfig) -> tuple[dic
         },
     }
     init = {
-        "image": "minio/mc:latest",
+        "image": "quay.io/minio/mc:latest",
         "depends_on": {"minio": {"condition": "service_healthy"}},
         "environment": {
             "MINIO_ACCESS_KEY": "${MINIO_ACCESS_KEY}",
