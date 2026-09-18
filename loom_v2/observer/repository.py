@@ -8,12 +8,11 @@ from copy import deepcopy
 import json
 import hashlib
 import hmac
-import os
 import shutil
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from loom_v2.contracts.constraints import Constraint
@@ -38,15 +37,24 @@ from loom_v2.contracts.types import (
     NodeInputBinding,
     ValidationEvidence,
 )
-from loom_v2.db.base import Base
 from loom_v2.db.models import DriverRequestRow, DriverThreadRow, IdempotencyRow, MessageReceiptRow, RunRow, RuntimeAgentRow
-from loom_v2.contracts.agents import AgentLease, AgentRegistration, DriverCommand, DriverThreadBinding
+from loom_v2.db.migrations import apply_migrations
+from loom_v2.contracts.agents import DRIVER_COMMANDS, DRIVER_RUN_SCOPED_COMMANDS, AgentLease, AgentRegistration, DriverCommand, DriverThreadBinding
 from loom_v2.contracts.messages import MessageReceipt, MessageReceiptState
 from loom_v2.db.session import make_session_factory
 from loom_v2.content_store import ContentStore, canonical_json_bytes, put_typed_content
 from loom_v2.digest import digest_bytes, digest_json
 from loom_v2.contracts.io_schema import ValidationError as SchemaValidationError, validate, validate_schema
 from loom_v2.contracts.package_contracts import DRIVER_ORCHESTRATOR_KEY
+from loom_v2.contracts.refs import (
+    input_binding_for,
+    operation_name,
+    package_body_ref,
+    require_content_ref,
+    select_slave_agents,
+    single_export,
+    slave_supports_package,
+)
 from loom_v2.settings import Settings
 from loom_v2.slave.executor import default_registry
 from loom_v2.contracts.errors import DomainError, DomainErrorEnvelope
@@ -120,21 +128,6 @@ RUN_TRANSITIONS: dict[str, dict[str, str]] = {
 }
 
 
-def _select_slave_agents(agents: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    selected: dict[str, dict[str, Any]] = {}
-    for agent in agents:
-        slave_id = str(agent.get("agent_id") or "")
-        if not slave_id:
-            continue
-        current = selected.get(slave_id)
-        if current is None or (
-            agent.get("lease_state") == "active"
-            and current.get("lease_state") != "active"
-        ):
-            selected[slave_id] = dict(agent)
-    return selected
-
-
 def _transition(record: RunRecord, event: str, *, reason: Any | None = None) -> str:
     current = record.state
     target = RUN_TRANSITIONS.get(current, {}).get(event)
@@ -160,8 +153,8 @@ def _transition(record: RunRecord, event: str, *, reason: Any | None = None) -> 
     return target
 
 
-def _run_record_payload(record: RunRecord) -> dict[str, Any]:
-    return {
+def run_record_payload(record: RunRecord, *, include_snapshots: bool = True) -> dict[str, Any]:
+    payload = {
         "run_id": record.run_id,
         "task_ref": record.task_ref,
         "goal": record.goal,
@@ -170,8 +163,6 @@ def _run_record_payload(record: RunRecord) -> dict[str, Any]:
         "status": ObserverRepository._conversation_status_for_state(record.state) if "ObserverRepository" in globals() else record.state,
         "draft_version": record.draft.version_id,
         "draft_digest": record.draft.snapshot_digest,
-        "draft": record.draft.model_dump(mode="json"),
-        "committed": record.committed.model_dump(mode="json") if record.committed else None,
         "closure_contract": record.closure_contract.model_dump(mode="json") if record.closure_contract else None,
         "committed_version": record.committed.version_id if record.committed else None,
         "execution_id": record.execution_id,
@@ -183,6 +174,10 @@ def _run_record_payload(record: RunRecord) -> dict[str, Any]:
         "capability_packages": [package.model_dump(mode="json") for package in record.capability_packages],
         "capability_activations": [activation.model_dump(mode="json") for activation in record.capability_activations],
     }
+    if include_snapshots:
+        payload["draft"] = record.draft.model_dump(mode="json")
+        payload["committed"] = record.committed.model_dump(mode="json") if record.committed else None
+    return payload
 
 
 class ObserverRepository:
@@ -193,6 +188,7 @@ class ObserverRepository:
         engine: AsyncEngine | None = None,
         content_store: ContentStore | None = None,
         *,
+        settings: Settings | None = None,
         orchestrator_runtime_available: bool | None = None,
         operation_descriptor_registry: dict[tuple[str, str], Any] | None = None,
     ) -> None:
@@ -203,9 +199,9 @@ class ObserverRepository:
         self.slave_capabilities: dict[str, dict[str, Any]] = {}
         self.engine = engine
         self.sessions = make_session_factory(engine) if engine is not None else None
+        self.settings = settings or Settings()
         if content_store is None:
-            settings = Settings()
-            content_store = ContentStore.from_settings(settings)
+            content_store = ContentStore.from_settings(self.settings)
         self.content_store = content_store
         # Optional authoritative operation-descriptor registry.  Deployments
         # may populate it from their existing registry; content-addressed
@@ -213,9 +209,8 @@ class ObserverRepository:
         self.operation_descriptor_registry = {
             key: deepcopy(value) for key, value in (operation_descriptor_registry or {}).items()
         }
-        # A deployed Observer deliberately has no Docker CLI/socket.  The
-        # legacy in-process test profile can retain the local preflight check;
-        # production Driver readiness is responsible for its own runtime.
+        # A deployed Observer deliberately has no Docker CLI/socket. Driver
+        # readiness is responsible for its own runtime.
         self.orchestrator_runtime_available = orchestrator_runtime_available
         # Promotion mutates a RunRecord's package list.  The single Observer
         # process serializes concurrent retries so two requests cannot both
@@ -227,42 +222,6 @@ class ObserverRepository:
         # (the hermetic test profile) and mirrored to Observer PostgreSQL when
         # one is available. Lease ids are never persisted in plaintext.
         self.agents: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-        if engine is None:
-            from loom_v2.slave.service import SlaveService
-
-            now = datetime.now(timezone.utc)
-            for slave_id in ("slave-a", "slave-b"):
-                embedded_slave = SlaveService(slave_id, content_store=self.content_store)
-                instance_id = f"embedded-{slave_id}"
-                self.agents[("workspace-default", "slave", slave_id, instance_id)] = {
-                    "workspace_id": "workspace-default",
-                    "role": "slave",
-                    "agent_id": slave_id,
-                    "instance_id": instance_id,
-                    "endpoint_url": f"http://{slave_id}",
-                    "protocol_version": "loom.v1",
-                    "capabilities": {
-                        "operations": sorted(embedded_slave.supported_operations),
-                        "base_operations": sorted(embedded_slave.supported_operations),
-                        "executor_descriptors": [
-                            {
-                                "package_type": descriptor.package_type,
-                                "kind": descriptor.kind,
-                                "version": descriptor.version,
-                            }
-                            for descriptor in embedded_slave.executor_registry.descriptors()
-                        ],
-                        "term_support": [item.model_dump(mode="json") for item in embedded_slave.term_support()],
-                    },
-                    "epoch": 1,
-                    "lease_id_hash": "",
-                    "lease_state": "active",
-                    "last_seen_at": now,
-                    "created_at": now,
-                    "updated_at": now,
-                }
-            seeded = [dict(item) for item in self.agents.values()]
-            self._store_slave_snapshot(seeded)
         self.driver_threads: dict[tuple[str, str], DriverThreadBinding] = {}
         self._driver_requests: dict[tuple[str, str], dict[str, Any]] = {}
         self._driver_request_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -316,23 +275,10 @@ class ObserverRepository:
                     if schema_ref is not None:
                         validate_schema(await self._load_json_content(schema_ref))
                 if contract.success_validator_ref is not None:
-                    self._require_content_ref(contract.success_validator_ref)
+                    require_content_ref(contract.success_validator_ref)
                     await self.content_store.get(contract.success_validator_ref)
             except (FileNotFoundError, TypeError, ValueError) as exc:
                 raise ValueError("io_contract_invalid") from exc
-
-    @staticmethod
-    def _single_export(package: CapabilityPackageVersion) -> CapabilityExport:
-        if len(package.capability_exports) != 1:
-            raise ValueError("capability_export_selection_required")
-        return package.capability_exports[0]
-
-    @staticmethod
-    def _package_body_ref(package: CapabilityPackageVersion, field_name: str) -> ResourceRef:
-        try:
-            return ResourceRef.model_validate(package.body[field_name])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"{field_name}_required") from exc
 
     @staticmethod
     def _message_receipt_from_row(row: MessageReceiptRow) -> MessageReceipt:
@@ -794,7 +740,7 @@ class ObserverRepository:
                 if key[0] == workspace_id
             ] if registration.role == "driver" else []
             recovery_runs = [
-                _run_record_payload(item)
+                run_record_payload(item)
                 for item in self.runs.values()
                 if item.closure_contract is not None
                 and item.closure_contract.workspace_id == workspace_id
@@ -908,7 +854,7 @@ class ObserverRepository:
                 for thread in thread_rows
             ]
             recovery_runs = [
-                _run_record_payload(item)
+                run_record_payload(item)
                 for item in await self._all_records()
                 if item.closure_contract is not None
                 and item.closure_contract.workspace_id == workspace_id
@@ -1022,7 +968,7 @@ class ObserverRepository:
                     await session.commit()
 
     async def list_agents(self, workspace_id: str, role: str | None = None) -> list[dict[str, Any]]:
-        lease_ttl = float(os.getenv("LOOM_AGENT_LEASE_TTL_SECONDS", "15"))
+        lease_ttl = self.settings.agent_lease_ttl_seconds
         cutoff = datetime.now(timezone.utc).timestamp() - max(1.0, lease_ttl)
         if self.sessions is None:
             rows = []
@@ -1072,7 +1018,7 @@ class ObserverRepository:
             for agent in agents
             if agent.get("agent_id")
         }
-        self.slave_agents = _select_slave_agents(agents)
+        self.slave_agents = select_slave_agents(agents)
         self.slave_capabilities = {}
         for slave_id, agent in self.slave_agents.items():
             if agent.get("lease_state") != "active":
@@ -1121,7 +1067,7 @@ class ObserverRepository:
                     if package is None or package.package_digest != activation.package_digest:
                         continue
                     projected.update(
-                        self._operation_name(export.capability_descriptor_ref.resource_id)
+                        operation_name(export.capability_descriptor_ref.resource_id)
                         for export in package.capability_exports
                     )
             details["operations"] = projected
@@ -1231,16 +1177,31 @@ class ObserverRepository:
         async with lock:
             return await self._execute_driver_command(command)
 
+    async def _admit_driver_arguments(self, name: str, args: dict[str, Any], workspace_id: str) -> None:
+        """Check resource scope and normalize package refs before dispatch."""
+        if name in DRIVER_RUN_SCOPED_COMMANDS and args.get("run_id") is not None:
+            try:
+                await self._assert_run_workspace(str(args["run_id"]), workspace_id)
+            except KeyError:
+                if name != "node.fail":
+                    raise
+        if name in {"capability.get", "capability.desire"}:
+            package_ref = args.get("package_ref")
+            if isinstance(package_ref, dict):
+                try:
+                    package_ref = ResourceRef.model_validate(package_ref)
+                except (TypeError, ValueError) as exc:
+                    if name == "capability.get":
+                        raise
+                    raise ValueError("capability_package_ref_invalid") from exc
+            args["package_ref"] = package_ref
+            await self._assert_package_workspace(package_ref, workspace_id, run_id=args.get("run_id"))
+        elif name == "capability.health" and args.get("run_id") is None:
+            report = args.get("report") or {}
+            await self._assert_package_workspace(str(report.get("package_version_ref") or ""), workspace_id)
+
     async def _execute_driver_command(self, command: DriverCommand) -> dict[str, Any]:
-        allowed = {
-            "run.open", "run.begin", "run.get", "run.patch", "run.commit", "run.start", "run.close", "run.cancel", "run.fail", "run.resolve",
-            "run.readiness", "run.recovery.list", "run.recovery.mark", "message.append", "message.claim", "message.update", "message.release", "agent_signal.record",
-            "run.result",
-            "thread.bind", "thread.get", "turn.state", "capability.list", "capability.get", "capability.health",
-            "capability.desire",
-            "node.accept", "node.dispatch", "node.reassign", "node.result", "node.fail",
-        }
-        if command.command not in allowed:
+        if command.command not in DRIVER_COMMANDS:
             raise ValueError("driver_command_not_allowed")
         requested_workspace = command.arguments.get("workspace_id")
         agents = await self.list_agents(str(requested_workspace or "workspace-default"), role="driver")
@@ -1275,45 +1236,15 @@ class ObserverRepository:
                     return deepcopy(existing.response)
         args = dict(command.arguments)
         workspace_id = str(agent["workspace_id"])
-        run_scoped_commands = {
-            "run.get", "run.begin", "run.patch", "run.commit", "run.start", "run.close", "run.cancel", "run.fail", "run.resolve",
-            "run.readiness", "message.append", "agent_signal.record", "capability.health", "capability.desire",
-            "node.accept", "node.dispatch", "node.reassign", "node.result", "node.fail",
-        }
-        if command.command in run_scoped_commands and args.get("run_id") is not None:
-            try:
-                await self._assert_run_workspace(str(args["run_id"]), workspace_id)
-            except KeyError:
-                if command.command != "node.fail":
-                    raise
-        if command.command == "capability.get":
-            package_ref = args.get("package_ref")
-            if isinstance(package_ref, dict):
-                package_ref = ResourceRef.model_validate(package_ref)
-            args["package_ref"] = package_ref
-            await self._assert_package_workspace(package_ref, workspace_id, run_id=args.get("run_id"))
-        elif command.command == "capability.health" and args.get("run_id") is None:
-            report = args.get("report") or {}
-            await self._assert_package_workspace(str(report.get("package_version_ref") or ""), workspace_id)
-        elif command.command == "capability.desire":
-            package_ref = args.get("package_ref")
-            if isinstance(package_ref, dict):
-                try:
-                    package_ref = ResourceRef.model_validate(package_ref)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError("capability_package_ref_invalid") from exc
-                args["package_ref"] = package_ref
-            await self._assert_package_workspace(
-                package_ref, workspace_id, run_id=args.get("run_id")
-            )
+        await self._admit_driver_arguments(command.command, args, workspace_id)
         if command.command == "run.open":
             contract = args.get("closure_contract")
             result = (await self.open_run(args.get("run_id"), str(args.get("task_ref") or args.get("conversation_ref") or ""), str(args.get("goal") or (contract or {}).get("goal") or ""), bool(args.get("allow_reassignment", False)), ClosureContract.model_validate(contract) if contract else None, user_id=str(args.get("user_id", "user-default")), workspace_id=workspace_id)).__dict__
             result = {"run_id": result["run_id"], "state": result["state"], "draft_version": result["draft"].version_id, "draft_digest": result["draft"].snapshot_digest}
         elif command.command == "run.begin":
-            result = _run_record_payload(await self.begin_refinement(str(args["run_id"])))
+            result = run_record_payload(await self.begin_refinement(str(args["run_id"])))
         elif command.command == "run.get":
-            result = _run_record_payload(await self.get_run(str(args["run_id"])))
+            result = run_record_payload(await self.get_run(str(args["run_id"])))
         elif command.command == "run.patch":
             run = await self.get_run(str(args["run_id"]))
             receipt = await self.apply_patch(run.run_id, run.draft_version, run.draft_digest, str(args.get("operation_id") or command.request_id), list(args.get("ops", [])))
@@ -1327,29 +1258,29 @@ class ObserverRepository:
             reported = dict(args["result"])
             final_ref = reported.pop("orchestration_final_ref", None)
             if final_ref is not None:
-                result = _run_record_payload(await self.complete_orchestration(str(args["run_id"]), ResourceRef.model_validate(final_ref)))
+                result = run_record_payload(await self.complete_orchestration(str(args["run_id"]), ResourceRef.model_validate(final_ref)))
             else:
-                result = _run_record_payload(await self.record_result(str(args["run_id"]), reported))
+                result = run_record_payload(await self.record_result(str(args["run_id"]), reported))
         elif command.command == "run.close":
-            result = _run_record_payload(await self.close_run(str(args["run_id"])))
+            result = run_record_payload(await self.close_run(str(args["run_id"])))
         elif command.command == "run.cancel":
             reason = args.get("reason", "user_interrupt")
             if not isinstance(reason, (str, dict)):
                 reason = str(reason)
-            result = _run_record_payload(await self.cancel_run(str(args["run_id"]), reason))
+            result = run_record_payload(await self.cancel_run(str(args["run_id"]), reason))
         elif command.command == "run.fail":
             reason = args.get("reason", {"code": "driver_failure"})
             if not isinstance(reason, (str, dict)):
                 reason = str(reason)
-            result = _run_record_payload(await self.fail_run(str(args["run_id"]), reason))
+            result = run_record_payload(await self.fail_run(str(args["run_id"]), reason))
         elif command.command == "run.resolve":
-            result = _run_record_payload(await self.resolve_run(str(args["run_id"]), str(args.get("decision") or "")))
+            result = run_record_payload(await self.resolve_run(str(args["run_id"]), str(args.get("decision") or "")))
         elif command.command == "run.readiness":
             result = await self.inspect_readiness(str(args["run_id"]), args.get("version_id"))
         elif command.command == "run.recovery.list":
             result = {
                 "runs": [
-                    _run_record_payload(item)
+                    run_record_payload(item)
                     for item in await self._all_records()
                     if item.state in {"thinking", "running"}
                     and (item.closure_contract is None or item.closure_contract.workspace_id == workspace_id)
@@ -1420,22 +1351,10 @@ class ObserverRepository:
                 "packages": [item.model_dump(mode="json") for item in await self.list_capability_packages(run_id=args.get("run_id"), include_abandoned=bool(args.get("include_abandoned", False)))],
             }
         elif command.command == "capability.get":
-            package_ref = args["package_ref"]
-            if isinstance(package_ref, dict):
-                try:
-                    package_ref = ResourceRef.model_validate(package_ref)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError("capability_package_ref_invalid") from exc
-            result = (await self.get_capability_package(package_ref, run_id=args.get("run_id"))).model_dump(mode="json")
+            result = (await self.get_capability_package(args["package_ref"], run_id=args.get("run_id"))).model_dump(mode="json")
         elif command.command == "capability.desire":
-            package_ref = args["package_ref"]
-            if isinstance(package_ref, dict):
-                try:
-                    package_ref = ResourceRef.model_validate(package_ref)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError("capability_package_ref_invalid") from exc
             activation = await self.set_capability_desired(
-                package_ref,
+                args["package_ref"],
                 str(args["target_slave"]),
                 desired_state=str(args["desired_state"]),
                 idempotency_key=str(args["idempotency_key"]),
@@ -1492,26 +1411,16 @@ class ObserverRepository:
         if self.engine is None:
             return
         async with self.engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
             if connection.dialect.name == "postgresql":
-                await connection.execute(text("ALTER TABLE runs ADD COLUMN IF NOT EXISTS closure_contract JSONB"))
-                await connection.execute(text("ALTER TABLE runs ADD COLUMN IF NOT EXISTS capability_packages JSONB NOT NULL DEFAULT '[]'::jsonb"))
-                await connection.execute(text("ALTER TABLE runs ADD COLUMN IF NOT EXISTS capability_activations JSONB NOT NULL DEFAULT '[]'::jsonb"))
-                await connection.execute(text("ALTER TABLE runs ADD COLUMN IF NOT EXISTS dynamic_nodes JSONB NOT NULL DEFAULT '[]'::jsonb"))
-            await connection.execute(
-                text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_runtime_agents_active_agent "
-                    "ON runtime_agents (workspace_id, role, agent_id) "
-                    "WHERE lease_state = 'active'"
-                )
-            )
-            await connection.execute(
-                text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_runtime_agents_active_driver "
-                    "ON runtime_agents (workspace_id) "
-                    "WHERE role = 'driver' AND lease_state = 'active'"
-                )
-            )
+                await apply_migrations(connection, "observer")
+            else:
+                # SQLite is the intentionally ephemeral test backend.  It has
+                # no production upgrade path, so metadata creation keeps the
+                # persistence tests hermetic without becoming a second
+                # PostgreSQL schema owner.
+                from loom_v2.db.base import Base
+
+                await connection.run_sync(Base.metadata.create_all)
 
     async def recover_stale_runs(self, active_run_ids: set[str] | None = None) -> list[str]:
         """Fence Runs left active by a lost Observer/Driver process.
@@ -1542,7 +1451,7 @@ class ObserverRepository:
                     )
                     replayable = (
                         package is not None
-                        and self._single_export(package).replay_safety == "DeterministicByEventLog"
+                        and single_export(package).replay_safety == "DeterministicByEventLog"
                         and not bool(package.body.get("captures_run_state", False))
                         and not package.body.get("captured_secret_refs")
                         and not package.body.get("captured_path_refs")
@@ -1804,12 +1713,6 @@ class ObserverRepository:
         latest = max(records, key=cls._record_order_key)
         return cls._conversation_status_for_state(latest.state)
 
-    @staticmethod
-    def _operation_name(operation_ref: str) -> str:
-        if not operation_ref:
-            return ""
-        return operation_ref.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
-
     def _canonical_target_resource_id(self, resource_id: str) -> str:
         """Resolve common capability-URI spellings to a registered Slave id."""
         if resource_id in self.slave_capabilities:
@@ -1821,42 +1724,12 @@ class ObserverRepository:
         return resource_id
 
     def _slave_supports_package(self, slave_id: str, package: CapabilityPackageVersion) -> bool:
-        details = self.slave_capabilities.get(slave_id)
-        agent = self.slave_agents.get(slave_id)
-        if details is None or agent is None or agent.get("lease_state") != "active":
-            return False
-        declared_executors = (
-            details.get("executor_kinds")
-            or details.get("executors")
-            or details.get("executor_descriptors")
+        return slave_supports_package(
+            slave_id,
+            package,
+            agents=self.slave_agents,
+            capabilities=self.slave_capabilities,
         )
-        if declared_executors:
-            raw_executors = [declared_executors] if isinstance(declared_executors, str) else declared_executors
-            if any(
-                isinstance(item, dict)
-                and (
-                    str(item.get("package_type") or ""),
-                    str(item.get("kind") or ""),
-                    str(item.get("version") or "1"),
-                )
-                == (package.package_type, package.execution.kind, package.execution.version)
-                for item in raw_executors
-            ):
-                return True
-        descriptors = details.get("runtime_plugin_descriptors") or details.get("runtime_plugins") or []
-        for descriptor in descriptors if isinstance(descriptors, list) else []:
-            supports = descriptor.get("supports", []) if isinstance(descriptor, dict) else []
-            for support in supports if isinstance(supports, list) else []:
-                if not isinstance(support, dict):
-                    continue
-                execution = support.get("execution") if isinstance(support.get("execution"), dict) else support
-                if (
-                    str(support.get("package_type") or "") == package.package_type
-                    and str(support.get("execution_kind") or execution.get("kind") or "") == package.execution.kind
-                    and str(support.get("execution_version") or execution.get("version") or "1") == package.execution.version
-                ):
-                    return True
-        return False
 
     def _slave_is_active(self, slave_id: str) -> bool:
         agent = self.slave_agents.get(slave_id)
@@ -2309,15 +2182,10 @@ class ObserverRepository:
         self._project_ready_capabilities(report.target_slave)
         return activation
 
-    @staticmethod
-    def _input_binding_for(snapshot: TaskClosure, operation_ref: str) -> NodeInputBinding | None:
-        candidates = {operation_ref, ObserverRepository._operation_name(operation_ref), "default"}
-        return next((binding for binding in snapshot.node_input_bindings if binding.node_id in candidates), None)
-
     @classmethod
     def _input_digest_for(cls, snapshot: TaskClosure) -> str | None:
         operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
-        binding = cls._input_binding_for(snapshot, operation_ref)
+        binding = input_binding_for(snapshot, operation_ref)
         return binding.input_ref.digest if binding is not None else None
 
     @staticmethod
@@ -2337,27 +2205,13 @@ class ObserverRepository:
         if max_attempts < 0 or len(record.attempts) >= max_attempts:
             raise ValueError("orchestration_attempt_limit_exceeded")
 
-    @staticmethod
-    def _require_content_ref(ref: ResourceRef) -> None:
-        prefix = "content://sha256/"
-        if not ref.resource_id.startswith(prefix):
-            raise ValueError("content_ref_required")
-        resource_digest = ref.resource_id.removeprefix(prefix)
-        digest = ref.digest or ""
-        if len(digest) != 64 or any(char not in "0123456789abcdefABCDEF" for char in digest):
-            raise ValueError("content_ref_required")
-        if resource_digest.lower() != digest.lower():
-            raise ValueError("content_ref_digest_mismatch")
-        if ref.identity_criterion not in {None, "content_digest"}:
-            raise ValueError("content_ref_required")
-
     @classmethod
     def _collect_content_ref_digests(cls, value: Any, output: set[str]) -> None:
         if isinstance(value, dict):
             if "resource_id" in value:
                 try:
                     ref = ResourceRef.model_validate(value)
-                    cls._require_content_ref(ref)
+                    require_content_ref(ref)
                     output.add((ref.digest or "").lower())
                 except (TypeError, ValueError):
                     pass
@@ -2368,7 +2222,7 @@ class ObserverRepository:
                 cls._collect_content_ref_digests(item, output)
 
     async def _load_json_content(self, ref: ResourceRef) -> Any:
-        self._require_content_ref(ref)
+        require_content_ref(ref)
         raw = await self.content_store.get(ref)
         try:
             return json.loads(raw)
@@ -2406,7 +2260,7 @@ class ObserverRepository:
         schema_ref = io_contract.input_schema_ref
         if schema_ref is None:
             return blockers
-        binding = self._input_binding_for(snapshot, operation_ref)
+        binding = input_binding_for(snapshot, operation_ref)
         if binding is None:
             blockers.append(
                 {
@@ -2453,8 +2307,8 @@ class ObserverRepository:
             return [{"code": "orchestration_package_invalid"}]
         blockers: list[dict[str, Any]] = []
         try:
-            capability_export = self._single_export(package)
-            program_content_ref = self._package_body_ref(package, "program_content_ref")
+            capability_export = single_export(package)
+            program_content_ref = package_body_ref(package, "program_content_ref")
             allowed_node_package_refs = [
                 ResourceRef.model_validate(item)
                 for item in package.body["allowed_node_package_refs"]
@@ -2574,7 +2428,7 @@ class ObserverRepository:
                 workspace_id = record.closure_contract.workspace_id if record.closure_contract is not None else "workspace-default"
                 await self.refresh_slaves(workspace_id)
         operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
-        operation = self._operation_name(operation_ref)
+        operation = operation_name(operation_ref)
         blockers: list[dict[str, Any]] = []
         inline_io_fields = [
             field_name
@@ -3090,7 +2944,7 @@ class ObserverRepository:
                 ) == DRIVER_ORCHESTRATOR_KEY:
                     snapshot.program_systems.execution = package.execution
                     snapshot.program_systems.package_ref = ResourceRef(resource_id=self._package_ref(package), version_or_digest=package.package_digest)
-                    snapshot.program_systems.replay_safety = self._single_export(package).replay_safety
+                    snapshot.program_systems.replay_safety = single_export(package).replay_safety
                 snapshot.metadata.setdefault("capability_package_refs", []).append(self._package_ref(package))
             elif kind == "bind_compute_hole":
                 value = operation.get("value", {})
@@ -3603,7 +3457,7 @@ class ObserverRepository:
             "parent_execution_ref": record.execution_id,
             "closure_version_ref": record.committed.version_id if record.committed is not None else record.draft.version_id,
             "orchestration_package_ref": package_ref.model_dump(mode="json") if package_ref is not None else None,
-            "orchestration_program_ref": self._package_body_ref(package, "program_content_ref").model_dump(mode="json") if package is not None else None,
+            "orchestration_program_ref": package_body_ref(package, "program_content_ref").model_dump(mode="json") if package is not None else None,
         }
 
     async def accept_node_intent(
@@ -3755,7 +3609,7 @@ class ObserverRepository:
         authorized_digests: set[str] = set()
         for binding in snapshot.node_input_bindings:
             try:
-                self._require_content_ref(binding.input_ref)
+                require_content_ref(binding.input_ref)
                 authorized_digests.add((binding.input_ref.digest or "").lower())
                 root_value = await self._load_json_content(binding.input_ref)
             except (FileNotFoundError, TypeError, ValueError):
@@ -3766,13 +3620,13 @@ class ObserverRepository:
                 continue
             try:
                 result_ref = ResourceRef.model_validate(attempt["result_ref"])
-                self._require_content_ref(result_ref)
+                require_content_ref(result_ref)
                 authorized_digests.add((result_ref.digest or "").lower())
             except (TypeError, ValueError):
                 continue
         for input_ref in intent.input_refs:
             try:
-                self._require_content_ref(input_ref)
+                require_content_ref(input_ref)
                 await self._load_json_content(input_ref)
             except (FileNotFoundError, TypeError, ValueError) as exc:
                 raise ValueError("node_input_unavailable") from exc
@@ -3985,7 +3839,7 @@ class ObserverRepository:
                     raise ValueError("node_permission_denied")
             for input_ref in node.input_refs:
                 try:
-                    self._require_content_ref(input_ref)
+                    require_content_ref(input_ref)
                     await self._load_json_content(input_ref)
                 except (FileNotFoundError, TypeError, ValueError) as exc:
                     raise ValueError("node_input_unavailable") from exc

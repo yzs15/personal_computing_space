@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
-from loom_v2.observer.app import create_app
+from loom_v2.testing.observer import create_embedded_app as create_app
+from loom_v2.observer.app import create_app as create_production_app
 
 
 def test_runtime_reports_codex_backend_and_model(monkeypatch):
@@ -33,7 +34,7 @@ def test_runtime_identifies_fake_backend_for_test_profile(monkeypatch):
 def test_runtime_reports_driver_unavailable_in_split_deployment(monkeypatch):
     monkeypatch.setenv("LOOM_INTERNAL_API_SECRET", "test-internal-secret")
 
-    response = TestClient(create_app()).get("/api/v1/runtime")
+    response = TestClient(create_production_app()).get("/api/v1/runtime")
 
     assert response.status_code == 503
     assert response.json() == {"code": "driver_unavailable", "retryable": True}

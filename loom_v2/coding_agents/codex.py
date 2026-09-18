@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import json
-import os
 import time
 from collections.abc import AsyncIterator
 from typing import Any, Awaitable, Callable
@@ -11,6 +10,7 @@ from typing import Any, Awaitable, Callable
 from .base import AgentEvent
 from .turn import TurnContext
 from loom_v2.contracts.errors import DomainError
+from loom_v2.settings import Settings
 
 
 class CodexAppServerProvider:
@@ -20,27 +20,26 @@ class CodexAppServerProvider:
         executable: str = "codex",
         poll_interval_seconds: float | None = None,
         protocol_failure_seconds: float | None = None,
+        settings: Settings | None = None,
     ) -> None:
-        self.model = model or os.getenv("LOOM_CODEX_MODEL", "deepseek-v4-flash")
+        config = settings or Settings()
+        self.workspace_id = config.workspace_id
+        self.model = model or config.codex_model
         self.executable = executable
         self.poll_interval_seconds = (
             poll_interval_seconds
             if poll_interval_seconds is not None
-            else float(os.getenv("LOOM_CODING_AGENT_POLL_INTERVAL_SECONDS", "5"))
+            else config.coding_agent_poll_interval_seconds
         )
         self.protocol_failure_seconds = (
             protocol_failure_seconds
             if protocol_failure_seconds is not None
-            else float(os.getenv("LOOM_CODING_AGENT_PROTOCOL_FAILURE_SECONDS", "60"))
+            else config.coding_agent_protocol_failure_seconds
         )
         self.clock: Callable[[], float] = time.monotonic
         self.process: asyncio.subprocess.Process | None = None
         self.request_id = 0
-        configured_message_limit = os.getenv("LOOM_CODEX_MESSAGE_LIMIT_BYTES", str(16 * 1024 * 1024))
-        try:
-            self.message_limit_bytes = max(1024, int(configured_message_limit))
-        except ValueError:
-            self.message_limit_bytes = 16 * 1024 * 1024
+        self.message_limit_bytes = max(1024, config.codex_message_limit_bytes)
         self._read_buffer = bytearray()
         self.thread_id: str | None = None
         self.current_turn_id: str | None = None
@@ -84,7 +83,7 @@ class CodexAppServerProvider:
     ) -> TurnContext:
         await self._turn_lock.acquire()
         context = TurnContext(
-            workspace_id=os.getenv("LOOM_WORKSPACE_ID", "workspace-default"),
+            workspace_id=self.workspace_id,
             conversation_ref=conversation_ref,
             request_id=request_id,
             claim_token="",

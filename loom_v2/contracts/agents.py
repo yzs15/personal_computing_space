@@ -7,6 +7,26 @@ from pydantic import Field, model_validator
 from .types import ContractModel
 
 
+DRIVER_COMMANDS = frozenset({
+    "run.open", "run.begin", "run.get", "run.patch", "run.commit", "run.start",
+    "run.close", "run.cancel", "run.fail", "run.resolve", "run.readiness",
+    "run.recovery.list", "run.recovery.mark", "run.result",
+    "message.append", "message.claim", "message.update", "message.release",
+    "agent_signal.record", "thread.bind", "thread.get", "turn.state",
+    "capability.list", "capability.get", "capability.health", "capability.desire",
+    "node.accept", "node.dispatch", "node.reassign", "node.result", "node.fail",
+})
+
+# Commands whose optional run_id is admitted before executing their handler.
+# Recovery and capability listing enforce their own collection scope.
+DRIVER_RUN_SCOPED_COMMANDS = frozenset({
+    "run.get", "run.begin", "run.patch", "run.commit", "run.start", "run.close",
+    "run.cancel", "run.fail", "run.resolve", "run.readiness", "run.result",
+    "message.append", "agent_signal.record", "capability.health", "capability.desire",
+    "node.accept", "node.dispatch", "node.reassign", "node.result", "node.fail",
+})
+
+
 class AgentRegistration(ContractModel):
     role: Literal["driver", "slave"]
     agent_id: str = Field(min_length=1)

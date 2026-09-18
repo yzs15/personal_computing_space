@@ -42,6 +42,30 @@ def test_observer_starts_without_registered_slave_or_driver():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("orchestrated", [False, True])
+async def test_result_command_rejects_another_workspace_before_result_handler(monkeypatch, orchestrated):
+    repo = ObserverRepository()
+    lease = await repo.register_agent(AgentRegistration.model_validate(registration("instance-1")))
+    await repo.open_run("foreign-run", "foreign-conversation", "goal", workspace_id="other-workspace")
+    before = (await repo.get_run("foreign-run")).state
+
+    async def forbidden_handler(*args, **kwargs):
+        pytest.fail("result handler must not run for another workspace")
+
+    monkeypatch.setattr(repo, "record_result", forbidden_handler)
+    monkeypatch.setattr(repo, "complete_orchestration", forbidden_handler)
+    result = {"orchestration_final_ref": {"resource_id": "unused"}} if orchestrated else {}
+    with pytest.raises(ValueError, match="^workspace_binding_mismatch$"):
+        await repo.execute_driver_command(DriverCommand(
+            request_id="foreign-result", driver_id=lease.agent_id, instance_id=lease.instance_id,
+            lease_id=lease.lease_id, driver_epoch=lease.epoch, command="run.result",
+            arguments={"run_id": "foreign-run", "result": result},
+        ))
+    assert (await repo.get_run("foreign-run")).state == before
+    assert (lease.agent_id, "foreign-result") not in repo._driver_requests
+
+
+@pytest.mark.asyncio
 async def test_node_fail_command_passes_attempt_and_error_as_keywords():
     repo = ObserverRepository()
     lease = await repo.register_agent(

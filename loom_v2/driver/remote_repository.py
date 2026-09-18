@@ -19,23 +19,16 @@ from loom_v2.contracts.types import (
     ResourceRef,
     TaskClosure,
 )
+from loom_v2.contracts.refs import (
+    input_binding_for,
+    operation_name,
+    package_body_ref,
+    select_slave_agents,
+    single_export,
+    slave_supports_package,
+)
 
 from .control_client import ObserverControlClient
-
-
-def _select_slave_agents(agents: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    selected: dict[str, dict[str, Any]] = {}
-    for agent in agents:
-        slave_id = str(agent.get("agent_id") or "")
-        if not slave_id:
-            continue
-        current = selected.get(slave_id)
-        if current is None or (
-            agent.get("lease_state") == "active"
-            and current.get("lease_state") != "active"
-        ):
-            selected[slave_id] = dict(agent)
-    return selected
 
 
 @dataclass
@@ -148,7 +141,7 @@ class RemoteObserverRepository:
             for agent in agents
             if agent.get("agent_id")
         }
-        self.slave_agents = _select_slave_agents(agents)
+        self.slave_agents = select_slave_agents(agents)
         self.slave_capabilities = {}
         for slave_id, agent in self.slave_agents.items():
             if agent.get("lease_state") != "active":
@@ -165,42 +158,12 @@ class RemoteObserverRepository:
         return agents
 
     def _slave_supports_package(self, slave_id: str, package: CapabilityPackageVersion) -> bool:
-        agent = self.slave_agents.get(slave_id)
-        if agent is None or agent.get("lease_state") != "active":
-            return False
-        details = self.slave_capabilities.get(slave_id, {})
-        declared_executors = (
-            details.get("executor_kinds")
-            or details.get("executors")
-            or details.get("executor_descriptors")
+        return slave_supports_package(
+            slave_id,
+            package,
+            agents=self.slave_agents,
+            capabilities=self.slave_capabilities,
         )
-        if declared_executors:
-            raw_executors = [declared_executors] if isinstance(declared_executors, str) else declared_executors
-            if any(
-                isinstance(item, dict)
-                and (
-                    str(item.get("package_type") or ""),
-                    str(item.get("kind") or ""),
-                    str(item.get("version") or "1"),
-                )
-                == (package.package_type, package.execution.kind, package.execution.version)
-                for item in raw_executors
-            ):
-                return True
-        descriptors = details.get("runtime_plugin_descriptors") or details.get("runtime_plugins") or []
-        for descriptor in descriptors if isinstance(descriptors, list) else []:
-            supports = descriptor.get("supports", []) if isinstance(descriptor, dict) else []
-            for support in supports if isinstance(supports, list) else []:
-                if not isinstance(support, dict):
-                    continue
-                execution = support.get("execution") if isinstance(support.get("execution"), dict) else support
-                if (
-                    str(support.get("package_type") or "") == package.package_type
-                    and str(support.get("execution_kind") or execution.get("kind") or "") == package.execution.kind
-                    and str(support.get("execution_version") or execution.get("version") or "1") == package.execution.version
-                ):
-                    return True
-        return False
 
     async def accept_node_intent(self, run_id: str, intent: NodeIntent, *, selected_target: str) -> DynamicNode:
         payload = await self.control.command(
@@ -312,33 +275,3 @@ class RemoteObserverRepository:
         import json
 
         return json.loads(raw)
-
-    @staticmethod
-    def _input_binding_for(snapshot: TaskClosure, operation_ref: str):
-        candidates = {operation_ref, operation_ref.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1], "default"}
-        return next((binding for binding in snapshot.node_input_bindings if binding.node_id in candidates), None)
-
-    @staticmethod
-    def _operation_name(operation_ref: str) -> str:
-        return str(operation_ref or "").rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
-
-    @staticmethod
-    def _single_export(package: CapabilityPackageVersion) -> CapabilityExport:
-        """Return the sole export for an execution package.
-
-        Dynamic orchestration uses the same package-shape validation for the
-        in-process and remote Observer repositories.  Keeping this helper on
-        the remote read model avoids making the Driver reach into Observer's
-        persistence implementation while preserving the exact error raised
-        for multi-export packages that require an explicit descriptor.
-        """
-        if len(package.capability_exports) != 1:
-            raise ValueError("capability_export_selection_required")
-        return package.capability_exports[0]
-
-    @staticmethod
-    def _package_body_ref(package: CapabilityPackageVersion, field_name: str) -> ResourceRef:
-        try:
-            return ResourceRef.model_validate(package.body[field_name])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"{field_name}_required") from exc

@@ -9,6 +9,7 @@ from loom_v2.observer.repository import ObserverRepository
 from loom_v2.driver.worker import WorkerSession
 from loom_v2.slave.app import create_app as create_slave_app
 from tests.support.package_fixture import orchestration_package_value, process_package_value
+from loom_v2.testing.observer import seed_embedded_slaves
 
 
 async def _put(mcp: DriverMCP, content, media_type: str) -> ResourceRef:
@@ -20,6 +21,7 @@ async def _put(mcp: DriverMCP, content, media_type: str) -> ResourceRef:
 @pytest.mark.asyncio
 async def test_dynamic_distributed_map_reduce_analysis():
     repo = ObserverRepository()
+    seed_embedded_slaves(repo)
     mcp = DriverMCP(repo, "conversation-dynamic-analysis")
     parent_input_schema = await _put(mcp, {"type": "object", "required": ["partitions"]}, "application/schema+json")
     summarize_input_schema = await _put(mcp, {"type": "object", "required": ["items"]}, "application/schema+json")

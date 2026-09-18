@@ -22,4 +22,3 @@ def test_production_message_endpoint_persists_receipt_without_driver(monkeypatch
             json={"request_id": "req-api", "conversation_ref": "conversation-api", "text": "different"},
         )
         assert reused.status_code == 409
-

@@ -14,6 +14,7 @@ from loom_v2.contracts.types import (
     ResourceRef,
     TaskClosure,
 )
+from loom_v2.contracts.refs import input_binding_for, operation_name, package_body_ref, single_export
 from loom_v2.contracts.package_contracts import DRIVER_ORCHESTRATOR_KEY
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.driver.worker import WorkerSession, WorkerUnavailableError
@@ -71,7 +72,7 @@ class DynamicOrchestrationRuntime:
                 orchestration_package.execution.version,
             ) != DRIVER_ORCHESTRATOR_KEY:
                 raise RuntimeError("orchestration_package_invalid")
-            orchestration_export = self.repository._single_export(orchestration_package)
+            orchestration_export = single_export(orchestration_package)
             if (
                 orchestration_export.replay_safety != "DeterministicByEventLog"
                 or bool(orchestration_package.body.get("captures_run_state", False))
@@ -81,13 +82,13 @@ class DynamicOrchestrationRuntime:
                 raise RuntimeError("orchestration_not_replayable")
             if int(orchestration_package.body["max_live_nodes"]) > int(orchestration_package.body["max_nodes"]):
                 raise RuntimeError("orchestration_live_node_limit_exceeded")
-            program_ref = self.repository._package_body_ref(orchestration_package, "program_content_ref")
+            program_ref = package_body_ref(orchestration_package, "program_content_ref")
             program = await self.repository.content_store.get(
                 program_ref,
                 expected_digest=program_ref.digest,
             )
             operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
-            input_binding = self.repository._input_binding_for(snapshot, operation_ref)
+            input_binding = input_binding_for(snapshot, operation_ref)
             if input_binding is None:
                 raise RuntimeError("orchestration_input_missing")
         except BaseException as exc:
@@ -452,7 +453,7 @@ class DynamicOrchestrationRuntime:
             idempotency_key=desired.last_idempotency_key,
             activation_revision=desired.activation_revision,
         )
-        operation = self.repository._operation_name(operation_ref)
+        operation = operation_name(operation_ref)
         worker = self.workers.get(target)
         if worker is not None:
             report = await worker.provision(command=command, package=package, driver_id=self.driver_id, driver_epoch=self.driver_epoch)

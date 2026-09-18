@@ -1,29 +1,22 @@
 from __future__ import annotations
 
-import asyncio
 import os
 from typing import Any
 from uuid import uuid4
 
 import httpx
 
-from loom_v2.contracts.agents import AgentLease, AgentRegistration, DriverCommand
+from loom_v2.contracts.agents import DRIVER_COMMANDS, AgentLease, AgentRegistration, DriverCommand
 from loom_v2.contracts.errors import DomainError, DomainErrorEnvelope
 from loom_v2.contracts.types import CapabilityPackageVersion, ResourceRef
+from loom_v2.internal_http import InternalHttpClient
+from loom_v2.settings import Settings
 
 
 class ObserverControlClient:
     """Small authenticated client for Observer's fixed Driver RPC surface."""
 
-    ALLOWED_COMMANDS = frozenset(
-        {
-            "run.open", "run.begin", "run.get", "run.patch", "run.commit", "run.start", "run.close", "run.cancel", "run.fail", "run.resolve",
-            "run.readiness", "run.recovery.list", "run.recovery.mark", "message.append", "message.claim", "message.update", "message.release", "agent_signal.record",
-            "run.result",
-            "thread.bind", "thread.get", "turn.state", "capability.list", "capability.get", "capability.health", "capability.desire",
-            "node.accept", "node.dispatch", "node.reassign", "node.result", "node.fail",
-        }
-    )
+    ALLOWED_COMMANDS = DRIVER_COMMANDS
 
     def __init__(
         self,
@@ -37,16 +30,23 @@ class ObserverControlClient:
         internal_api_secret: str | None = None,
         timeout: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        settings: Settings | None = None,
     ) -> None:
+        config = settings or Settings()
         self.observer_url = observer_url.rstrip("/")
         self.driver_id = driver_id
         self.instance_id = instance_id
         self.lease_id = lease_id
         self.driver_epoch = driver_epoch
         self.workspace_id = workspace_id
-        self.internal_api_secret = internal_api_secret if internal_api_secret is not None else os.getenv("LOOM_INTERNAL_API_SECRET", "")
+        self.driver_url = config.driver_url or "http://driver:8090"
+        self.internal_api_secret = internal_api_secret if internal_api_secret is not None else config.internal_api_secret
         self.timeout = timeout
         self.transport = transport
+        self._http = InternalHttpClient(timeout=timeout, transport=transport)
+
+    async def close(self) -> None:
+        await self._http.close()
 
     def _headers(self) -> dict[str, str]:
         if not self.internal_api_secret:
@@ -56,9 +56,14 @@ class ObserverControlClient:
     async def _request(self, method: str, path: str, payload: dict[str, Any] | None = None, *, timeout: float | None = None) -> dict[str, Any]:
         request_timeout = timeout if timeout is not None else self.timeout
         try:
-            async with asyncio.timeout(request_timeout):
-                async with httpx.AsyncClient(timeout=request_timeout, transport=self.transport) as client:
-                    response = await client.request(method, f"{self.observer_url}{path}", json=payload, headers=self._headers())
+            self._http.transport = self.transport
+            response = await self._http.request(
+                method,
+                f"{self.observer_url}{path}",
+                json=payload,
+                headers=self._headers(),
+                timeout=request_timeout,
+            )
         except (TimeoutError, httpx.TimeoutException, httpx.TransportError) as exc:
             raise RuntimeError("observer_unavailable") from exc
         if response.status_code >= 400:
@@ -85,7 +90,7 @@ class ObserverControlClient:
             agent_id=self.driver_id,
             instance_id=self.instance_id,
             workspace_id=self.workspace_id,
-            endpoint_url=os.getenv("LOOM_DRIVER_URL", "http://driver:8090"),
+            endpoint_url=self.driver_url,
             protocol_version="loom.v1",
         )
         payload = await self._request("POST", "/internal/v1/agents/register", registration.model_dump(mode="json"))
@@ -96,11 +101,11 @@ class ObserverControlClient:
         return lease
 
     async def heartbeat(self) -> AgentLease:
-        self._require_lease()
+        lease_id, driver_epoch = self._require_lease()
         payload = await self._request(
             "POST",
             f"/internal/v1/agents/{self.driver_id}/heartbeat",
-            {"instance_id": self.instance_id, "workspace_id": self.workspace_id, "lease_id": self.lease_id, "epoch": self.driver_epoch, "driver_epoch": self.driver_epoch, "role": "driver"},
+            {"instance_id": self.instance_id, "workspace_id": self.workspace_id, "lease_id": lease_id, "epoch": driver_epoch, "driver_epoch": driver_epoch, "role": "driver"},
         )
         lease = AgentLease.model_validate(payload)
         self.lease_id = lease.lease_id
@@ -116,20 +121,21 @@ class ObserverControlClient:
             {"instance_id": self.instance_id, "workspace_id": self.workspace_id, "lease_id": self.lease_id, "epoch": self.driver_epoch, "driver_epoch": self.driver_epoch, "role": "driver"},
         )
 
-    def _require_lease(self) -> None:
+    def _require_lease(self) -> tuple[str, int]:
         if not self.lease_id or self.driver_epoch is None:
             raise RuntimeError("driver_not_registered")
+        return self.lease_id, self.driver_epoch
 
     async def command(self, command: str, arguments: dict[str, Any] | None = None, *, request_id: str | None = None) -> dict[str, Any]:
         if command not in self.ALLOWED_COMMANDS:
             raise ValueError("driver_command_not_allowed")
-        self._require_lease()
+        lease_id, driver_epoch = self._require_lease()
         envelope = DriverCommand(
             request_id=request_id or f"driver-request-{os.urandom(8).hex()}",
             driver_id=self.driver_id,
             instance_id=self.instance_id,
-            lease_id=str(self.lease_id),
-            driver_epoch=int(self.driver_epoch),
+            lease_id=lease_id,
+            driver_epoch=driver_epoch,
             command=command,
             arguments={**(arguments or {}), "workspace_id": self.workspace_id},
         )

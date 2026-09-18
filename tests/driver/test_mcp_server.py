@@ -2,7 +2,7 @@ import json
 
 from fastapi.testclient import TestClient
 
-from loom_v2.observer.app import create_app
+from loom_v2.testing.observer import create_embedded_app as create_app
 from loom_v2.observer.repository import ObserverRepository
 
 

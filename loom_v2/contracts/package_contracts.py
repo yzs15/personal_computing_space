@@ -3,7 +3,6 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, field
 import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -340,9 +339,11 @@ package_contract_registry = PackageContractRegistry()
 package_contract_registry.register(("function", "process:json_stdio", "1"), PROCESS_JSON_STDIO_V1_SCHEMA)
 package_contract_registry.register(DRIVER_ORCHESTRATOR_KEY, PYTHON_ORCHESTRATOR_V1_SCHEMA)
 package_contract_registry.register(("service", "container:http", "1"), CONTAINER_HTTP_V1_SCHEMA)
-package_contract_registry.load_directory(
-    os.getenv("LOOM_PACKAGE_CONTRACT_DIR", "/opt/loom/package-contracts")
-)
+
+
+def load_operator_package_contracts(directory: str | Path) -> list[PackageContractKey]:
+    """Load operator-owned schemas from an explicit composition-root setting."""
+    return package_contract_registry.load_directory(directory)
 
 
 __all__ = [
@@ -353,4 +354,5 @@ __all__ = [
     "PYTHON_ORCHESTRATOR_V1_SCHEMA",
     "CONTAINER_HTTP_V1_SCHEMA",
     "package_contract_registry",
+    "load_operator_package_contracts",
 ]

@@ -10,6 +10,13 @@ from loom_v2.driver.service import DriverService
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.coding_agents.fake import FakeCodingAgentProvider
 from loom_v2.slave.executor import ExecutionResult
+from loom_v2.testing.observer import seed_embedded_slaves
+
+
+def _seeded_repository() -> ObserverRepository:
+    repo = ObserverRepository()
+    seed_embedded_slaves(repo)
+    return repo
 
 
 @pytest.mark.asyncio
@@ -45,7 +52,7 @@ async def test_open_run_is_agent_decision_and_contract_is_scoped_by_driver():
 
 @pytest.mark.asyncio
 async def test_query_capabilities_is_available_before_open_run():
-    mcp = DriverMCP(ObserverRepository(), "conversation-capabilities-first")
+    mcp = DriverMCP(_seeded_repository(), "conversation-capabilities-first")
 
     result = await mcp.call("loom_query_capabilities")
 
@@ -74,7 +81,7 @@ def test_driver_mcp_exposes_dynamic_tool_specs():
 
 @pytest.mark.asyncio
 async def test_apply_plan_patch_accepts_explicit_operation_alias_from_json_tool_call():
-    repo = ObserverRepository()
+    repo = _seeded_repository()
     mcp = DriverMCP(repo, "conversation-mcp-alias")
     await mcp.call(
         "loom_open_run",
@@ -94,6 +101,7 @@ async def test_apply_plan_patch_accepts_explicit_operation_alias_from_json_tool_
 @pytest.mark.asyncio
 async def test_bind_compute_hole_accepts_capability_uri_target_for_registered_slave():
     repo = ObserverRepository()
+    seed_embedded_slaves(repo)
     mcp = DriverMCP(repo, "conversation-mcp-binding-uri")
     program = await mcp.call(
         "loom_put_content",

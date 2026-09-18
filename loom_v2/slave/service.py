@@ -8,7 +8,6 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import AsyncEngine
-from sqlalchemy import inspect
 
 from loom_v2.contracts.terms import TermSupport
 from loom_v2.contracts.types import (
@@ -28,6 +27,7 @@ from loom_v2.contracts.types import (
 )
 from loom_v2.db.base import SlaveBase
 from loom_v2.db.models import SlaveAttemptRow, SlaveReplicaRow
+from loom_v2.db.migrations import apply_migrations
 from loom_v2.db.session import make_session_factory
 from loom_v2.settings import Settings
 
@@ -37,6 +37,7 @@ from loom_v2.content_store import ContentStore
 from loom_v2.digest import canonical_json_bytes, digest_bytes
 from loom_v2.contracts.io_schema import ValidationError as SchemaValidationError, validate, validate_schema
 from loom_v2.contracts.package_contracts import DRIVER_ORCHESTRATOR_KEY
+from loom_v2.contracts.refs import operation_name
 
 
 @dataclass
@@ -55,6 +56,7 @@ class SlaveService:
     supported_operations: set[str] = field(default_factory=lambda: {"run_code"})
     engine: AsyncEngine | None = None
     content_store: ContentStore | None = None
+    settings: Settings | None = None
     executor_registry: ExecutorRegistry = field(default_factory=lambda: default_registry)
     capability_operation_timeout_seconds: float | None = None
     package_cache: dict[str, CapabilityPackageVersion] = field(default_factory=dict)
@@ -66,17 +68,16 @@ class SlaveService:
     _last_reported_health: dict[str, tuple[int, str]] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self.settings = self.settings or Settings()
         self.sessions = make_session_factory(self.engine) if self.engine is not None else None
         if self.content_store is None:
-            settings = Settings()
-            self.content_store = ContentStore.from_settings(settings)
+            self.content_store = ContentStore.from_settings(self.settings)
         if self.runtime_plugin_host is None:
-            settings = Settings()
             self.runtime_plugin_host = RuntimePluginHost(
-                plugin_dir=settings.runtime_plugin_dir,
-                socket_dir=settings.runtime_plugin_socket_dir,
-                startup_timeout=settings.runtime_plugin_startup_timeout_seconds,
-                call_timeout=settings.runtime_plugin_call_timeout_seconds,
+                plugin_dir=self.settings.runtime_plugin_dir,
+                socket_dir=self.settings.runtime_plugin_socket_dir,
+                startup_timeout=self.settings.runtime_plugin_startup_timeout_seconds,
+                call_timeout=self.settings.runtime_plugin_call_timeout_seconds,
             )
         if self.capability_operation_timeout_seconds is not None and self.executor_registry is default_registry:
             self.executor_registry = ExecutorRegistry(capability_timeout_seconds=self.capability_operation_timeout_seconds)
@@ -87,16 +88,12 @@ class SlaveService:
                 await self.runtime_plugin_host.start()
             return
         async with self.engine.begin() as connection:
-            await connection.run_sync(SlaveBase.metadata.create_all)
-            def ensure_activation_column(sync_connection: Any) -> None:
-                columns = {str(item.get("name")) for item in inspect(sync_connection).get_columns("slave_replica")}
-                if "capability_activations" not in columns:
-                    column_type = "JSONB" if sync_connection.dialect.name == "postgresql" else "JSON"
-                    default = "'[]'::jsonb" if sync_connection.dialect.name == "postgresql" else "'[]'"
-                    sync_connection.exec_driver_sql(
-                        f"ALTER TABLE slave_replica ADD COLUMN capability_activations {column_type} NOT NULL DEFAULT {default}"
-                    )
-            await connection.run_sync(ensure_activation_column)
+            if connection.dialect.name == "postgresql":
+                await apply_migrations(connection, "slave")
+            else:
+                # SQLite is used only by hermetic tests; production role-local
+                # databases always use the ordered PostgreSQL migrations.
+                await connection.run_sync(SlaveBase.metadata.create_all)
         async with self.sessions() as session:
             row = await session.get(SlaveReplicaRow, self.slave_id)
             if row is None:
@@ -305,10 +302,6 @@ class SlaveService:
             return None
         return self.package_cache.get(package_ref)
 
-    @staticmethod
-    def _operation_name(operation_ref: str) -> str:
-        return operation_ref.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
-
     def capability_snapshot(self) -> set[str]:
         operations = set(self.supported_operations)
         for activation in self.activations.values():
@@ -320,7 +313,7 @@ class SlaveService:
             if package is None:
                 continue
             operations.update(
-                self._operation_name(item.capability_descriptor_ref.resource_id)
+                operation_name(item.capability_descriptor_ref.resource_id)
                 for item in package.capability_exports
             )
         return operations

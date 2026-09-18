@@ -10,6 +10,7 @@ from typing import Any, Protocol
 
 from loom_v2.contracts.types import ExecutionContract, ResourceRef
 from loom_v2.digest import canonical_json_bytes, digest_bytes, digest_json
+from loom_v2.settings import Settings
 
 
 @dataclass
@@ -67,15 +68,17 @@ class ProcessJSONStdioV1Adapter:
     descriptor = ExecutorDescriptor(package_type="function", kind="process:json_stdio", operations=frozenset({"run_code"}), replay_safety="DeclaredByPackage", effect_class="Sandboxed")
 
     def __init__(self, timeout_seconds: float | None = None) -> None:
-        # Keep the timeout on the child-operation adapter, independent from
-        # the coding-agent conversation deadline.  Reading the environment at
-        # execution time keeps the process-level default easy to override in
-        # Compose and in tests without rebuilding the registry.
-        self.timeout_seconds = timeout_seconds
+        # Keep this timeout independent from the coding-agent conversation
+        # deadline.  Composition roots may provide an explicit value; the
+        # default comes from the shared Settings model.
+        self.timeout_seconds = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else Settings().capability_operation_timeout_seconds
+        )
 
     def _timeout(self) -> float:
-        configured = os.getenv("LOOM_CAPABILITY_OPERATION_TIMEOUT_SECONDS", "30")
-        return self.timeout_seconds if self.timeout_seconds is not None else float(configured)
+        return self.timeout_seconds
 
     async def invoke(self, payload: dict[str, Any], *, program: bytes | None = None) -> ExecutionResult:
         if not program:

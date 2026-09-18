@@ -5,11 +5,13 @@ from loom_v2.driver.service import DriverService
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.slave.service import SlaveService
 from tests.support.package_fixture import process_package_value
+from loom_v2.testing.observer import seed_embedded_slaves
 
 
 @pytest.mark.asyncio
 async def test_content_refs_drive_readiness_dispatch_and_terminal_evidence():
     repo = ObserverRepository()
+    seed_embedded_slaves(repo)
     input_schema_ref = await repo.put_content(
         {"type": "object", "required": ["scores"], "properties": {"scores": {"type": "array", "items": {"type": "number"}}}},
         media_type="application/schema+json",

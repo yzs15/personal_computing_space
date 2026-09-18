@@ -1,58 +1,81 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from loom_v2.db.session import make_engine
 from loom_v2.settings import Settings
-from loom_v2.contracts.types import CapabilityHealthReport, ClosureContract
+from loom_v2.contracts.types import CapabilityHealthReport
+from loom_v2.contracts.api import (
+    AgentLeaseRequest,
+    CapabilityActivationRequest,
+    CapabilityHealthRequest,
+    CommitRequest,
+    ContentPutRequest,
+    IdempotencyRequest,
+    OpenRunRequest,
+    PatchRequest,
+    PublicMessageRequest,
+    ResolveRequest,
+    StartRequest,
+)
 from loom_v2.content_store import ContentStore
 from loom_v2.contracts.agents import AgentRegistration, DriverCommand
 from loom_v2.contracts.errors import DomainError
 from loom_v2.observer.gateway import ObserverDriverGateway
 from loom_v2.observer.dispatcher import ObserverMessageDispatcher
+from loom_v2.observer.activation import execute_activation_targets
+from loom_v2.auth import InternalAuth
+from loom_v2.contracts.package_contracts import load_operator_package_contracts
 
-from .repository import ObserverRepository
+from .repository import ObserverRepository, run_record_payload
 
 
 def _run_view(record: Any) -> dict[str, Any]:
-    return {
-        "run_id": record.run_id,
-        "task_ref": record.task_ref,
-        "goal": record.goal,
-        "closure_contract": record.closure_contract.model_dump(mode="json") if record.closure_contract else None,
-        "allow_reassignment": record.allow_reassignment,
-        "state": record.state,
-        "status": ObserverRepository._conversation_status_for_state(record.state),
-        "draft_version": record.draft.version_id,
-        "draft_digest": record.draft.snapshot_digest,
-        "committed_version": record.committed.version_id if record.committed else None,
-        "execution_id": record.execution_id,
-        "execution_epoch": record.execution_epoch,
-        "outcome": record.outcome,
-        "attempts": record.attempts,
-        "dynamic_nodes": [node.model_dump(mode="json") for node in record.dynamic_nodes],
-        "events": record.events,
-        "capability_packages": [package.model_dump(mode="json") for package in record.capability_packages],
-        "capability_activations": [activation.model_dump(mode="json") for activation in record.capability_activations],
-    }
+    return run_record_payload(record, include_snapshots=False)
 
 
-def create_app(repository: ObserverRepository | None = None) -> FastAPI:
-    app = FastAPI(title="Loom v2 Observer")
-    settings = Settings()
+def create_app(
+    repository: ObserverRepository | None = None,
+    *,
+    settings: Settings | None = None,
+) -> FastAPI:
+    settings = settings or Settings()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        await app.state.repo.init_db()
+        await app.state.dispatcher.start()
+        try:
+            yield
+        finally:
+            await app.state.dispatcher.stop()
+            await app.state.gateway.close()
+            for worker in app.state.workers.values():
+                with suppress(Exception):
+                    await worker.close()
+            for slave in app.state.slaves.values():
+                with suppress(Exception):
+                    await slave.close()
+            if app.state.engine is not None:
+                await app.state.engine.dispose()
+
+    app = FastAPI(title="Loom v2 Observer", lifespan=lifespan)
+    load_operator_package_contracts(settings.package_contract_dir)
     app.state.engine = None
     if repository is None and not settings.database_url.startswith("sqlite+aiosqlite:///:memory:"):
         app.state.engine = make_engine(settings.database_url)
     content_store = repository.content_store if repository is not None else ContentStore.from_settings(settings)
-    app.state.repo = repository or ObserverRepository(app.state.engine, content_store=content_store)
+    app.state.repo = repository or ObserverRepository(app.state.engine, content_store=content_store, settings=settings)
     app.state.gateway = ObserverDriverGateway(
         app.state.repo,
         workspace_id=settings.workspace_id,
@@ -65,131 +88,50 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         workspace_id=settings.workspace_id,
         forward_timeout=settings.observer_forward_timeout_seconds,
     )
-    # The production Compose profile injects the internal secret and runs a
-    # standalone Driver. Keep the in-process objects only for the hermetic
-    # in-memory test profile (or an explicitly injected repository); a
-    # PostgreSQL Observer without its internal secret never starts a Driver.
-    legacy_embedded = (
-        not settings.internal_api_secret.strip()
-        and (repository is not None or settings.database_url.startswith("sqlite+aiosqlite:///:memory:"))
-    )
-    if not legacy_embedded:
-        # Observer never executes Docker orchestration itself; readiness and
-        # sandbox checks belong to the Driver that owns the Docker socket.
-        app.state.repo.orchestrator_runtime_available = False
-    elif repository is None:
-        app.state.repo.orchestrator_runtime_available = True
-    if not legacy_embedded:
-        app.state.repo.slave_capabilities.clear()
-        app.state.repo.slave_agents.clear()
-        app.state.repo.slave_instances.clear()
-        app.state.repo.agents = {
-            key: value
-            for key, value in app.state.repo.agents.items()
-            if not str(value.get("instance_id") or "").startswith("embedded-")
-        }
-    if legacy_embedded:
-        from loom_v2.coding_agents.codex import CodexAppServerProvider
-        from loom_v2.coding_agents.fake import FakeCodingAgentProvider
-        from loom_v2.driver.mcp_server import DriverMCPServer
-        from loom_v2.driver.service import DriverService
-        from loom_v2.driver.worker import WorkerSession
-        from loom_v2.slave.service import SlaveService
-
-        provider = (
-            FakeCodingAgentProvider()
-            if settings.coding_agent_backend == "fake"
-            else CodexAppServerProvider(
-                model=settings.codex_model,
-                poll_interval_seconds=settings.coding_agent_poll_interval_seconds,
-                protocol_failure_seconds=settings.coding_agent_protocol_failure_seconds,
-            )
-        )
-        app.state.slaves = {
-            "slave-a": SlaveService("slave-a", content_store=ContentStore.from_settings(settings), capability_operation_timeout_seconds=settings.capability_operation_timeout_seconds),
-            "slave-b": SlaveService("slave-b", content_store=ContentStore.from_settings(settings), capability_operation_timeout_seconds=settings.capability_operation_timeout_seconds),
-        }
-        app.state.workers = {}
-        if settings.slave_a_url:
-            app.state.workers["slave-a"] = WorkerSession("slave-a", settings.slave_a_url, operation_timeout=settings.worker_operation_timeout_seconds)
-        if settings.slave_b_url:
-            app.state.workers["slave-b"] = WorkerSession("slave-b", settings.slave_b_url, operation_timeout=settings.worker_operation_timeout_seconds)
-        app.state.driver = DriverService(
-            app.state.repo,
-            provider,
-            slaves=app.state.slaves,
-            workers=app.state.workers,
-            deadline_seconds=settings.coding_agent_deadline_seconds,
-        )
-        app.state.forward_tasks: dict[str, asyncio.Task[Any]] = {}
-    else:
-        app.state.provider = None
-        app.state.slaves = {}
-        app.state.workers = {}
-        app.state.driver = None
-    app.state.mcp_server = (
-        DriverMCPServer(app.state.repo, run_executor=app.state.driver._execute_and_wait_local)
-        if legacy_embedded
-        else None
-    )
+    # Observer production composition only owns the repository, gateway and
+    # dispatcher.  Embedded Driver/Slave/MCP wiring lives in
+    # ``loom_v2.testing.observer`` and is never imported by this module.
+    app.state.embedded = False
+    app.state.repo.orchestrator_runtime_available = False
+    app.state.provider = None
+    app.state.slaves = {}
+    app.state.workers = {}
+    app.state.driver = None
+    app.state.forward_tasks = {}
+    app.state.mcp_server = None
     static_dir = Path(__file__).resolve().parents[1] / "web" / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
-
-    @app.on_event("startup")
-    async def initialize_database() -> None:
-        await app.state.repo.init_db()
-        await app.state.dispatcher.start()
-        # Run ownership belongs to the registered Driver lease.  Do not mark
-        # persisted active Runs failed merely because Observer restarted; the
-        # next Driver instance will inspect and recover them using thread ids.
-
-    @app.on_event("shutdown")
-    async def close_database() -> None:
-        await app.state.dispatcher.stop()
-        if app.state.engine is not None:
-            await app.state.engine.dispose()
 
     @app.get("/healthz")
     async def health() -> dict[str, object]:
         return {"ok": True, "service": "observer"}
 
-    def require_internal(request: Request) -> None:
-        configured = settings.internal_api_secret.strip()
-        if not configured:
-            return
-        provided = request.headers.get("x-loom-internal-token", "")
-        if not provided:
-            authorization = request.headers.get("authorization", "")
-            if authorization.lower().startswith("bearer "):
-                provided = authorization[7:]
-        if provided != configured:
-            raise HTTPException(status_code=401, detail="invalid_internal_token")
+    require_internal = InternalAuth(settings.internal_api_secret)
+    internal_router = APIRouter(dependencies=[Depends(require_internal)])
 
-    @app.post("/internal/v1/agents/register")
-    async def register_agent(payload: dict[str, Any], request: Request) -> dict[str, Any]:
-        require_internal(request)
+    @internal_router.post("/internal/v1/agents/register")
+    async def register_agent(payload: AgentRegistration) -> dict[str, Any]:
         try:
-            lease = await app.state.repo.register_agent(AgentRegistration.model_validate(payload))
+            lease = await app.state.repo.register_agent(payload)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return lease.model_dump(mode="json")
 
-    @app.post("/internal/v1/agents/{agent_id}/heartbeat")
-    async def heartbeat_agent(agent_id: str, payload: dict[str, Any], request: Request) -> dict[str, Any]:
-        require_internal(request)
+    @internal_router.post("/internal/v1/agents/{agent_id}/heartbeat")
+    async def heartbeat_agent(agent_id: str, payload: AgentLeaseRequest) -> dict[str, Any]:
         try:
-            epoch_value = payload.get("driver_epoch", payload.get("epoch"))
+            epoch_value = payload.driver_epoch if payload.driver_epoch is not None else payload.epoch
             if epoch_value is None:
                 raise KeyError("epoch")
-            if payload.get("driver_epoch") is not None and payload.get("epoch") is not None and int(payload["driver_epoch"]) != int(payload["epoch"]):
+            if payload.driver_epoch is not None and payload.epoch is not None and payload.driver_epoch != payload.epoch:
                 raise ValueError("driver_epoch_mismatch")
             lease = await app.state.repo.heartbeat_agent(
                 agent_id,
-                str(payload["instance_id"]),
-                str(payload["lease_id"]),
+                payload.instance_id,
+                payload.lease_id,
                 int(epoch_value),
-                workspace_id=str(payload.get("workspace_id") or settings.workspace_id),
-                role=str(payload.get("role", "driver")),
+                workspace_id=payload.workspace_id or settings.workspace_id,
+                role=payload.role,
             )
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=f"missing_field:{exc.args[0]}") from exc
@@ -197,22 +139,21 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return lease.model_dump(mode="json")
 
-    @app.post("/internal/v1/agents/{agent_id}/release")
-    async def release_agent(agent_id: str, payload: dict[str, Any], request: Request) -> dict[str, Any]:
-        require_internal(request)
+    @internal_router.post("/internal/v1/agents/{agent_id}/release")
+    async def release_agent(agent_id: str, payload: AgentLeaseRequest) -> dict[str, Any]:
         try:
-            epoch_value = payload.get("driver_epoch", payload.get("epoch"))
+            epoch_value = payload.driver_epoch if payload.driver_epoch is not None else payload.epoch
             if epoch_value is None:
                 raise KeyError("epoch")
-            if payload.get("driver_epoch") is not None and payload.get("epoch") is not None and int(payload["driver_epoch"]) != int(payload["epoch"]):
+            if payload.driver_epoch is not None and payload.epoch is not None and payload.driver_epoch != payload.epoch:
                 raise ValueError("driver_epoch_mismatch")
             await app.state.repo.release_agent(
                 agent_id,
-                str(payload["instance_id"]),
-                str(payload["lease_id"]),
+                payload.instance_id,
+                payload.lease_id,
                 int(epoch_value),
-                workspace_id=str(payload.get("workspace_id") or settings.workspace_id),
-                role=str(payload.get("role", "driver")),
+                workspace_id=payload.workspace_id or settings.workspace_id,
+                role=payload.role,
             )
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=f"missing_field:{exc.args[0]}") from exc
@@ -220,9 +161,8 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"released": True}
 
-    @app.get("/internal/v1/agents/slaves")
-    async def list_slaves(request: Request, workspace_id: str | None = None) -> list[dict[str, Any]]:
-        require_internal(request)
+    @internal_router.get("/internal/v1/agents/slaves")
+    async def list_slaves(workspace_id: str | None = None) -> list[dict[str, Any]]:
         agents = await app.state.repo.refresh_slaves(workspace_id or settings.workspace_id)
         for agent in agents:
             projected = app.state.repo.slave_capabilities.get(str(agent.get("agent_id") or ""))
@@ -233,21 +173,20 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
             agent["capabilities"] = capabilities
         return agents
 
-    @app.post("/internal/v1/capability-health")
-    async def capability_health(payload: dict[str, Any], request: Request) -> dict[str, Any]:
-        require_internal(request)
+    @internal_router.post("/internal/v1/capability-health")
+    async def capability_health(payload: CapabilityHealthRequest) -> dict[str, Any]:
         report: CapabilityHealthReport | None = None
         try:
-            report = CapabilityHealthReport.model_validate(payload["report"])
-            agent_id = str(payload["agent_id"])
-            workspace_id = str(payload["workspace_id"])
+            report = payload.report
+            agent_id = payload.agent_id
+            workspace_id = payload.workspace_id
             if report.target_slave != agent_id:
                 raise ValueError("target_slave_mismatch")
             await app.state.repo.heartbeat_agent(
                 agent_id,
-                str(payload["instance_id"]),
-                str(payload["lease_id"]),
-                int(payload["epoch"]),
+                payload.instance_id,
+                payload.lease_id,
+                payload.epoch,
                 workspace_id=workspace_id,
                 role="slave",
             )
@@ -272,11 +211,10 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"accepted": True, "activation": activation.model_dump(mode="json")}
 
-    @app.post("/internal/v1/driver/commands")
-    async def driver_command(payload: dict[str, Any], request: Request) -> dict[str, Any]:
-        require_internal(request)
+    @internal_router.post("/internal/v1/driver/commands")
+    async def driver_command(payload: DriverCommand) -> dict[str, Any]:
         try:
-            result = await app.state.repo.execute_driver_command(DriverCommand.model_validate(payload))
+            result = await app.state.repo.execute_driver_command(payload)
         except DomainError as exc:
             envelope = exc.envelope.model_dump(mode="json")
             raise HTTPException(status_code=409, detail=envelope) from exc
@@ -288,14 +226,15 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=f"missing_field:{exc.args[0]}") from exc
         return result
 
-    @app.post("/driver-gateway/v1/registration-check")
-    async def registration_check(request: Request) -> dict[str, Any]:
-        require_internal(request)
+    @internal_router.post("/driver-gateway/v1/registration-check")
+    async def registration_check() -> dict[str, Any]:
         driver = await app.state.gateway.active_driver()
         return {"registered": driver is not None, "driver": driver}
 
-    @app.get("/api/v1/runtime")
-    async def runtime() -> dict[str, str | None]:
+    app.include_router(internal_router)
+
+    @app.get("/api/v1/runtime", response_model=dict[str, str | None])
+    async def runtime() -> dict[str, str | None] | JSONResponse:
         active_driver = await app.state.gateway.active_driver()
         if active_driver is not None:
             capabilities = active_driver.get("capabilities") or {}
@@ -306,7 +245,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
                 "driver_id": active_driver.get("agent_id"),
                 "driver_epoch": str(active_driver.get("epoch")),
             }
-        if not legacy_embedded:
+        if not app.state.embedded:
             return JSONResponse(status_code=503, content={"code": "driver_unavailable", "retryable": True})
         backend = settings.coding_agent_backend.strip().lower()
         if backend == "codex":
@@ -333,11 +272,11 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         return Response(content=body, media_type="application/octet-stream", headers={"X-Content-Digest": digest})
 
     @app.post("/api/v1/content")
-    async def put_content(payload: dict[str, Any]) -> dict[str, Any]:
-        if "content" not in payload:
+    async def put_content(payload: ContentPutRequest) -> dict[str, Any]:
+        if "content" not in payload.model_fields_set:
             raise HTTPException(status_code=400, detail="content_required")
         try:
-            ref = await app.state.repo.put_content(payload["content"], media_type=str(payload.get("media_type") or ""))
+            ref = await app.state.repo.put_content(payload.content, media_type=str(payload.media_type or ""))
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return ref.model_dump(mode="json")
@@ -345,7 +284,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
     @app.post("/mcp")
     async def mcp(payload: dict[str, Any], request: Request) -> dict[str, Any]:
         conversation_ref = request.headers.get("x-loom-conversation-ref", "")
-        if not legacy_embedded:
+        if not app.state.embedded:
             try:
                 return await app.state.gateway.forward(
                     "/driver/v1/mcp",
@@ -357,42 +296,50 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         return await app.state.mcp_server.handle(payload, conversation_ref)
 
     @app.post("/api/v1/runs")
-    async def open_run(payload: dict[str, Any]) -> dict[str, Any]:
-        contract_payload = payload.get("closure_contract")
-        contract = ClosureContract.model_validate(contract_payload) if contract_payload is not None else None
-        goal = contract.goal if contract is not None else payload.get("goal", "")
+    async def open_run(payload: OpenRunRequest) -> dict[str, Any]:
+        if not payload.task_ref:
+            raise HTTPException(status_code=400, detail="task_ref_required")
+        contract = payload.closure_contract
+        goal = contract.goal if contract is not None else payload.goal or ""
         record = await app.state.repo.open_run(
-            payload.get("run_id"),
-            payload["task_ref"],
+            payload.run_id,
+            payload.task_ref,
             goal,
-            payload.get("allow_reassignment", False),
+            payload.allow_reassignment,
             contract,
-            user_id=payload.get("user_id", "user-default"),
-            workspace_id=payload.get("workspace_id", settings.workspace_id),
+            user_id=payload.user_id or "user-default",
+            workspace_id=payload.workspace_id or settings.workspace_id,
         )
         return _run_view(record)
 
-    @app.post("/api/v1/messages")
-    async def message(payload: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(payload.get("text"), str) or not payload["text"].strip():
+    @app.post("/api/v1/messages", response_model=dict[str, Any])
+    async def message(payload: PublicMessageRequest) -> dict[str, Any] | JSONResponse:
+        if not isinstance(payload.text, str) or not payload.text.strip():
             raise HTTPException(status_code=422, detail="text_required")
-        if not legacy_embedded and not str(payload.get("request_id") or "").strip():
+        if not app.state.embedded and not str(payload.request_id or "").strip():
             raise HTTPException(status_code=422, detail="request_id_required")
-        if not legacy_embedded and not str(payload.get("conversation_ref") or "").strip():
+        if not app.state.embedded and not str(payload.conversation_ref or "").strip():
             raise HTTPException(status_code=422, detail="conversation_ref_required")
-        if not legacy_embedded and str(payload.get("workspace_id") or settings.workspace_id) != settings.workspace_id:
+        if not app.state.embedded and (payload.workspace_id or settings.workspace_id) != settings.workspace_id:
             raise HTTPException(status_code=403, detail="workspace_binding_mismatch")
-        conversation_ref = str(payload.get("conversation_ref", "conversation-default"))
-        supplied_request_id = bool(payload.get("request_id"))
-        request_id = str(payload.get("request_id") or f"request-{uuid4().hex}")
-        if not legacy_embedded:
+        conversation_ref = payload.conversation_ref or "conversation-default"
+        supplied_request_id = bool(payload.request_id)
+        request_id = payload.request_id or f"request-{uuid4().hex}"
+        if not app.state.embedded:
+            # A standalone Observer without an internal control-plane secret
+            # has no safe way to deliver work when no Driver is registered.
+            # Keep the synchronous failure contract for local deployments;
+            # split deployments with a secret may durably queue the receipt
+            # for a Driver that will register later.
+            if not settings.internal_api_secret.strip() and await app.state.gateway.active_driver() is None:
+                return JSONResponse(status_code=503, content={"code": "driver_unavailable", "retryable": True})
             try:
                 existing = await app.state.repo.get_message_receipt(settings.workspace_id, request_id)
                 receipt = await app.state.repo.create_or_get_message_receipt(
                     settings.workspace_id,
                     request_id,
                     conversation_ref,
-                    payload["text"],
+                    payload.text,
                 )
             except ValueError as exc:
                 if str(exc) == "request_id_reused":
@@ -413,7 +360,12 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
                 try:
                     return await app.state.gateway.forward(
                         "/driver/v1/messages",
-                        {**payload, "conversation_ref": conversation_ref, "request_id": request_id, "workspace_id": settings.workspace_id},
+                        {
+                            **payload.model_dump(exclude_none=True),
+                            "conversation_ref": conversation_ref,
+                            "request_id": request_id,
+                            "workspace_id": settings.workspace_id,
+                        },
                         timeout=settings.observer_forward_timeout_seconds,
                     )
                 except Exception:
@@ -428,7 +380,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         if app.state.driver is None:
             return JSONResponse(status_code=503, content={"code": "driver_unavailable", "retryable": True})
         try:
-            return await app.state.driver.run_prompt(conversation_ref, payload.get("text", ""))
+            return await app.state.driver.run_prompt(conversation_ref, payload.text)
         except (RuntimeError, FileNotFoundError) as exc:
             reason = getattr(exc, "reason", None)
             if isinstance(reason, dict):
@@ -451,7 +403,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
 
     @app.post("/api/v1/conversations/{conversation_ref}/interrupt")
     async def interrupt_conversation(conversation_ref: str) -> dict[str, Any]:
-        if not legacy_embedded:
+        if not app.state.embedded:
             receipts = await app.state.repo.list_message_receipts(settings.workspace_id, conversation_ref)
             pending = next((item for item in reversed(receipts) if item.state in {"accepted", "queued", "retryable", "in_flight"}), None)
             if pending is None:
@@ -482,7 +434,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
 
     @app.get("/api/v1/conversations/{conversation_ref}/stream")
     async def stream(conversation_ref: str) -> StreamingResponse:
-        async def events() -> Any:
+        async def events() -> AsyncIterator[str]:
             try:
                 conversation_view = await app.state.repo.get_conversation(conversation_ref, settings.workspace_id)
             except KeyError:
@@ -493,14 +445,17 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         return StreamingResponse(events(), media_type="text/event-stream")
 
     @app.post("/api/v1/runs/{run_id}/patches")
-    async def apply_patch(run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def apply_patch(run_id: str, payload: PatchRequest) -> dict[str, Any]:
+        for field_name in ("base_draft_version", "base_snapshot_digest", "operation_id"):
+            if getattr(payload, field_name) is None:
+                raise HTTPException(status_code=400, detail=f"missing_field:{field_name}")
         try:
             receipt = await app.state.repo.apply_patch(
                 run_id,
-                payload["base_draft_version"],
-                payload["base_snapshot_digest"],
-                payload["operation_id"],
-                payload.get("ops", []),
+                payload.base_draft_version,
+                payload.base_snapshot_digest,
+                payload.operation_id,
+                payload.ops,
             )
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=f"missing_field:{exc.args[0]}") from exc
@@ -527,9 +482,12 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/v1/runs/{run_id}/commit")
-    async def commit(run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def commit(run_id: str, payload: CommitRequest) -> dict[str, Any]:
+        for field_name in ("draft_version", "draft_digest"):
+            if getattr(payload, field_name) is None:
+                raise HTTPException(status_code=400, detail=f"missing_field:{field_name}")
         try:
-            version = await app.state.repo.commit(run_id, payload["draft_version"], payload["draft_digest"])
+            version = await app.state.repo.commit(run_id, payload.draft_version, payload.draft_digest)
         except DomainError as exc:
             raise HTTPException(status_code=409, detail=exc.envelope.model_dump(mode="json")) from exc
         except ValueError as exc:
@@ -537,9 +495,11 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         return {"closure_version": version.version_id, "snapshot_digest": version.snapshot_digest, "state": "committed"}
 
     @app.post("/api/v1/runs/{run_id}/start")
-    async def start(run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def start(run_id: str, payload: StartRequest) -> dict[str, Any]:
+        if payload.closure_version is None:
+            raise HTTPException(status_code=400, detail="missing_field:closure_version")
         try:
-            return await app.state.repo.start(run_id, payload["closure_version"])
+            return await app.state.repo.start(run_id, payload.closure_version)
         except DomainError as exc:
             raise HTTPException(status_code=409, detail=exc.envelope.model_dump(mode="json")) from exc
         except ValueError as exc:
@@ -553,8 +513,8 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/v1/runs/{run_id}/resolve")
-    async def resolve_run(run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        decision = str(payload.get("decision") or "")
+    async def resolve_run(run_id: str, payload: ResolveRequest) -> dict[str, Any]:
+        decision = str(payload.decision or "")
         if decision not in {"accept", "abandon"}:
             raise HTTPException(status_code=422, detail="invalid_decision")
         try:
@@ -593,7 +553,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
                     }
                 )
             return result
-        if not legacy_embedded:
+        if not app.state.embedded:
             return []
         records = await app.state.repo._all_records()
         result = []
@@ -644,17 +604,16 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
         return [{**package.model_dump(mode="json"), "activations": [activation.model_dump(mode="json") for activation in record.capability_activations if activation.package_version_ref == package.version_ref]} for package in packages]
 
     @app.post("/api/v1/capability-packages/{package_ref:path}/promote")
-    async def promote_capability_package(package_ref: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload = payload or {}
+    async def promote_capability_package(package_ref: str, payload: CapabilityActivationRequest | None = None) -> dict[str, Any]:
+        payload = payload or CapabilityActivationRequest()
         try:
-            package = await app.state.repo.promote_capability_package(package_ref, idempotency_key=payload.get("idempotency_key"), approved_digest=payload.get("approved_digest"))
+            package = await app.state.repo.promote_capability_package(package_ref, idempotency_key=payload.idempotency_key, approved_digest=payload.approved_digest)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="capability_package_not_found") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        targets = payload.get("target_slaves") or []
-        reports = []
-        if targets and not legacy_embedded:
+        targets = payload.target_slaves
+        if targets and not app.state.embedded:
             try:
                 return {
                     "package": package.model_dump(mode="json"),
@@ -663,8 +622,8 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
                         {
                             "package_ref": package.version_ref,
                             "target_slaves": targets,
-                            "compute_binding": payload.get("compute_binding"),
-                            "idempotency_key": payload.get("idempotency_key"),
+                            "compute_binding": payload.compute_binding.model_dump(mode="json") if payload.compute_binding else None,
+                            "idempotency_key": payload.idempotency_key,
                         },
                     ),
                 }
@@ -676,51 +635,25 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
                         for target in targets
                     ],
                 }
-        for target in targets:
-            worker = app.state.workers.get(target)
-            slave = app.state.slaves.get(target)
-            requested_idempotency_key = payload.get("idempotency_key") or f"promote-{package.package_digest}-{target}"
-            desired = await app.state.repo.set_capability_desired(
-                package.version_ref,
-                str(target),
-                desired_state="running",
-                idempotency_key=requested_idempotency_key,
-                workspace_id=settings.workspace_id,
-                activation_closure_version_ref=package.package_closure_version_ref,
-                compute_binding_ref=str((payload.get("compute_binding") or {}).get("binding_id") or ""),
-            )
-            command = {
-                "command_id": f"provision-{package.package_id}-{target}",
-                "package_version_ref": package.version_ref,
-                "package_digest": package.package_digest,
-                "target_slave": target,
-                "workspace_id": settings.workspace_id,
-                "activation_closure_version_ref": package.package_closure_version_ref,
-                "compute_binding": payload.get("compute_binding"),
-                "idempotency_key": desired.last_idempotency_key,
-                "activation_revision": desired.activation_revision,
-            }
-            from loom_v2.contracts.types import CapabilityProvisionCommand
-            provision_command = CapabilityProvisionCommand.model_validate(command)
-            try:
-                if worker is not None:
-                    report = await worker.provision(command=provision_command, package=package)
-                elif slave is not None:
-                    report = await slave.provision(provision_command, package)
-                else:
-                    raise RuntimeError("slave_not_found")
-                await app.state.repo.record_capability_health(report)
-                reports.append(report.model_dump(mode="json"))
-            except (RuntimeError, ValueError) as exc:
-                reports.append({"target_slave": target, "activation_state": "failed", "error": str(exc)})
+        reports = await execute_activation_targets(
+            app.state.repo,
+            package,
+            targets,
+            desired_state="running",
+            workspace_id=settings.workspace_id,
+            workers=app.state.workers,
+            slaves=app.state.slaves,
+            compute_binding=payload.compute_binding.model_dump(mode="json") if payload.compute_binding else None,
+            idempotency_key=payload.idempotency_key,
+        )
         return {"package": package.model_dump(mode="json"), "health_reports": reports}
 
     @app.post("/api/v1/capability-packages/{package_ref:path}/deactivate")
-    async def deactivate_capability_package(package_ref: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload = payload or {}
+    async def deactivate_capability_package(package_ref: str, payload: CapabilityActivationRequest | None = None) -> dict[str, Any]:
+        payload = payload or CapabilityActivationRequest()
         try:
             package = await app.state.repo.get_capability_package(package_ref)
-            approved_digest = payload.get("approved_digest")
+            approved_digest = payload.approved_digest
             if not approved_digest:
                 raise ValueError("approved_digest_required")
             if str(approved_digest).lower() != package.package_digest.lower():
@@ -729,10 +662,10 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="capability_package_not_found") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        targets = payload.get("target_slaves") or []
+        targets = payload.target_slaves
         if not targets:
             raise HTTPException(status_code=400, detail="target_slave_required")
-        if not legacy_embedded:
+        if not app.state.embedded:
             try:
                 return {
                     "package": package.model_dump(mode="json"),
@@ -742,7 +675,7 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
                             "package_ref": package.version_ref,
                             "target_slaves": targets,
                             "approved_digest": package.package_digest,
-                            "idempotency_key": payload.get("idempotency_key"),
+                            "idempotency_key": payload.idempotency_key,
                         },
                     ),
                 }
@@ -754,46 +687,22 @@ def create_app(repository: ObserverRepository | None = None) -> FastAPI:
                         for target in targets
                     ],
                 }
-        reports = []
-        for target in targets:
-            worker = app.state.workers.get(target)
-            slave = app.state.slaves.get(target)
-            requested_idempotency_key = payload.get("idempotency_key") or f"deactivate-{package.package_digest}-{target}"
-            desired = await app.state.repo.set_capability_desired(
-                package.version_ref,
-                str(target),
-                desired_state="stopped",
-                idempotency_key=requested_idempotency_key,
-                workspace_id=settings.workspace_id,
-            )
-            command = {
-                "command_id": f"deprovision-{package.package_id}-{target}",
-                "package_version_ref": package.version_ref,
-                "package_digest": package.package_digest,
-                "target_slave": target,
-                "workspace_id": settings.workspace_id,
-                "idempotency_key": desired.last_idempotency_key,
-                "activation_revision": desired.activation_revision,
-            }
-            from loom_v2.contracts.types import CapabilityDeprovisionCommand
-            deprovision_command = CapabilityDeprovisionCommand.model_validate(command)
-            try:
-                if worker is not None:
-                    report = await worker.deprovision(command=deprovision_command, package=package)
-                elif slave is not None:
-                    report = await slave.deprovision(deprovision_command, package)
-                else:
-                    raise RuntimeError("slave_not_found")
-                await app.state.repo.record_capability_health(report)
-                reports.append(report.model_dump(mode="json"))
-            except (RuntimeError, ValueError) as exc:
-                reports.append({"target_slave": target, "activation_state": "failed", "error": str(exc)})
+        reports = await execute_activation_targets(
+            app.state.repo,
+            package,
+            targets,
+            desired_state="stopped",
+            workspace_id=settings.workspace_id,
+            workers=app.state.workers,
+            slaves=app.state.slaves,
+            idempotency_key=payload.idempotency_key,
+        )
         return {"package": package.model_dump(mode="json"), "health_reports": reports}
 
     @app.post("/api/v1/capability-packages/{package_ref:path}/abandon")
-    async def abandon_capability_package(package_ref: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def abandon_capability_package(package_ref: str, payload: IdempotencyRequest | None = None) -> dict[str, Any]:
         try:
-            package = await app.state.repo.abandon_capability_package(package_ref, idempotency_key=(payload or {}).get("idempotency_key"))
+            package = await app.state.repo.abandon_capability_package(package_ref, idempotency_key=payload.idempotency_key if payload else None)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="capability_package_not_found") from exc
         return package.model_dump(mode="json")

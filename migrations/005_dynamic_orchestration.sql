@@ -1,2 +1,0 @@
-ALTER TABLE runs
-    ADD COLUMN IF NOT EXISTS dynamic_nodes JSONB NOT NULL DEFAULT '[]'::jsonb;

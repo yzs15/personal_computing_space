@@ -9,6 +9,7 @@ from loom_v2.contracts.agents import AgentRegistration
 from loom_v2.contracts.errors import DomainError
 from loom_v2.content_store import canonical_json_bytes
 from loom_v2.observer.repository import ObserverRepository
+from loom_v2.testing.observer import seed_embedded_slaves
 from tests.support.package_fixture import orchestration_package_value, process_package_value
 
 
@@ -58,6 +59,7 @@ async def _dynamic_run(
     node_replay_safety: str = "DeterministicByEventLog",
     max_attempts: int | None = None,
 ):
+    seed_embedded_slaves(repo)
     parent_schema = await _schema_ref(repo, {"type": "object", "required": ["partitions"]})
     parent_contract = await _contract_ref(repo, parent_schema)
     node_schema = await _schema_ref(repo, {"type": "object", "required": ["items"], "properties": {"items": {"type": "array"}}})

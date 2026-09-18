@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-import os
 import asyncio
 import shutil
 from contextlib import suppress
 from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import uuid4
 
 from loom_v2.coding_agents.base import CodingAgentError, CodingAgentProvider
 from loom_v2.contracts.types import CapabilityDeprovisionCommand, CapabilityProvisionCommand, ComputeBinding, ResourceRef, TaskClosure
 from loom_v2.contracts.package_contracts import DRIVER_ORCHESTRATOR_KEY
+from loom_v2.contracts.refs import input_binding_for, operation_name
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.driver.worker import WorkerSession
 from loom_v2.slave.service import SlaveService
@@ -37,6 +38,22 @@ class ActiveTurn:
     deadline_exceeded: bool = False
 
 
+async def _wait_for_execution_or_cancel(
+    task: asyncio.Task[Any],
+    is_cancelled: Callable[[], Awaitable[bool]],
+) -> bool:
+    """Wait for a shared execution task, stopping it only on authoritative cancellation."""
+    while True:
+        done, _pending = await asyncio.wait({task}, timeout=0.2)
+        if done:
+            return True
+        if await is_cancelled():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            return False
+
+
 class DriverService:
     def __init__(
         self,
@@ -48,7 +65,9 @@ class DriverService:
         deadline_seconds: float | None = None,
         orchestration_executor: DockerOrchestrationExecutor | None = None,
         content_store: Any | None = None,
+        settings: Settings | None = None,
     ) -> None:
+        self.settings = settings or Settings()
         self.control_client = repository if hasattr(repository, "command") and not hasattr(repository, "get_run") else None
         self.repository = repository
         self.content_store = (
@@ -62,9 +81,8 @@ class DriverService:
         self.executor = executor
         self.slaves = slaves or {}
         self.workers = workers or {}
-        self.orchestration_executor = orchestration_executor or DockerOrchestrationExecutor.from_settings(Settings())
-        configured_deadline = os.getenv("LOOM_CODING_AGENT_DEADLINE_SECONDS", "86400")
-        self.deadline_seconds = deadline_seconds if deadline_seconds is not None else float(configured_deadline)
+        self.orchestration_executor = orchestration_executor or DockerOrchestrationExecutor.from_settings(self.settings)
+        self.deadline_seconds = deadline_seconds if deadline_seconds is not None else self.settings.coding_agent_deadline_seconds
         self.active_turns: dict[str, ActiveTurn] = {}
         self._execution_tasks: dict[str, asyncio.Task[Any]] = {}
         self.coordinator = DriverTurnCoordinator(
@@ -158,7 +176,7 @@ class DriverService:
             set_tool_handler = getattr(self.provider, "set_tool_handler", None)
             if callable(set_tool_handler):
                 set_tool_handler(DriverMCP.tool_specs(), mcp.call)
-            await self.provider.start(conversation_ref, os.getenv("LOOM_WORKSPACE_ROOT", "/workspace"))
+            await self.provider.start(conversation_ref, self.settings.workspace_root)
             async for event in self.provider.send_turn(prompt):
                 if event.kind == "turn_started":
                     active.turn_ref = event.payload.get("turn_id") or active.turn_ref
@@ -409,7 +427,7 @@ class DriverService:
                 provider_context = await begin_turn(
                     conversation_ref,
                     request_id,
-                    os.getenv("LOOM_WORKSPACE_ROOT", "/workspace"),
+                    self.settings.workspace_root,
                     existing_thread_id,
                     DriverMCP.tool_specs(),
                     mcp.call,
@@ -419,11 +437,11 @@ class DriverService:
                 thread_id = provider_context.thread_id or conversation_ref
             else:
                 try:
-                    thread_id = await self.provider.start(conversation_ref, os.getenv("LOOM_WORKSPACE_ROOT", "/workspace"), existing_thread_id=existing_thread_id)
+                    thread_id = await self.provider.start(conversation_ref, self.settings.workspace_root, existing_thread_id=existing_thread_id)
                 except TypeError:
                     if existing_thread_id:
                         raise
-                    thread_id = await self.provider.start(conversation_ref, os.getenv("LOOM_WORKSPACE_ROOT", "/workspace"))
+                    thread_id = await self.provider.start(conversation_ref, self.settings.workspace_root)
             if context is not None:
                 context.thread_id = thread_id
                 if provider_context is not None:
@@ -449,7 +467,7 @@ class DriverService:
             raise
         try:
             if not existing_thread_id:
-                await control.thread_bind({"workspace_id": getattr(control, "workspace_id", "workspace-default"), "conversation_ref": conversation_ref, "thread_id": thread_id, "model": getattr(self.provider, "model", None) or os.getenv("LOOM_CODEX_MODEL", "deepseek-v4-flash"), "workspace_root": os.getenv("LOOM_WORKSPACE_ROOT", "/workspace"), "turn_state": "idle", "driver_epoch": int(getattr(control, "driver_epoch", 0) or 0)})
+                await control.thread_bind({"workspace_id": getattr(control, "workspace_id", self.settings.workspace_id), "conversation_ref": conversation_ref, "thread_id": thread_id, "model": getattr(self.provider, "model", None) or self.settings.codex_model, "workspace_root": self.settings.workspace_root, "turn_state": "idle", "driver_epoch": int(getattr(control, "driver_epoch", 0) or 0)})
             elif isinstance(binding, dict) and binding.get("turn_state") == "recovery_pending":
                 read_thread = getattr(self.provider, "read_thread", None)
                 if callable(read_thread):
@@ -733,7 +751,7 @@ class DriverService:
         worker = self.workers.get(target)
         if worker is None:
             raise RuntimeError(f"capability_unavailable:{target}")
-        operation = self._operation_name(snapshot.program.operation_ref or snapshot.compute.operation_ref) or "run_code"
+        operation = operation_name(snapshot.program.operation_ref or snapshot.compute.operation_ref) or "run_code"
         payload = await self._execution_payload(snapshot, operation, prompt)
         binding = snapshot.compute_bindings[0] if snapshot.compute_bindings else None
         if binding is not None and binding.capability_package_ref is not None and self.remote_repository is not None:
@@ -781,11 +799,18 @@ class DriverService:
             if agent.get("lease_state") != "active" or not agent.get("endpoint_url"):
                 continue
             slave_id = str(agent["agent_id"])
+            previous = self.workers.get(slave_id)
+            endpoint = str(agent["endpoint_url"]).rstrip("/")
+            if previous is not None and getattr(previous, "base_url", None) == endpoint:
+                continue
+            if previous is not None:
+                await previous.close()
             self.workers[slave_id] = WorkerSession(
                 slave_id,
-                str(agent["endpoint_url"]),
-                operation_timeout=float(os.getenv("LOOM_WORKER_OPERATION_TIMEOUT_SECONDS", "90")),
+                endpoint,
+                operation_timeout=self.settings.worker_operation_timeout_seconds,
                 internal_api_secret=getattr(self.control_client, "internal_api_secret", None),
+                settings=self.settings,
             )
 
     async def provision_capability(
@@ -913,17 +938,14 @@ class DriverService:
             task = asyncio.create_task(self._dispatch_execution(run_id, prompt), name=f"run-execution:{run_id}")
             self._execution_tasks[key] = task
         try:
-            while True:
-                done, _pending = await asyncio.wait({task}, timeout=0.2)
-                if done:
-                    completed, _result = task.result()
-                    break
+            async def local_cancelled() -> bool:
                 current = await self.repository.get_run(run_id)
-                if current.state == "cancelled":
-                    task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await task
-                    return DriverMCP.run_view(current)
+                return current.state == "cancelled"
+
+            if await _wait_for_execution_or_cancel(task, local_cancelled):
+                completed, _result = task.result()
+            else:
+                return DriverMCP.run_view(await self.repository.get_run(run_id))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -957,17 +979,14 @@ class DriverService:
             )
             self._execution_tasks[key] = task
         try:
-            while True:
-                done, _pending = await asyncio.wait({task}, timeout=0.2)
-                if done:
-                    task.result()
-                    break
+            async def remote_cancelled() -> bool:
                 current = await control.command("run.get", {"run_id": run_id})
-                if current.get("state") == "cancelled":
-                    task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await task
-                    return current
+                return current.get("state") == "cancelled"
+
+            if await _wait_for_execution_or_cancel(task, remote_cancelled):
+                task.result()
+            else:
+                return await control.command("run.get", {"run_id": run_id})
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1007,7 +1026,7 @@ class DriverService:
                 driver_epoch=getattr(self.control_client, "driver_epoch", None),
             )
             return await runtime.run(run_id)
-        operation = self._operation_name(snapshot.program.operation_ref or snapshot.compute.operation_ref) or "run_code"
+        operation = operation_name(snapshot.program.operation_ref or snapshot.compute.operation_ref) or "run_code"
         payload = await self._execution_payload(snapshot, operation, prompt)
         binding = self._binding_for_operation(snapshot)
         current_attempt = next(
@@ -1132,19 +1151,13 @@ class DriverService:
         )
         return completed, result
 
-    @staticmethod
-    def _operation_name(operation_ref: str) -> str:
-        if not operation_ref:
-            return ""
-        return operation_ref.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
-
     async def _execution_payload(self, snapshot: TaskClosure, operation: str, prompt: str) -> dict[str, Any]:
         # Executable input is always a content-addressed NodeInputBinding.
         # Resolve it at dispatch time so the closure carries only semantic
         # references and no mutable/raw payload in metadata.
         operation_ref = snapshot.program.operation_ref or snapshot.compute.operation_ref
         repository = self.remote_repository if self.remote_repository is not None else self.repository
-        binding = repository._input_binding_for(snapshot, operation_ref)
+        binding = input_binding_for(snapshot, operation_ref)
         if binding is not None:
             value = await repository._load_json_content(binding.input_ref)
             return dict(value) if isinstance(value, dict) else {"value": value}

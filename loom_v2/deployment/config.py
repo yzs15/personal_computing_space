@@ -6,30 +6,79 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import tomllib
-from typing import Any
+from typing import Annotated, Any, Literal, Self
 from urllib.parse import quote
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError, field_validator, model_validator
 
 
 class DeploymentConfigError(ValueError):
     """Raised when a deployment file cannot describe a safe topology."""
 
 
-_ROLES = {"minio", "observer", "driver", "slave"}
-_SLAVE_IDS = {"slave-a", "slave-b"}
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+Port = Annotated[int, Field(strict=True, ge=1, le=65535)]
 
 
-@dataclass(frozen=True)
-class MachineConfig:
-    name: str
-    ssh_host: str
-    ssh_port: int
-    ssh_user: str
-    role: str
-    service_port: int
-    console_port: int | None = None
-    service_id: str | None = None
+class ConfigModel(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, hide_input_in_errors=True)
+
+
+class MachineConfig(ConfigModel):
+    name: NonEmptyString
+    ssh_host: NonEmptyString
+    ssh_port: Port = 22
+    ssh_user: NonEmptyString
+    role: Literal["minio", "observer", "driver", "slave"]
+    service_port: Port
+    console_port: Port | None = None
+    service_id: Literal["slave-a", "slave-b"] | None = None
     ssh_key: Path | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def port_defaults(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        role = value.get("role")
+        if isinstance(role, str):
+            role = value["role"] = role.strip().lower()
+            default_port = {"minio": 9000, "observer": 8080, "driver": 8090}.get(role, 8081 if value.get("service_id") == "slave-a" else 8082)
+            value.setdefault("service_port", default_port)
+            if role == "minio":
+                value.setdefault("console_port", 9001)
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def valid_name(cls, value: str) -> str:
+        if not _NAME_RE.fullmatch(value):
+            raise ValueError("name contains unsupported characters")
+        return value
+
+    @field_validator("ssh_host", "ssh_user")
+    @classmethod
+    def ssh_token(cls, value: str, info) -> str:
+        if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError(f"{info.field_name} must not contain whitespace or control characters")
+        return value
+
+    @field_validator("ssh_key")
+    @classmethod
+    def expand_key(cls, value: Path | None) -> Path | None:
+        return value.expanduser() if value is not None else None
+
+    @model_validator(mode="after")
+    def role_fields(self) -> Self:
+        if self.role == "slave" and self.service_id is None:
+            raise ValueError("service_id is required for a slave")
+        if self.role != "slave" and self.service_id is not None:
+            raise ValueError("service_id is only valid for a slave")
+        if self.role != "minio" and self.console_port is not None:
+            raise ValueError("console_port is only valid for minio")
+        return self
 
     @property
     def advertised_host(self) -> str:
@@ -43,15 +92,52 @@ class MachineConfig:
         return f"http://{host}:{self.service_port}"
 
 
-@dataclass(frozen=True)
-class DriverConfig:
-    codex_base_url: str = "http://host.docker.internal:8787"
-    workspace_path: str = "/srv/loom/workspace"
+class DriverConfig(ConfigModel):
+    codex_base_url: NonEmptyString = "http://host.docker.internal:8787"
+    workspace_path: NonEmptyString = "/srv/loom/workspace"
     model_catalog_file: Path | None = None
-    codex_version: str = "0.151.0"
-    codex_model: str = "deepseek-v4-flash"
-    codex_provider: str = "proxy"
-    codex_wire_api: str = "responses"
+    codex_version: NonEmptyString = "0.151.0"
+    codex_model: NonEmptyString = "deepseek-v4-flash"
+    codex_provider: NonEmptyString = "proxy"
+    codex_wire_api: NonEmptyString = "responses"
+
+    @field_validator("workspace_path")
+    @classmethod
+    def absolute_workspace(cls, value: str) -> str:
+        if not value.startswith("/"):
+            raise ValueError("workspace_path must be absolute")
+        return value
+
+
+class ClusterConfig(ConfigModel):
+    name: NonEmptyString
+    remote_dir: NonEmptyString
+    workspace_id: NonEmptyString
+    build_network: Literal["default", "host", "none"] = "default"
+    internal_secret_file: NonEmptyString
+    postgres_password_file: NonEmptyString
+    minio_secret_key_file: NonEmptyString
+    minio_access_key: NonEmptyString = "loom"
+
+    @field_validator("name")
+    @classmethod
+    def valid_name(cls, value: str) -> str:
+        if not _NAME_RE.fullmatch(value):
+            raise ValueError("cluster.name contains unsupported characters")
+        return value
+
+    @field_validator("remote_dir")
+    @classmethod
+    def absolute_remote_dir(cls, value: str) -> str:
+        if not value.startswith("/"):
+            raise ValueError("cluster.remote_dir must be absolute")
+        return value
+
+
+class DeploymentInput(ConfigModel):
+    cluster: ClusterConfig
+    machines: tuple[MachineConfig, ...] = Field(min_length=1)
+    driver: DriverConfig = Field(default_factory=DriverConfig)
 
 
 @dataclass(frozen=True)
@@ -96,63 +182,38 @@ class DeploymentConfig:
 
     @classmethod
     def _from_raw(cls, config_path: Path, raw: dict[str, Any]) -> "DeploymentConfig":
-        cluster = raw.get("cluster")
-        if not isinstance(cluster, dict):
-            raise DeploymentConfigError("cluster table is required")
-
-        name = _required_string(cluster, "name")
-        if not _NAME_RE.fullmatch(name):
-            raise DeploymentConfigError("cluster.name contains unsupported characters")
-        remote_dir = _required_string(cluster, "remote_dir")
-        if not remote_dir.startswith("/"):
-            raise DeploymentConfigError("cluster.remote_dir must be absolute")
-        workspace_id = _required_string(cluster, "workspace_id")
-        build_network = cluster.get("build_network", "default")
-        if not isinstance(build_network, str) or build_network not in {"default", "host", "none"}:
-            raise DeploymentConfigError("cluster.build_network must be one of default, host, none")
+        try:
+            parsed = DeploymentInput.model_validate(raw)
+        except ValidationError as exc:
+            error = exc.errors()[0]
+            location = ".".join(str(item) for item in error.get("loc", ()))
+            message = str(error.get("msg", "invalid deployment configuration"))
+            if location:
+                message = f"{location} {message}"
+            raise DeploymentConfigError(message) from exc
+        cluster = parsed.cluster
+        name, remote_dir, workspace_id = cluster.name, cluster.remote_dir, cluster.workspace_id
+        build_network = cluster.build_network
         base_dir = config_path.parent
-        internal_secret_path = _resolve_secret_path(base_dir, cluster.get("internal_secret_file"), "cluster.internal_secret_file")
-        postgres_password_path = _resolve_secret_path(base_dir, cluster.get("postgres_password_file"), "cluster.postgres_password_file")
-        minio_secret_path = _resolve_secret_path(base_dir, cluster.get("minio_secret_key_file"), "cluster.minio_secret_key_file")
+        internal_secret_path = _resolve_secret_path(base_dir, cluster.internal_secret_file, "cluster.internal_secret_file")
+        postgres_password_path = _resolve_secret_path(base_dir, cluster.postgres_password_file, "cluster.postgres_password_file")
+        minio_secret_path = _resolve_secret_path(base_dir, cluster.minio_secret_key_file, "cluster.minio_secret_key_file")
         internal_secret = _read_secret(internal_secret_path, "cluster.internal_secret_file")
         postgres_password = _read_secret(postgres_password_path, "cluster.postgres_password_file")
         minio_secret = _read_secret(minio_secret_path, "cluster.minio_secret_key_file")
-        minio_access_key = cluster.get("minio_access_key", "loom")
-        if not isinstance(minio_access_key, str) or not minio_access_key.strip():
-            raise DeploymentConfigError("cluster.minio_access_key must be non-empty")
-
-        machines_raw = raw.get("machines")
-        if not isinstance(machines_raw, list) or not machines_raw:
-            raise DeploymentConfigError("machines must contain at least one entry")
-        machines = tuple(_parse_machine(item) for item in machines_raw)
+        minio_access_key = cluster.minio_access_key
+        machines = parsed.machines
         _validate_topology(machines)
-
-        driver_raw = raw.get("driver", {})
-        if not isinstance(driver_raw, dict):
-            raise DeploymentConfigError("driver must be a table")
-        catalog = driver_raw.get("model_catalog_file")
-        catalog_path: Path | None = None
-        if catalog is not None:
-            if not isinstance(catalog, str) or not catalog.strip():
-                raise DeploymentConfigError("driver.model_catalog_file must be a path")
-            catalog_path = Path(catalog).expanduser()
+        driver = parsed.driver
+        catalog_path = driver.model_catalog_file
+        if catalog_path is not None:
             if not catalog_path.is_absolute():
                 catalog_path = (base_dir / catalog_path).resolve()
             else:
                 catalog_path = catalog_path.resolve()
             if not catalog_path.is_file():
                 raise DeploymentConfigError(f"driver.model_catalog_file does not exist: {catalog_path}")
-        driver = DriverConfig(
-            codex_base_url=_optional_string(driver_raw, "codex_base_url", DriverConfig.codex_base_url),
-            workspace_path=_optional_string(driver_raw, "workspace_path", DriverConfig.workspace_path),
-            model_catalog_file=catalog_path,
-            codex_version=_optional_string(driver_raw, "codex_version", DriverConfig.codex_version),
-            codex_model=_optional_string(driver_raw, "codex_model", DriverConfig.codex_model),
-            codex_provider=_optional_string(driver_raw, "codex_provider", DriverConfig.codex_provider),
-            codex_wire_api=_optional_string(driver_raw, "codex_wire_api", DriverConfig.codex_wire_api),
-        )
-        if not driver.workspace_path.startswith("/"):
-            raise DeploymentConfigError("driver.workspace_path must be absolute")
+        driver = driver.model_copy(update={"model_catalog_file": catalog_path})
         return cls(
             config_path=config_path,
             name=name,
@@ -208,20 +269,6 @@ class DeploymentConfig:
         return f"postgresql+asyncpg://loom:{quote(self.postgres_password, safe='')}@postgres:5432/{db_name}"
 
 
-def _required_string(table: dict[str, Any], field: str) -> str:
-    value = table.get(field)
-    if not isinstance(value, str) or not value.strip():
-        raise DeploymentConfigError(f"{field} is required and must be non-empty")
-    return value.strip()
-
-
-def _optional_string(table: dict[str, Any], field: str, default: str) -> str:
-    value = table.get(field, default)
-    if not isinstance(value, str) or not value.strip():
-        raise DeploymentConfigError(f"driver.{field} must be non-empty")
-    return value.strip()
-
-
 def _resolve_secret_path(base_dir: Path, raw_path: Any, field: str) -> Path:
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise DeploymentConfigError(f"{field} is required")
@@ -239,56 +286,6 @@ def _read_secret(path: Path, field: str) -> str:
     value = value.strip()
     if not value or "\n" in value or "\r" in value:
         raise DeploymentConfigError(f"{field} must contain one non-empty line")
-    return value
-
-
-def _parse_machine(raw: Any) -> MachineConfig:
-    if not isinstance(raw, dict):
-        raise DeploymentConfigError("each machines entry must be a table")
-    name = _required_string(raw, "name")
-    if not _NAME_RE.fullmatch(name):
-        raise DeploymentConfigError(f"machines.{name}.name contains unsupported characters")
-    host = _required_string(raw, "ssh_host")
-    user = _required_string(raw, "ssh_user")
-    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in host):
-        raise DeploymentConfigError(f"machines.{name}.ssh_host must not contain whitespace or control characters")
-    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in user):
-        raise DeploymentConfigError(f"machines.{name}.ssh_user must not contain whitespace or control characters")
-    role = _required_string(raw, "role").lower()
-    if role not in _ROLES:
-        raise DeploymentConfigError(f"machines.{name}.role must be one of {sorted(_ROLES)}")
-    ssh_port = _port(raw.get("ssh_port", 22), f"machines.{name}.ssh_port")
-    defaults = {"minio": 9000, "observer": 8080, "driver": 8090}
-    service_id = raw.get("service_id")
-    if role == "slave":
-        if not isinstance(service_id, str) or not service_id.strip():
-            raise DeploymentConfigError(f"machines.{name}.service_id is required for a slave")
-        service_id = service_id.strip()
-        if service_id not in _SLAVE_IDS:
-            raise DeploymentConfigError(f"machines.{name}.service_id must be slave-a or slave-b")
-        default_port = 8081 if service_id == "slave-a" else 8082
-    else:
-        if service_id is not None:
-            raise DeploymentConfigError(f"machines.{name}.service_id is only valid for a slave")
-        default_port = defaults[role]
-    service_port = _port(raw.get("service_port", default_port), f"machines.{name}.service_port")
-    console_port: int | None = None
-    if role == "minio":
-        console_port = _port(raw.get("console_port", 9001), f"machines.{name}.console_port")
-    elif raw.get("console_port") is not None:
-        raise DeploymentConfigError(f"machines.{name}.console_port is only valid for minio")
-    key = raw.get("ssh_key")
-    ssh_key: Path | None = None
-    if key is not None:
-        if not isinstance(key, str) or not key.strip():
-            raise DeploymentConfigError(f"machines.{name}.ssh_key must be a path")
-        ssh_key = Path(key).expanduser()
-    return MachineConfig(name, host, ssh_port, user, role, service_port, console_port, service_id, ssh_key)
-
-
-def _port(value: Any, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
-        raise DeploymentConfigError(f"{field} must be an integer between 1 and 65535")
     return value
 
 

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from loom_v2.observer.repository import ObserverRepository
+from .plan_repository import PlanRepository
 
 
 class DriverTools:
-    def __init__(self, repository: ObserverRepository) -> None:
+    def __init__(self, repository: PlanRepository) -> None:
         self.repository = repository
 
     async def apply_plan_patch(self, run_id: str, operation_id: str, ops: list[dict[str, Any]]) -> dict[str, Any]:

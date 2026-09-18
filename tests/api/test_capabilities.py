@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 from datetime import datetime, timedelta, timezone
 
-from loom_v2.observer.app import create_app
+from loom_v2.testing.observer import create_embedded_app as create_app, seed_embedded_slaves
 from loom_v2.observer.repository import ObserverRepository
 
 
@@ -16,6 +16,7 @@ def test_capabilities_expose_term_support_without_granting_access():
 
 def test_capability_availability_is_derived_from_slave_lease():
     repository = ObserverRepository()
+    seed_embedded_slaves(repository)
     slave_a = next(
         item
         for key, item in repository.agents.items()

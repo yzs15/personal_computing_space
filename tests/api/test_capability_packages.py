@@ -5,6 +5,7 @@ import pytest
 from loom_v2.contracts.agents import AgentRegistration, DriverCommand
 from loom_v2.contracts.types import ClosureContract, ComputeBinding, ResourceRef, TaskClosure
 from loom_v2.observer.repository import ObserverRepository
+from loom_v2.testing.observer import seed_embedded_slaves
 from tests.support.package_fixture import process_package_value, register_test_descriptor, capability_export
 
 
@@ -71,6 +72,7 @@ async def test_capability_get_command_normalizes_resource_ref_dict():
 @pytest.mark.asyncio
 async def test_candidate_is_run_bound_and_cannot_be_used_by_another_run():
     repo = ObserverRepository()
+    seed_embedded_slaves(repo)
     first = await repo.open_run("run-a", "conversation-a", "matmul")
     program_ref = await _program_ref(repo)
     io_contract_ref = await _empty_io_contract_ref(repo)
@@ -477,6 +479,7 @@ async def test_observer_rejects_unresolvable_operation_descriptor() -> None:
 @pytest.mark.asyncio
 async def test_binding_package_with_different_io_contract_is_not_ready() -> None:
     repo = ObserverRepository()
+    seed_embedded_slaves(repo)
     schema_ref = await repo.put_content({"type": "object"}, media_type="application/schema+json")
     closure_contract_ref = await repo.put_content(
         {

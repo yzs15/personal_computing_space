@@ -10,6 +10,13 @@ from loom_v2.observer.repository import ObserverRepository
 from loom_v2.driver.worker import WorkerSession
 from loom_v2.slave.service import SlaveService
 from loom_v2.slave.app import create_app as create_slave_app
+from loom_v2.testing.observer import seed_embedded_slaves
+
+
+def _seeded_repository() -> ObserverRepository:
+    repo = ObserverRepository()
+    seed_embedded_slaves(repo)
+    return repo
 
 
 def test_driver_special_orchestrator_detection_is_version_exact(monkeypatch):
@@ -45,7 +52,7 @@ def test_driver_special_orchestrator_detection_is_version_exact(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_driver_applies_fake_patches_continuously_and_starts_execution():
-    repo = ObserverRepository()
+    repo = _seeded_repository()
     slave = SlaveService("slave-a", content_store=repo.content_store)
     driver = DriverService(repo, FakeCodingAgentProvider(), slaves={"slave-a": slave})
     result = await driver.run_prompt("conversation-1", "run the test capability")
@@ -338,7 +345,7 @@ async def test_driver_enforces_absolute_conversation_deadline():
 
 @pytest.mark.asyncio
 async def test_driver_dispatches_committed_operation_to_bound_slave():
-    repo = ObserverRepository()
+    repo = _seeded_repository()
     driver = DriverService(repo, RunCodeClosureProvider(), slaves={"slave-a": SlaveService("slave-a", content_store=repo.content_store)})
 
     result = await driver.run_prompt("conversation-run-code", "double three")
@@ -351,7 +358,7 @@ async def test_driver_dispatches_committed_operation_to_bound_slave():
 
 @pytest.mark.asyncio
 async def test_driver_dispatches_through_worker_session_http_boundary():
-    repo = ObserverRepository()
+    repo = _seeded_repository()
     slave_app = create_slave_app("slave-a")
     worker = WorkerSession("slave-a", "http://slave-a", transport=httpx.ASGITransport(app=slave_app))
     driver = DriverService(repo, RunCodeClosureProvider(), workers={"slave-a": worker})
@@ -365,7 +372,7 @@ async def test_driver_dispatches_through_worker_session_http_boundary():
 
 @pytest.mark.asyncio
 async def test_driver_adopts_run_opened_through_dynamic_mcp_tool():
-    repo = ObserverRepository()
+    repo = _seeded_repository()
     driver = DriverService(repo, DynamicToolProvider(), slaves={"slave-a": SlaveService("slave-a", content_store=repo.content_store)})
 
     result = await driver.run_prompt("conversation-dynamic", "run code through MCP")
@@ -382,7 +389,7 @@ async def test_driver_adopts_run_opened_through_dynamic_mcp_tool():
 async def test_driver_keeps_execution_completed_when_turn_fails_after_start():
     """start_run is an execution boundary; later agent failure must not undo it."""
 
-    repo = ObserverRepository()
+    repo = _seeded_repository()
     driver = DriverService(
         repo,
         DynamicToolProvider(fail_after_start=True),
@@ -401,7 +408,7 @@ async def test_driver_keeps_execution_completed_when_turn_fails_after_start():
 
 @pytest.mark.asyncio
 async def test_driver_does_not_commit_or_start_when_agent_only_opens_run():
-    repo = ObserverRepository()
+    repo = _seeded_repository()
     driver = DriverService(repo, OpenOnlyProvider(), slaves={"slave-a": SlaveService("slave-a")})
 
     result = await driver.run_prompt("conversation-open-only", "clarify before execution")
@@ -415,7 +422,7 @@ async def test_driver_does_not_commit_or_start_when_agent_only_opens_run():
 
 @pytest.mark.asyncio
 async def test_driver_marks_run_and_conversation_failed_with_structured_stall_reason():
-    repo = ObserverRepository()
+    repo = _seeded_repository()
     driver = DriverService(repo, StalledProvider())
 
     with pytest.raises(RuntimeError, match="coding_agent_stalled"):

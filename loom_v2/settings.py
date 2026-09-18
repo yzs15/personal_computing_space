@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     # deterministic Fake provider is selected explicitly by the test profile.
     coding_agent_backend: str = "codex"
     codex_model: str = "deepseek-v4-flash"
+    codex_message_limit_bytes: int = 16 * 1024 * 1024
     coding_agent_deadline_seconds: float = 86400.0
     coding_agent_poll_interval_seconds: float = 5.0
     coding_agent_protocol_failure_seconds: float = 60.0
@@ -51,7 +52,9 @@ class Settings(BaseSettings):
     agent_protocol_version: str = "loom.v1"
     agent_heartbeat_interval_seconds: float = 5.0
     agent_registration_retry_seconds: float = 2.0
+    agent_lease_ttl_seconds: float = 15.0
     driver_url: str | None = None
+    slave_endpoint_url: str | None = None
     slave_a_url: str | None = None
     slave_b_url: str | None = None
 

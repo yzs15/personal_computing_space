@@ -5,6 +5,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from loom_v2.observer.app import create_app
+from loom_v2.testing.observer import create_embedded_app
 
 
 class DriverTransport(httpx.AsyncBaseTransport):
@@ -47,7 +48,7 @@ class BlockingDriverTransport(httpx.AsyncBaseTransport):
 
 def test_observer_deduplicates_in_flight_request_by_request_id():
     transport = BlockingDriverTransport()
-    app = create_app()
+    app = create_embedded_app()
     app.state.gateway.transport = transport
     with TestClient(app) as client:
         client.post("/internal/v1/agents/register", json={"role": "driver", "agent_id": "driver-default", "instance_id": "instance-1", "workspace_id": "workspace-default", "endpoint_url": "http://driver:8090", "protocol_version": "loom.v1"})

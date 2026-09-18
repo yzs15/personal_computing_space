@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import os
 from typing import Any
 
 import httpx
@@ -16,6 +14,8 @@ from loom_v2.contracts.types import (
     TaskClosure,
 )
 from loom_v2.slave.executor import ExecutionResult
+from loom_v2.internal_http import InternalHttpClient
+from loom_v2.settings import Settings
 
 
 class WorkerUnavailableError(RuntimeError):
@@ -34,14 +34,19 @@ class WorkerSession:
         operation_timeout: float | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         internal_api_secret: str | None = None,
+        settings: Settings | None = None,
     ) -> None:
+        config = settings or Settings()
         self.slave_id = slave_id
         self.base_url = base_url.rstrip("/")
-        configured_timeout = os.getenv("LOOM_WORKER_OPERATION_TIMEOUT_SECONDS", "90")
-        self.operation_timeout = operation_timeout if operation_timeout is not None else timeout if timeout is not None else float(configured_timeout)
+        self.operation_timeout = operation_timeout if operation_timeout is not None else timeout if timeout is not None else config.worker_operation_timeout_seconds
         self.timeout = self.operation_timeout
         self.transport = transport
-        self.internal_api_secret = internal_api_secret or os.getenv("LOOM_INTERNAL_API_SECRET", "")
+        self.internal_api_secret = internal_api_secret if internal_api_secret is not None else config.internal_api_secret
+        self._http = InternalHttpClient(timeout=self.operation_timeout, transport=transport)
+
+    async def close(self) -> None:
+        await self._http.close()
 
     def _headers(self) -> dict[str, str]:
         if not self.internal_api_secret:
@@ -145,9 +150,14 @@ class WorkerSession:
 
     async def _post(self, path: str, payload: dict[str, Any]) -> httpx.Response:
         try:
-            async with asyncio.timeout(self.operation_timeout):
-                async with httpx.AsyncClient(timeout=self.operation_timeout, transport=self.transport) as client:
-                    return await client.post(f"{self.base_url}{path}", json=payload, headers=self._headers())
+            self._http.transport = self.transport
+            return await self._http.request(
+                "POST",
+                f"{self.base_url}{path}",
+                json=payload,
+                headers=self._headers(),
+                timeout=self.operation_timeout,
+            )
         except (TimeoutError, httpx.TimeoutException) as exc:
             raise WorkerUnavailableError("worker_operation_timeout") from exc
         except httpx.TransportError as exc:

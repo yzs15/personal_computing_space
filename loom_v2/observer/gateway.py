@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import httpx
+
+from loom_v2.internal_http import InternalHttpClient
 
 from .repository import ObserverRepository
 
@@ -25,6 +26,10 @@ class ObserverDriverGateway:
         self.internal_api_secret = internal_api_secret
         self.timeout = timeout
         self.transport = transport
+        self._http = InternalHttpClient(timeout=timeout, transport=transport)
+
+    async def close(self) -> None:
+        await self._http.close()
 
     async def active_driver(self) -> dict[str, Any] | None:
         agents = await self.repository.list_agents(self.workspace_id, role="driver")
@@ -41,9 +46,14 @@ class ObserverDriverGateway:
             headers.update(extra_headers)
         request_timeout = timeout if timeout is not None else self.timeout
         try:
-            async with asyncio.timeout(request_timeout):
-                async with httpx.AsyncClient(timeout=request_timeout, transport=self.transport) as client:
-                    response = await client.post(f"{str(driver['endpoint_url']).rstrip('/')}{path}", json=payload, headers=headers)
+            self._http.transport = self.transport
+            response = await self._http.request(
+                "POST",
+                f"{str(driver['endpoint_url']).rstrip('/')}{path}",
+                json=payload,
+                headers=headers,
+                timeout=request_timeout,
+            )
         except (TimeoutError, httpx.TimeoutException, httpx.TransportError) as exc:
             raise RuntimeError("driver_unavailable") from exc
         if response.status_code >= 500:

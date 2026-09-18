@@ -10,6 +10,7 @@ from loom_v2.driver.worker import WorkerSession, WorkerUnavailableError
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.slave.app import create_app as create_slave_app
 from tests.support.package_fixture import orchestration_package_value, process_package_value
+from loom_v2.testing.observer import seed_embedded_slaves
 
 
 FAMILIES = ("perovskite", "rutile", "zincblende")
@@ -157,6 +158,7 @@ def _contract(input_ref: ResourceRef | None, output_ref: ResourceRef | None) -> 
 @pytest.mark.asyncio
 async def test_deterministic_bandgap_report_executes_parse_summarize_merge_and_replays():
     repo = ObserverRepository()
+    seed_embedded_slaves(repo)
     parent_input_schema = await _put_content(repo, {"type": "object", "required": ["partitions"]}, "application/schema+json")
     parse_input_schema = await _put_content(repo, {"type": "object", "required": ["files"]}, "application/schema+json")
     parsed_output_schema = await _put_content(repo, {"type": "object", "required": ["items"]}, "application/schema+json")
@@ -341,6 +343,7 @@ async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> 
 @pytest.mark.asyncio
 async def test_parse_package_promotion_and_abandon_are_explicit_user_decisions():
     repo = ObserverRepository()
+    seed_embedded_slaves(repo)
     contract_ref = await _put_content(
         repo,
         _contract(None, None),
@@ -393,6 +396,7 @@ async def test_parse_package_promotion_and_abandon_are_explicit_user_decisions()
 @pytest.mark.asyncio
 async def test_lost_slave_a_attempt_is_reassigned_to_slave_b():
     repo = ObserverRepository()
+    seed_embedded_slaves(repo)
     input_schema = await _put_content(repo, {"type": "object"}, "application/schema+json")
     contract = await _put_content(repo, _contract(input_schema, None), "application/vnd.loom.io-contract+json")
     orchestration_program = await _put_content(

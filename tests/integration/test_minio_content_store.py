@@ -11,6 +11,7 @@ from loom_v2.slave.app import create_app
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.driver.worker import WorkerSession
 from tests.support.package_fixture import process_package_value
+from loom_v2.testing.observer import seed_embedded_slaves
 
 
 def _store() -> ContentStore:
@@ -26,6 +27,7 @@ def _store() -> ContentStore:
 async def test_observer_and_slave_share_immutable_content_store():
     observer_store = _store()
     repo = ObserverRepository(content_store=observer_store)
+    seed_embedded_slaves(repo)
     run = await repo.open_run("run-minio-e2e", "conversation-minio-e2e", "double")
     code = 'import sys,json; print(json.dumps({"value": json.load(sys.stdin)["x"] * 2}))'
     program_ref = await observer_store.put(code.encode(), media_type="text/x-python")

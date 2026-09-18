@@ -11,6 +11,7 @@ from loom_v2.driver.service import DriverService
 from loom_v2.observer.repository import ObserverRepository
 from loom_v2.driver.worker import WorkerSession, WorkerUnavailableError
 from loom_v2.slave.app import create_app as create_slave_app
+from loom_v2.testing.observer import seed_embedded_slaves
 from tests.support.package_fixture import (
     orchestration_package_value,
     process_package_value,
@@ -22,9 +23,15 @@ async def _content(repo: ObserverRepository, value, media_type: str):
     return await repo.put_content(value, media_type=media_type)
 
 
+def _seeded_repository() -> ObserverRepository:
+    repo = ObserverRepository()
+    seed_embedded_slaves(repo)
+    return repo
+
+
 @pytest.mark.integration
 async def test_dynamic_orchestration_runtime_executes_docker_program_and_slave_node():
-    repo = ObserverRepository()
+    repo = _seeded_repository()
     input_schema = await _content(repo, {"type": "object", "required": ["partition"]}, "application/schema+json")
     output_schema = await _content(
         repo,
@@ -165,7 +172,7 @@ async def orchestrate(ctx: "OrchestrationContext", input_ref: "ResourceRef") -> 
 
 
 async def test_target_selection_applies_permissions_locality_and_round_robin():
-    repo = ObserverRepository()
+    repo = _seeded_repository()
     run, patched = await _dynamic_fixture_for_target_selection(repo)
     record = await repo.get_run(run.run_id)
     package = next(package for package in record.capability_packages if package.package_id == "summarize")
@@ -202,7 +209,7 @@ async def test_target_selection_applies_permissions_locality_and_round_robin():
 
 @pytest.mark.asyncio
 async def test_runtime_reuses_completed_nodes_after_driver_restart():
-    repo = ObserverRepository()
+    repo = _seeded_repository()
     run, _patched = await _dynamic_fixture_for_target_selection(repo)
     record = await repo.get_run(run.run_id)
     package = next(package for package in record.capability_packages if package.package_id == "summarize")
@@ -342,7 +349,7 @@ class LosingWorker:
 
 @pytest.mark.asyncio
 async def test_runtime_reassigns_lost_dynamic_attempt_without_bumping_epoch():
-    repo = ObserverRepository()
+    repo = _seeded_repository()
     run, _ = await _dynamic_fixture_for_target_selection(repo, allow_reassignment=True)
     record = await repo.get_run(run.run_id)
     package = next(item for item in record.capability_packages if item.package_id == "summarize")
@@ -394,7 +401,7 @@ class TwoNodeExecutor:
 
 @pytest.mark.asyncio
 async def test_runtime_keeps_healthy_sibling_valid_during_reassignment():
-    repo = ObserverRepository()
+    repo = _seeded_repository()
     run, _ = await _dynamic_fixture_for_target_selection(repo, allow_reassignment=True)
     record = await repo.get_run(run.run_id)
     package = next(item for item in record.capability_packages if item.package_id == "summarize")

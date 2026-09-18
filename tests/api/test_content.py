@@ -56,6 +56,12 @@ def test_content_endpoint_rejects_invalid_json_schema() -> None:
     assert response.json()["detail"] == "schema_invalid"
 
 
+def test_content_endpoint_preserves_missing_content_error() -> None:
+    response = TestClient(create_app()).post("/api/v1/content", json={})
+    assert response.status_code == 400
+    assert response.json()["detail"] == "content_required"
+
+
 def test_mcp_exposes_only_the_generic_content_upload_tool() -> None:
     names = {spec["name"] for spec in DriverMCP.tool_specs()}
 
